@@ -7,5 +7,6 @@
   "cute_anim": true,
   "heartbeat_minutes": 60,
   "sse_enabled": true,
+  "tool_full_access": false,
   "think_mcp_enabled": true
 }

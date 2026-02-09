@@ -620,6 +620,7 @@ fn settings_field_hint(section: SettingsSection, kind: SettingsFieldKind) -> &'s
             SettingsFieldKind::ContextMaxTokens => "Dynamic context threshold (tokens)",
             SettingsFieldKind::ContextPoolMaxItems => "Summary pool size",
             SettingsFieldKind::ChatTarget => "Switch model (Main/Memory)",
+            SettingsFieldKind::ExecPermission => "Tool execution permission (safe/full)",
             SettingsFieldKind::DogPrompt => "Edit DOG prompt",
             SettingsFieldKind::MainPrompt => "Edit MAIN prompt",
             SettingsFieldKind::ContextMainPrompt => "Edit context prompt",
@@ -3768,6 +3769,7 @@ enum SettingsFieldKind {
     ContextMaxTokens,
     ContextPoolMaxItems,
     ChatTarget,
+    ExecPermission,
     DogPrompt,
     MainPrompt,
     ContextMainPrompt,
@@ -4243,6 +4245,15 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 kind: SettingsFieldKind::ChatTarget,
             },
             SettingsFieldSpec {
+                label: "Exec perm",
+                value: if sys_cfg.tool_full_access {
+                    "Full".to_string()
+                } else {
+                    "Safe".to_string()
+                },
+                kind: SettingsFieldKind::ExecPermission,
+            },
+            SettingsFieldSpec {
                 label: "SSE",
                 value: format_toggle(sys_cfg.sse_enabled),
                 kind: SettingsFieldKind::SseEnabled,
@@ -4354,6 +4365,13 @@ fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
             }
         }
         SettingsFieldKind::ChatTarget => sys_cfg.chat_target.clone(),
+        SettingsFieldKind::ExecPermission => {
+            if sys_cfg.tool_full_access {
+                "full".to_string()
+            } else {
+                "safe".to_string()
+            }
+        }
         SettingsFieldKind::ContextMainPrompt => context_prompts.main_prompt.to_string(),
         SettingsFieldKind::ContextCompactPrompt => context_compact_prompt_text.to_string(),
     }
@@ -4628,6 +4646,23 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             sys_cfg.sse_enabled = next;
             store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
         }
+        SettingsFieldKind::ExecPermission => {
+            let next = if trimmed.is_empty() {
+                !sys_cfg.tool_full_access
+            } else {
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "safe" | "安全" => false,
+                    "full" | "all" | "全权" => true,
+                    other => {
+                        return Err(format!(
+                            "执行权限仅支持 safe/full（当前：{other}）"
+                        ));
+                    }
+                }
+            };
+            sys_cfg.tool_full_access = next;
+            store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
+        }
         SettingsFieldKind::ChatTarget => {
             let next = if trimmed.is_empty() {
                 if normalize_chat_target_value(&sys_cfg.chat_target) == "main" {
@@ -4816,7 +4851,7 @@ fn tool_confirm_prompt(reason: &str, call: &ToolCall) -> String {
         truncate_with_suffix(cmd_raw, 2000)
     };
     format!(
-        "危险指令需要确认：{reason}\n[{label}]\ncmd:\n```sh\n{cmd}\n```\n输入 yes 执行 / no 拒绝"
+        "危险指令需要确认：{reason}\n[{label}]\ncmd:\n```sh\n{cmd}\n```\n输入 yes 执行 / no 拒绝\n（可在 Settings → System → Exec perm 切到 Full 以免确认）"
     )
 }
 
@@ -5170,6 +5205,7 @@ struct TryStartNextToolArgs<'a> {
     mode: &'a mut Mode,
     sys_log: &'a mut VecDeque<String>,
     sys_log_limit: usize,
+    sys_cfg: &'a SystemConfig,
     owner: MindKind,
 }
 
@@ -5184,6 +5220,7 @@ fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
         mode,
         sys_log,
         sys_log_limit,
+        sys_cfg,
         owner,
     } = args;
     if matches!(*mode, Mode::ExecutingTool | Mode::ApprovingTool) {
@@ -5195,7 +5232,7 @@ fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
     let Some(call) = pending_tools.pop_front() else {
         return false;
     };
-    if let Some(reason) = tool_requires_confirmation(&call) {
+    if !sys_cfg.tool_full_access && let Some(reason) = tool_requires_confirmation(&call) {
         let prompt = tool_confirm_prompt(&reason, &call);
         let msg_idx = core.history.len();
         push_system_and_log(core, meta, context_usage, Some("tool"), &prompt);
@@ -7288,7 +7325,9 @@ fn run_loop(
                                     settings_field_hint(settings_section, kind)
                                 )
                             }
-                            SettingsFieldKind::SseEnabled | SettingsFieldKind::ChatTarget => {
+                            SettingsFieldKind::SseEnabled
+                            | SettingsFieldKind::ChatTarget
+                            | SettingsFieldKind::ExecPermission => {
                                 format!(
                                     "{} (Enter)",
                                     settings_field_hint(settings_section, kind)
@@ -8074,6 +8113,7 @@ fn run_loop(
                                         spec.kind,
                                         SettingsFieldKind::SseEnabled
                                             | SettingsFieldKind::ChatTarget
+                                            | SettingsFieldKind::ExecPermission
                                     ) {
                                         let value =
                                             match spec.kind {
@@ -8088,6 +8128,13 @@ fn run_loop(
                                                         "dog"
                                                     } else {
                                                         "main"
+                                                    }
+                                                }
+                                                SettingsFieldKind::ExecPermission => {
+                                                    if sys_cfg.tool_full_access {
+                                                        "safe"
+                                                    } else {
+                                                        "full"
                                                     }
                                                 }
                                                 _ => "on",
@@ -9339,6 +9386,7 @@ fn run_loop(
 	                                            mode: &mut mode,
 	                                            sys_log: &mut sys_log,
 	                                            sys_log_limit: config.sys_log_limit,
+	                                            sys_cfg: &sys_cfg,
 	                                            owner: active_kind,
 	                                        });
 	                                        if !has_next && matches!(active_kind, MindKind::Sub) {
@@ -10653,6 +10701,7 @@ fn handle_model_stream_end(
                 mode,
                 sys_log,
                 sys_log_limit,
+                sys_cfg,
                 owner: *active_kind,
             });
         }
@@ -11492,6 +11541,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     mode,
                     sys_log,
                     sys_log_limit,
+                    sys_cfg,
                     owner,
                 });
                 if !has_next && !skip_owner_resume && matches!(owner, MindKind::Sub) {
@@ -12832,6 +12882,8 @@ mod config {
         pub heartbeat_minutes: usize,
         #[serde(default = "default_true")]
         pub sse_enabled: bool,
+        #[serde(default)]
+        pub tool_full_access: bool,
         #[serde(default = "default_ctx_recent_max_tokens")]
         pub ctx_recent_max_tokens: usize,
         #[serde(default = "default_ctx_pool_max_items")]
@@ -12980,6 +13032,7 @@ mod config {
                 context_k: 128,
                 heartbeat_minutes: 5,
                 sse_enabled: true,
+                tool_full_access: false,
                 ctx_recent_max_tokens: default_ctx_recent_max_tokens(),
                 ctx_pool_max_items: default_ctx_pool_max_items(),
                 context_compact_prompt_path: default_context_compact_prompt_path(),

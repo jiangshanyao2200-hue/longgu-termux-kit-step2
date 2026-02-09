@@ -126,6 +126,9 @@ bash Quickinstall/install.sh --quiet
 - `Enter`：复制选中消息到剪贴板（输入框为空时，依赖 `termux-clipboard-set`）
 - `Home`：退出选择模式（取消高亮）
 
+系统设置（Settings → System）：
+- `Exec perm`：工具执行权限（Safe=危险命令需确认；Full=全部放行不再确认）
+
 上下文；20k，触发上下文压缩的统计，20k推荐
 
 心跳；5/10/30/60 分钟，推荐30分钟。自动发送消息

@@ -52,6 +52,29 @@ if [[ ! -d "$SYS_DIR" ]]; then
   exit 1
 fi
 
+cleanup_orphan_ying() {
+  local pid ppid
+  local -a pids=()
+  while read -r pid ppid _; do
+    if [[ -n "${pid:-}" && -n "${ppid:-}" && "$ppid" == "1" ]]; then
+      pids+=("$pid")
+    fi
+  done < <(
+    ps -o pid=,ppid=,args= -A 2>/dev/null \
+      | grep -F "$SYS_DIR/target/" \
+      | grep -F "/ying" \
+      | grep -v grep \
+      || true
+  )
+  if ((${#pids[@]})); then
+    kill "${pids[@]}" 2>/dev/null || true
+    sleep 0.05
+    kill -9 "${pids[@]}" 2>/dev/null || true
+  fi
+}
+
+cleanup_orphan_ying || true
+
 need_build=0
 if (( rebuild )) || [[ ! -x "$BIN" ]]; then
   need_build=1

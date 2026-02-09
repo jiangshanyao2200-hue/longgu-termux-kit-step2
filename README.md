@@ -57,12 +57,13 @@ Project Ying（萤）
 Termux 一键运行（自动自检并安装依赖）
 
 ```bash
-bash install.sh
+cd ~/AItermux/system
+bash Quickinstall/install.sh
 ```
 
-安装脚本会执行：
+安装脚本位于仓库内 `Quickinstall/`，安装到用户目录 `~/AItermux/`，会执行：
 - 备份并覆盖启动链路文件：`~/.termux/motd.sh`、`$PREFIX/bin/login`、`$PREFIX/etc/motd.sh`、`$PREFIX/etc/termux-login.sh`、`$PREFIX/bin/tx11start`
-- 将当前仓库同步到 `~/AItermux/system`（保留本地 `config/*.json` 与 `memory/`）
+- 同步 `~/AItermux/system` 工程代码（保留本地 `config/*.json` 与 `memory/`）
 - 安装 `~/AItermux/bin/aitermux` 启动器
 - 安装随机开屏动画到 `~/AItermux/startboot`
 - 写入 `~/.zshrc` 的 AITermux 自动启动段
@@ -70,8 +71,9 @@ bash install.sh
 可选参数：
 
 ```bash
-bash install.sh --dry-run
-bash install.sh --skip-preview
+bash Quickinstall/install.sh --dry-run
+bash Quickinstall/install.sh --skip-preview
+bash Quickinstall/install.sh --quiet
 ```
 
 如有错误，运行自检脚本：
@@ -104,7 +106,7 @@ bash install.sh --skip-preview
 ⚙️ 配置说明
 
 系统设置项说明；
-默认自带了可用的deepseek key供测试
+仓库不包含任何 `api_key`，请自行填写 `config/*_api.json`。
 
 输入 `/settings` 进入设置界面。
 

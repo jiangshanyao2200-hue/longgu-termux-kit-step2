@@ -1,0 +1,87 @@
+#!/data/data/com.termux/files/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${AITERMUX_HOME:-$HOME/AItermux}"
+SYS_DIR="$ROOT_DIR/system"
+BIN="$SYS_DIR/target/release/ying"
+
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_DIR="$STATE_HOME/aitermux"
+MARKER="$STATE_DIR/first_run_ying_v1.done"
+
+cleanup() {
+  stty sane >/dev/null 2>&1 || true
+  if [[ -t 1 ]]; then
+    printf '\033[0m\033[?25h\033[?1049l' >/dev/tty 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+mkdir -p "$STATE_DIR" >/dev/null 2>&1 || true
+
+force_selfcheck=0
+skip_selfcheck=0
+rebuild=0
+rest=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --force-selfcheck) force_selfcheck=1 ;;
+    --skip-selfcheck) skip_selfcheck=1 ;;
+    --rebuild) rebuild=1 ;;
+    --help|-h)
+      cat <<'EOF'
+AITermux 启动器
+
+用法：
+  aitermux [--force-selfcheck] [--skip-selfcheck] [--rebuild] [-- <ying args>]
+EOF
+      exit 0
+      ;;
+    --)
+      shift
+      rest+=("$@")
+      break
+      ;;
+    *) rest+=("$arg") ;;
+  esac
+done
+
+if [[ ! -d "$SYS_DIR" ]]; then
+  echo "[aitermux] 缺少系统目录：$SYS_DIR" >&2
+  exit 1
+fi
+
+need_build=0
+if (( rebuild )) || [[ ! -x "$BIN" ]]; then
+  need_build=1
+fi
+
+if (( !need_build )) && [[ -f "$SYS_DIR/Cargo.toml" && "$SYS_DIR/Cargo.toml" -nt "$BIN" ]]; then
+  need_build=1
+fi
+
+if (( !need_build )) && command -v find >/dev/null 2>&1; then
+  if find "$SYS_DIR/src" -type f -name '*.rs' -newer "$BIN" -print -quit 2>/dev/null | grep -q .; then
+    need_build=1
+  fi
+fi
+
+if (( !skip_selfcheck )) && { (( force_selfcheck )) || [[ ! -f "$MARKER" ]]; }; then
+  echo "[aitermux] 首次启动：bootstrap + release build + selfcheck"
+  (cd "$SYS_DIR" && bash scripts/bootstrap.sh)
+  (cd "$SYS_DIR" && cargo build --release -q)
+  (cd "$SYS_DIR" && "$BIN" --selfcheck)
+  date '+%Y-%m-%d %H:%M:%S' > "$MARKER" 2>/dev/null || true
+  need_build=0
+fi
+
+if (( need_build )); then
+  echo "[aitermux] 检测到源码更新：执行 release 构建"
+  (cd "$SYS_DIR" && bash scripts/bootstrap.sh)
+  (cd "$SYS_DIR" && cargo build --release -q)
+fi
+
+export AITERMUX_STARTED=1
+cd "$SYS_DIR"
+"$BIN" --no-bootstrap "${rest[@]}"

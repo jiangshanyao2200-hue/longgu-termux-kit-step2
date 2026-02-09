@@ -1,5 +1,5 @@
 {
-  "api_key": "YOUR_API_KEY_HERE",
+  "api_key": "",
   "provider": "deepseek",
   "base_url": "https://api.deepseek.com/v1",
   "model": "deepseek-reasoner",
@@ -10,4 +10,3 @@
   "prompt_reinject_pct": 80,
   "token_total_path": "memory/token_total.json"
 }
-

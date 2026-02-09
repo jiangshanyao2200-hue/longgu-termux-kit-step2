@@ -57,7 +57,21 @@ Project Ying（萤）
 Termux 一键运行（自动自检并安装依赖）
 
 ```bash
-./run.sh
+bash install.sh
+```
+
+安装脚本会执行：
+- 备份并覆盖启动链路文件：`~/.termux/motd.sh`、`$PREFIX/bin/login`、`$PREFIX/etc/motd.sh`、`$PREFIX/etc/termux-login.sh`、`$PREFIX/bin/tx11start`
+- 将当前仓库同步到 `~/AItermux/system`（保留本地 `config/*.json` 与 `memory/`）
+- 安装 `~/AItermux/bin/aitermux` 启动器
+- 安装随机开屏动画到 `~/AItermux/startboot`
+- 写入 `~/.zshrc` 的 AITermux 自动启动段
+
+可选参数：
+
+```bash
+bash install.sh --dry-run
+bash install.sh --skip-preview
 ```
 
 如有错误，运行自检脚本：

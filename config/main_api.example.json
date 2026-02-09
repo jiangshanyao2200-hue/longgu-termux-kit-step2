@@ -1,5 +1,5 @@
 {
-  "api_key": "YOUR_API_KEY_HERE",
+  "api_key": "",
   "provider": "deepseek",
   "base_url": "https://api.deepseek.com/v1",
   "model": "deepseek-reasoner",
@@ -8,4 +8,3 @@
   "max_tokens": 5000,
   "prompt_path": "prompts/main.txt"
 }
-

@@ -8987,6 +8987,9 @@ fn run_loop(
                         selected_msg_idx = None;
                         push_sys_log(&mut sys_log, config.sys_log_limit, "已退出选择模式");
                     }
+                    // ↑/↓：不再用于“选择消息”（避免与手机手势/滚动混淆）。
+                    // - 输入框有内容：仍用于多行光标上下移动
+                    // - 输入框为空：仅做轻量滚动（不进入选择模式）
                     KeyCode::Up => {
                         if !input.is_empty() {
                             let width = input_width_cache.max(1);
@@ -8994,22 +8997,8 @@ fn run_loop(
                             last_input_at = Some(now);
                             command_menu_suppress = false;
                         } else {
-	                            selected_msg_idx = select_prev_chat_message(
-	                                &core,
-	                                selected_msg_idx,
-	                                thinking_idx,
-	                                &expanded_thinking_idxs,
-	                                details_mode,
-	                            );
+                            scroll = scroll.saturating_sub(1);
                             follow_bottom = false;
-                            ensure_selected_visible(
-                                &mut scroll,
-                                &mut follow_bottom,
-                                selected_msg_idx,
-                                &msg_line_ranges_cache,
-                                chat_height_cache,
-                                max_scroll_cache,
-                            );
                         }
                     }
                     KeyCode::Down => {
@@ -9019,24 +9008,9 @@ fn run_loop(
                             last_input_at = Some(now);
                             command_menu_suppress = false;
                         } else {
-                            if selected_msg_idx.is_some() {
-                                selected_msg_idx = select_next_chat_message(
-                                    &core,
-                                    selected_msg_idx,
-                                    thinking_idx,
-                                    &expanded_thinking_idxs,
-                                    details_mode,
-                                );
-                                follow_bottom = false;
-                                ensure_selected_visible(
-                                    &mut scroll,
-                                    &mut follow_bottom,
-                                    selected_msg_idx,
-                                    &msg_line_ranges_cache,
-                                    chat_height_cache,
-                                    max_scroll_cache,
-                                );
-                            }
+                            let max_scroll = max_scroll_cache as u16;
+                            scroll = (scroll + 1).min(max_scroll);
+                            follow_bottom = scroll >= max_scroll;
                         }
                     }
 	                    KeyCode::Left if input.is_empty() && selected_msg_idx.is_some() => {
@@ -9087,14 +9061,58 @@ fn run_loop(
                             command_menu_suppress = false;
                         }
                     }
-                    KeyCode::PageUp => {
+                    // PgUp/PgDn：消息选择（只在输入框为空时生效）
+                    // - PgUp：进入/上移选择
+                    // - PgDn：下移选择（不主动进入选择，避免误触）
+                    // Ctrl+PgUp/PgDn：滚动聊天（保留键盘滚动通道）
+                    KeyCode::PageUp if ctrl => {
                         scroll = scroll.saturating_sub(6);
                         follow_bottom = false;
                     }
-                    KeyCode::PageDown => {
+                    KeyCode::PageDown if ctrl => {
                         let max_scroll = max_scroll_cache as u16;
                         scroll = (scroll + 6).min(max_scroll);
                         follow_bottom = scroll >= max_scroll;
+                    }
+                    KeyCode::PageUp => {
+                        if input.is_empty() {
+                            selected_msg_idx = select_prev_chat_message(
+                                &core,
+                                selected_msg_idx,
+                                thinking_idx,
+                                &expanded_thinking_idxs,
+                                details_mode,
+                            );
+                            follow_bottom = false;
+                            ensure_selected_visible(
+                                &mut scroll,
+                                &mut follow_bottom,
+                                selected_msg_idx,
+                                &msg_line_ranges_cache,
+                                chat_height_cache,
+                                max_scroll_cache,
+                            );
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if input.is_empty() && selected_msg_idx.is_some() {
+                            selected_msg_idx = select_next_chat_message(
+                                &core,
+                                selected_msg_idx,
+                                thinking_idx,
+                                &expanded_thinking_idxs,
+                                details_mode,
+                            );
+                            follow_bottom = false;
+                            ensure_selected_visible(
+                                &mut scroll,
+                                &mut follow_bottom,
+                                selected_msg_idx,
+                                &msg_line_ranges_cache,
+                                chat_height_cache,
+                                max_scroll_cache,
+                            );
+                        }
                     }
                     KeyCode::Home => {
                         if !input.is_empty() {

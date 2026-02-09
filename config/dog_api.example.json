@@ -1,0 +1,13 @@
+{
+  "api_key": "YOUR_API_KEY_HERE",
+  "provider": "deepseek",
+  "base_url": "https://api.deepseek.com/v1",
+  "model": "deepseek-reasoner",
+  "temperature": 0.0,
+  "timeout_secs": 60,
+  "max_tokens": 8000,
+  "prompt_path": "prompts/dog.txt",
+  "prompt_reinject_pct": 80,
+  "token_total_path": "memory/token_total.json"
+}
+

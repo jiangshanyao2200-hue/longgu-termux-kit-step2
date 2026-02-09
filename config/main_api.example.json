@@ -1,0 +1,11 @@
+{
+  "api_key": "YOUR_API_KEY_HERE",
+  "provider": "deepseek",
+  "base_url": "https://api.deepseek.com/v1",
+  "model": "deepseek-reasoner",
+  "temperature": 1.0,
+  "timeout_secs": 60,
+  "max_tokens": 5000,
+  "prompt_path": "prompts/main.txt"
+}
+

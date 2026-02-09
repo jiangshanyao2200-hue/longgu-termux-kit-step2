@@ -1,0 +1,11 @@
+{
+  "chat_target": "main",
+  "context_compact_prompt_path": "prompts/context_compact.txt",
+  "context_k": 20,
+  "ctx_pool_max_items": 10,
+  "ctx_recent_max_tokens": 3000,
+  "cute_anim": true,
+  "heartbeat_minutes": 60,
+  "sse_enabled": true,
+  "think_mcp_enabled": true
+}

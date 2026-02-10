@@ -10378,7 +10378,10 @@ fn handle_model_stream_chunk(args: ModelStreamChunkArgs<'_>, content: &str, reas
                     if let Some(entry) = core.history.get_mut(idx) {
                         entry.role = Role::Tool;
                         // 工具 JSON 预览阶段：不显示原始 JSON，只给一个可读占位，等 ToolStreamStart 再补齐详情。
-                        entry.text = crate::mcp::tool_display_label(tool_name.trim());
+                        let label = crate::mcp::tool_display_label(tool_name.trim());
+                        entry.text = format!(
+                            "操作: {label}\nexplain: 解析工具调用\ninput: ...\noutput:\n```text\n...\n```\nmeta:\n```text\n状态:parsing\n```\n"
+                        );
                         render_cache.invalidate(idx);
                     }
                     *tool_preview_chat_idx = Some(idx);

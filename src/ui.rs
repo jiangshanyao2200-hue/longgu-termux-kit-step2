@@ -525,43 +525,79 @@ fn extract_tool_saved_path(text: &str) -> Option<String> {
     None
 }
 
-fn build_tool_compact_status(text: &str) -> String {
+fn build_tool_compact_status(text: &str, tick: usize) -> String {
     let saved = extract_tool_saved_path(text);
     let status = extract_tool_status_token(text);
+    let status_lower = status.as_deref().unwrap_or("").trim().to_ascii_lowercase();
     let timed_out = status.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("timeout"))
         || text.contains("【Timed out】")
         || text.contains("Timed out and terminated");
-    let failed = tool_status_result_line(text).is_some();
+    let failed_line = tool_status_result_line(text);
     let truncated = text.contains("[输出已截断");
     let has_output = !text.contains("(no output)");
 
+    fn spinner(tick: usize) -> &'static str {
+        match tick % 3 {
+            0 => ".",
+            1 => "..",
+            _ => "...",
+        }
+    }
+
+    // tool stub / 执行中：给出轻量动画反馈，避免“卡住”错觉。
+    if matches!(
+        status_lower.as_str(),
+        "parsing" | "preview" | "running" | "in_progress" | "processing"
+    ) {
+        let label = if matches!(status_lower.as_str(), "parsing" | "preview") {
+            "解析中"
+        } else {
+            "处理中"
+        };
+        return format!("{label}{}", spinner(tick));
+    }
+
     if saved.as_deref().is_some_and(|s| !s.trim().is_empty()) {
         if timed_out {
-            return "执行超时（输出已导出）".to_string();
+            return "执行超时：输出已导出".to_string();
         }
-        if failed {
-            return "执行失败（输出已导出）".to_string();
+        if failed_line.is_some() {
+            return "操作失败：输出已导出".to_string();
         }
-        return "输出已导出".to_string();
+        return "处理完成：输出已导出".to_string();
     }
 
     if timed_out {
         return if has_output {
-            "执行超时（已返回部分输出）".to_string()
+            "执行超时：已返回部分输出".to_string()
         } else {
             "执行超时".to_string()
         };
     }
-    if failed {
-        if let Some(token) = status.as_deref().filter(|s| !s.trim().is_empty()) {
-            return format!("执行失败（{token}）");
+    if let Some(line) = failed_line {
+        let mut reason = line.trim().to_string();
+        if let Some(rest) = reason.strip_prefix("执行失败：") {
+            reason = rest.trim().to_string();
         }
-        return "执行失败".to_string();
+        if reason.eq_ignore_ascii_case("fail") || reason.eq_ignore_ascii_case("error") {
+            let (out_lines, _meta_lines) = extract_tool_sections(text);
+            if let Some(first) = out_lines
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .find(|s| !s.is_empty())
+            {
+                reason = compact_preview(&first, 60);
+            }
+        }
+        if reason.is_empty() {
+            return "操作失败".to_string();
+        }
+        return format!("操作失败：{reason}");
     }
     if truncated {
-        return "输出已截断".to_string();
+        return "处理完成：输出已截断".to_string();
     }
-    "执行成功".to_string()
+    "处理完成".to_string()
 }
 
 fn extract_tool_status_token(text: &str) -> Option<String> {
@@ -2718,13 +2754,13 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         .add_modifier(Modifier::ITALIC);
                     lines.push(Line::from(vec![
                         Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
-                        Span::styled("↲ ", arrow_style),
+                        Span::styled("↳ ", arrow_style),
                         Span::styled(brief_fit, brief_style),
                     ]));
                 }
 
                 // 第三行：状态摘要（超时/失败/成功/保存路径等）
-                let status = build_tool_compact_status(&msg.text);
+                let status = build_tool_compact_status(&msg.text, tick);
                 let mut status_chunks = wrap_plain_line(&status, avail);
                 const STATUS_MAX_LINES: usize = 2;
                 if status_chunks.len() > STATUS_MAX_LINES {
@@ -3197,7 +3233,7 @@ mod tests {
         assert!(joined.contains("安全测试"));
         assert!(joined.contains("换行"));
         assert!(!joined.contains("saved:log/adb-"));
-        assert!(joined.contains("输出已导出"));
+        assert!(joined.contains("导出"));
     }
 }
 

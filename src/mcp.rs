@@ -25,6 +25,7 @@ const SEARCH_MAX_FILESIZE: &str = "1M";
 const SEARCH_MAX_FILE_BYTES: usize = 1_048_576;
 const SEARCH_MAX_KEYWORDS: usize = 8;
 const SEARCH_MAX_FILES_SCAN: usize = 8_000;
+const SEARCH_TIMEOUT_SECS: u64 = 30;
 const TOOL_TIMEOUT_SECS: u64 = 10;
 const TOOL_TIMEOUT_KILL_SECS: u64 = 2;
 // termux_api 默认给更宽松的超时：避免某些系统 API（如 wifi 扫描/定位/SAF）在弱机上经常误超时。
@@ -2193,8 +2194,9 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let started = Instant::now();
     let timeout_secs = call
         .timeout_secs
-        .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000));
-    let timeout_hint = timeout_secs.or(Some(TOOL_TIMEOUT_SECS));
+        .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000))
+        .or(Some(SEARCH_TIMEOUT_SECS));
+    let timeout_hint = timeout_secs;
     let pattern_preview = build_preview(&pattern_effective, 80);
     if search_files {
         let needles: Vec<String> = keywords
@@ -2208,7 +2210,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             &needles,
             max_matches,
             started,
-            timeout_hint.unwrap_or(TOOL_TIMEOUT_SECS),
+            timeout_hint.unwrap_or(SEARCH_TIMEOUT_SECS),
             &mut matches,
         );
         let elapsed = started.elapsed();
@@ -2218,6 +2220,12 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         } else {
             matches.join("\n")
         };
+        if match_count >= max_matches && match_count > 0 {
+            body = format!(
+                "【结果过多】已返回前 {max_matches} 条文件名匹配结果（结果可能不完整）。\n{}",
+                body.trim_end()
+            );
+        }
         if !finished {
             body = annotate_timeout(body, true, timeout_hint);
         }
@@ -2269,7 +2277,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             &needles,
             max_matches,
             started,
-            timeout_hint.unwrap_or(TOOL_TIMEOUT_SECS),
+            timeout_hint.unwrap_or(SEARCH_TIMEOUT_SECS),
             &pattern_preview,
         ));
     }
@@ -2348,7 +2356,14 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         None
     };
 
-    let mut body = annotate_timeout(truncate_command_output(raw_body), timed_out, timeout_hint);
+    let mut display_body = raw_body;
+    if need_save && !no_match {
+        display_body = format!(
+            "【输出过大】已返回部分结果（输出已导出）。\n{}",
+            display_body.trim_end()
+        );
+    }
+    let mut body = annotate_timeout(truncate_command_output(display_body), timed_out, timeout_hint);
     let status_code = if no_match { 0 } else { code };
     body = annotate_nonzero_exit(body, timed_out, status_code);
     if let Some(p) = saved_path.as_deref() {
@@ -2385,6 +2400,7 @@ fn run_search_keywords_and(
     let mut skipped_unreadable = 0usize;
     let mut timed_out = false;
     let mut limit_reached = false;
+    let mut scan_limit_reached = false;
 
     let root_path = Path::new(root);
     let mut stack: Vec<PathBuf> = vec![root_path.to_path_buf()];
@@ -2407,7 +2423,7 @@ fn run_search_keywords_and(
                 break;
             }
             if files_scanned >= SEARCH_MAX_FILES_SCAN {
-                timed_out = true;
+                scan_limit_reached = true;
                 break;
             }
             let path = entry.path();
@@ -2478,11 +2494,11 @@ fn run_search_keywords_and(
                 let content = line.trim_end_matches(['\n', '\r']);
                 results.push(format!("{shown}:{line_no}:{content}"));
             }
-            if timed_out || limit_reached {
+            if timed_out || limit_reached || scan_limit_reached {
                 break;
             }
         }
-        if timed_out || limit_reached {
+        if timed_out || limit_reached || scan_limit_reached {
             break;
         }
     }
@@ -2493,6 +2509,21 @@ fn run_search_keywords_and(
     } else {
         results.join("\n")
     };
+
+    let mut notes: Vec<String> = Vec::new();
+    if limit_reached && max_matches > 0 {
+        notes.push(format!(
+            "【结果过多】已返回前 {max_matches} 条（结果可能不完整）。"
+        ));
+    }
+    if scan_limit_reached {
+        notes.push(format!(
+            "【扫描上限】已扫描 {SEARCH_MAX_FILES_SCAN} 个文件后提前终止（结果可能不完整）。"
+        ));
+    }
+    if !notes.is_empty() {
+        body = format!("{}\n{}", notes.join("\n"), body.trim_end());
+    }
     if timed_out {
         body = annotate_timeout(body, true, Some(timeout_secs));
     }
@@ -2528,6 +2559,9 @@ fn run_search_keywords_and(
     );
     if limit_reached {
         log.push_str(&format!(" | cap_reached:true | cap:{max_matches}"));
+    }
+    if scan_limit_reached {
+        log.push_str(&format!(" | scan_cap_reached:true | scan_cap:{SEARCH_MAX_FILES_SCAN}"));
     }
     if skipped_large > 0 {
         log.push_str(&format!(" | skipped_large:{skipped_large}"));

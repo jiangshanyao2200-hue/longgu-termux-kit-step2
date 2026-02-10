@@ -181,27 +181,6 @@ fn wrap_plain_line(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn truncate_middle_to_width(text: &str, width: usize) -> String {
-    if width == 0 || text.is_empty() {
-        return String::new();
-    }
-    let total = UnicodeWidthStr::width(text);
-    if total <= width {
-        return text.to_string();
-    }
-    if width <= 6 {
-        return truncate_to_width(text, width);
-    }
-    let ellipsis = "...";
-    let keep = width.saturating_sub(UnicodeWidthStr::width(ellipsis));
-    let head = keep / 2 + (keep % 2);
-    let tail = keep / 2;
-    let head_str = slice_by_cells(text, 0, head.max(1));
-    let tail_start = total.saturating_sub(tail.max(1));
-    let tail_str = slice_by_cells(text, tail_start, tail.max(1));
-    format!("{head_str}{ellipsis}{tail_str}")
-}
-
 fn truncate_for_ui(text: &str) -> Cow<'_, str> {
     if text.len() <= MAX_CHAT_BYTES {
         return Cow::Borrowed(text);
@@ -525,7 +504,7 @@ fn extract_tool_saved_path(text: &str) -> Option<String> {
     None
 }
 
-fn build_tool_compact_status(text: &str, tick: usize) -> String {
+fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
     let saved = extract_tool_saved_path(text);
     let status = extract_tool_status_token(text);
     let status_lower = status.as_deref().unwrap_or("").trim().to_ascii_lowercase();
@@ -554,25 +533,25 @@ fn build_tool_compact_status(text: &str, tick: usize) -> String {
         } else {
             "处理中"
         };
-        return format!("{label}{}", spinner(tick));
+        return Some(format!("{label}{}", spinner(tick)));
     }
 
     if saved.as_deref().is_some_and(|s| !s.trim().is_empty()) {
         if timed_out {
-            return "执行超时：输出已导出".to_string();
+            return Some("执行超时：输出已导出".to_string());
         }
         if failed_line.is_some() {
-            return "操作失败：输出已导出".to_string();
+            return Some("操作失败：输出已导出".to_string());
         }
-        return "处理完成：输出已导出".to_string();
+        return Some("处理完成：输出已导出".to_string());
     }
 
     if timed_out {
-        return if has_output {
+        return Some(if has_output {
             "执行超时：已返回部分输出".to_string()
         } else {
             "执行超时".to_string()
-        };
+        });
     }
     if let Some(line) = failed_line {
         let mut reason = line.trim().to_string();
@@ -590,14 +569,15 @@ fn build_tool_compact_status(text: &str, tick: usize) -> String {
             }
         }
         if reason.is_empty() {
-            return "操作失败".to_string();
+            return Some("操作失败".to_string());
         }
-        return format!("操作失败：{reason}");
+        return Some(format!("操作失败：{reason}"));
     }
     if truncated {
-        return "处理完成：输出已截断".to_string();
+        return Some("处理完成：输出已截断".to_string());
     }
-    "处理完成".to_string()
+    // 正常成功：不显示状态行（避免“机械化”）
+    None
 }
 
 fn extract_tool_status_token(text: &str) -> Option<String> {
@@ -2711,23 +2691,11 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 let w = width.max(1);
                 let line_idx = out.len();
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                let avail_inline = w.saturating_sub(fixed_w);
-                if w > fixed_w && !target_disp.trim().is_empty() {
-                    let cmd_fit = truncate_middle_to_width(target_disp.trim(), avail_inline.max(1));
-                    lines.push(Line::from(vec![
-                        Span::styled(head, Style::default().fg(theme.fg).bg(theme.bg)),
-                        Span::styled(
-                            tool_name,
-                            Style::default()
-                                .fg(theme.yellow)
-                                .bg(theme.bg)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(suffix, Style::default().fg(theme.fg).bg(theme.bg)),
-                        Span::styled(sep, Style::default().fg(theme.dim).bg(theme.bg)),
-                        Span::styled(cmd_fit, Style::default().fg(theme.fg).bg(theme.bg)),
-                    ]));
-                } else {
+                let avail_inline = w.saturating_sub(fixed_w).max(1);
+                // 第一行：brief（高亮），不再展示 command（避免先显示命令再补 brief 的跳动感）
+                let brief_chunks = wrap_plain_line(&brief, avail_inline);
+                let brief_style = Style::default().fg(theme.yellow).bg(theme.bg);
+                if brief_chunks.is_empty() {
                     lines.push(Line::from(vec![Span::styled(
                         truncate_to_width(&fixed, w),
                         Style::default()
@@ -2735,48 +2703,89 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                             .bg(theme.bg)
                             .add_modifier(Modifier::BOLD),
                     )]));
+                } else {
+                    for (idx, chunk) in brief_chunks.iter().enumerate() {
+                        if idx == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled(head.clone(), Style::default().fg(theme.fg).bg(theme.bg)),
+                                Span::styled(
+                                    tool_name.clone(),
+                                    Style::default()
+                                        .fg(theme.yellow)
+                                        .bg(theme.bg)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(suffix.clone(), Style::default().fg(theme.fg).bg(theme.bg)),
+                                Span::styled(sep, Style::default().fg(theme.dim).bg(theme.bg)),
+                                Span::styled(chunk.clone(), brief_style),
+                            ]));
+                        } else {
+                            let prefix = " ".repeat(fixed_w.min(w.saturating_sub(1)).max(2));
+                            lines.push(Line::from(vec![
+                                Span::styled(prefix, Style::default().fg(theme.dim).bg(theme.bg)),
+                                Span::styled(chunk.clone(), brief_style),
+                            ]));
+                        }
+                        if idx >= 4 {
+                            break;
+                        }
+                    }
                 }
 
                 let indent_w = fixed_w.min(w.saturating_sub(1)).max(2);
                 let indent = " ".repeat(indent_w);
                 let avail = w.saturating_sub(indent_w).max(1);
 
-                // 第二行：brief（超长时中间省略）
-                let brief_fit = truncate_middle_to_width(brief.trim(), avail);
-                if !brief_fit.trim().is_empty() {
+                // 第二行：command（↳ 斜体）
+                let cmd_chunks = wrap_plain_line(&target_disp, avail.saturating_sub(2).max(1));
+                if !cmd_chunks.is_empty() {
                     let arrow_style = Style::default()
                         .fg(theme.dim)
                         .bg(theme.bg)
                         .add_modifier(Modifier::ITALIC);
-                    let brief_style = Style::default()
+                    let cmd_style = Style::default()
                         .fg(theme.fg)
                         .bg(theme.bg)
                         .add_modifier(Modifier::ITALIC);
-                    lines.push(Line::from(vec![
-                        Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
-                        Span::styled("↳ ", arrow_style),
-                        Span::styled(brief_fit, brief_style),
-                    ]));
+                    for (idx, chunk) in cmd_chunks.iter().enumerate() {
+                        if idx == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                                Span::styled("↳ ", arrow_style),
+                                Span::styled(chunk.clone(), cmd_style),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                                Span::styled("  ", Style::default().fg(theme.dim).bg(theme.bg)),
+                                Span::styled(chunk.clone(), cmd_style),
+                            ]));
+                        }
+                        if idx >= 3 {
+                            break;
+                        }
+                    }
                 }
 
-                // 第三行：状态摘要（超时/失败/成功/保存路径等）
-                let status = build_tool_compact_status(&msg.text, tick);
-                let mut status_chunks = wrap_plain_line(&status, avail);
-                const STATUS_MAX_LINES: usize = 2;
-                if status_chunks.len() > STATUS_MAX_LINES {
-                    status_chunks.truncate(STATUS_MAX_LINES);
-                    if let Some(last) = status_chunks.last_mut() {
-                        *last = truncate_to_width(&format!("{last} ..."), avail);
+                // 第三行：只在“特殊情况”显示（超时/失败/导出/截断/执行中）
+                if let Some(status) = build_tool_compact_status_line(&msg.text, tick) {
+                    let mut status_chunks = wrap_plain_line(&status, avail);
+                    const STATUS_MAX_LINES: usize = 2;
+                    if status_chunks.len() > STATUS_MAX_LINES {
+                        status_chunks.truncate(STATUS_MAX_LINES);
+                        if let Some(last) = status_chunks.last_mut() {
+                            *last = truncate_to_width(&format!("{last} ..."), avail);
+                        }
                     }
-                }
-                for chunk in status_chunks {
-                    if chunk.trim().is_empty() {
-                        continue;
+                    for chunk in status_chunks {
+                        if chunk.trim().is_empty() {
+                            continue;
+                        }
+                        lines.push(Line::from(vec![
+                            Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                            Span::styled(chunk, Style::default().fg(theme.dim).bg(theme.bg)),
+                        ]));
                     }
-                    lines.push(Line::from(vec![
-                        Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
-                        Span::styled(chunk, Style::default().fg(theme.dim).bg(theme.bg)),
-                    ]));
                 }
 
                 if reveal_idx != Some(msg_idx) {

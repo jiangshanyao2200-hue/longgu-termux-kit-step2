@@ -767,6 +767,42 @@ fn parse_search_hit_line(line: &str) -> Option<(String, usize, String)> {
     Some((path, line_no, content))
 }
 
+fn sanitize_search_line(raw: &str) -> String {
+    // 防止把文件内容里的控制字符/ANSI escape 注入到 TUI，导致闪烁/乱码/震动等现象。
+    // 规则：保留可见字符与 '\t'；其它控制字符全部替换为空格。
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch == '\t' {
+            out.push('\t');
+            continue;
+        }
+        if ch >= ' ' && ch != '\u{7f}' {
+            // 过滤 ESC（ANSI）与其它 C0/C1 控制
+            if ch == '\u{1b}' {
+                out.push(' ');
+            } else {
+                out.push(ch);
+            }
+        } else {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+fn is_probably_binary_file(path: &Path) -> bool {
+    // 快速二进制探测：存在 NUL 基本可判定为 binary。
+    // 这能避免 sqlite/db 等文件被 AND/context 模式扫描后产生乱码与控制序列。
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 2048];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    buf[..n].iter().any(|b| *b == 0)
+}
+
 fn resolve_search_hit_path(root: &str, hit_path: &str) -> PathBuf {
     let hit = hit_path.trim();
     if hit.starts_with('/') {
@@ -2863,6 +2899,7 @@ struct SearchWithContextArgs<'a> {
 struct SearchScanStats {
     files_scanned: usize,
     skipped_large: usize,
+    skipped_binary: usize,
     skipped_unreadable: usize,
     timed_out: bool,
     scan_limit_reached: bool,
@@ -2930,6 +2967,10 @@ fn scan_keywords_and_hits(args: &SearchWithContextArgs<'_>) -> (Vec<SearchHit>, 
                 stats.skipped_large = stats.skipped_large.saturating_add(1);
                 continue;
             }
+            if is_probably_binary_file(&path) {
+                stats.skipped_binary = stats.skipped_binary.saturating_add(1);
+                continue;
+            }
             let file = match fs::File::open(&path) {
                 Ok(f) => f,
                 Err(_) => {
@@ -2966,12 +3007,11 @@ fn scan_keywords_and_hits(args: &SearchWithContextArgs<'_>) -> (Vec<SearchHit>, 
                 if !args.needles.iter().all(|kw| lower.contains(kw)) {
                     continue;
                 }
+                let clean = sanitize_search_line(line.trim_end_matches(['\n', '\r']));
                 hits.push(SearchHit {
                     path: path.clone(),
                     line_no,
-                    line: line
-                        .trim_end_matches(['\n', '\r'])
-                        .to_string(),
+                    line: clean,
                 });
             }
             if stats.timed_out || stats.cap_reached || stats.scan_limit_reached {
@@ -3050,6 +3090,10 @@ fn build_context_pack(
             blocks.push(format!("=== {shown} ===\n(跳过：文件过大 > {SEARCH_MAX_FILE_BYTES} bytes)"));
             continue;
         }
+        if is_probably_binary_file(&path) {
+            blocks.push(format!("=== {shown} ===\n(跳过：二进制文件)"));
+            continue;
+        }
 
         let file = match fs::File::open(&path) {
             Ok(f) => f,
@@ -3104,7 +3148,10 @@ fn build_context_pack(
         for (s, e) in merged.into_iter() {
             block.push_str(&format!("({s}-{e})\n"));
             for ln in s..=e {
-                let text = lines.get(ln.saturating_sub(1)).map(|s| s.as_str()).unwrap_or("");
+                let text = lines
+                    .get(ln.saturating_sub(1))
+                    .map(|s| sanitize_search_line(s))
+                    .unwrap_or_default();
                 block.push_str(&format!("{:>width$} | {}\n", ln, text, width = width));
             }
         }
@@ -3451,6 +3498,9 @@ fn run_search_keywords_and(
     }
     if stats.skipped_large > 0 {
         log.push_str(&format!(" | skipped_large:{}", stats.skipped_large));
+    }
+    if stats.skipped_binary > 0 {
+        log.push_str(&format!(" | skipped_binary:{}", stats.skipped_binary));
     }
     if stats.skipped_unreadable > 0 {
         log.push_str(&format!(" | skipped_unreadable:{}", stats.skipped_unreadable));
@@ -4973,10 +5023,10 @@ fn compact_search_stdout(stdout: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for line in stdout.lines() {
         if let Some((p, ln, content)) = parse_search_hit_line(line) {
-            let snippet = build_preview(content.trim(), SNIP);
+            let snippet = build_preview(&sanitize_search_line(content.trim()), SNIP);
             out.push(format!("{p}:{ln}:{snippet}"));
         } else {
-            out.push(build_preview(line.trim(), SNIP));
+            out.push(build_preview(&sanitize_search_line(line.trim()), SNIP));
         }
     }
     out.join("\n").trim_end().to_string()

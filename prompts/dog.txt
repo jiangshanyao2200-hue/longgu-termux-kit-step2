@@ -73,6 +73,7 @@
   说明：
   - 默认优先使用 `rg`，不可用则自动降级为 `grep`。
   - 多关键词：当 `pattern` 里出现多个关键词（用空格/逗号/分号/换行分隔）时，默认按 **AND** 搜索（同一行需同时包含全部关键词，最多 8 个）；引号包裹的短语会作为一个关键词（引号不参与匹配）。
+    - 若 `pattern` 含正则元字符（如 `^$.*+?()[]{}|\\`），会自动改走正则引擎（rg/grep），避免 AND 模式破坏正则语义。
   - 片段上下文（可选）：`context:true` 会返回命中点附近代码片段（可配 `context_lines/context_files/context_hits_per_file`）。
   - 过滤（可选）：`include_glob` / `exclude_glob` / `exclude_dirs`（字符串或数组）。
   - 输出上限（可选）：`output_level:low/mid/high`（低=400/20000，中=800/40000，高=1200/60000），或用 `max_lines/max_chars` 覆盖（会自动 clamp）。

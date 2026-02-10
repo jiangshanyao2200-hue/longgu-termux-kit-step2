@@ -615,6 +615,74 @@ fn normalize_search_pattern(raw_pattern: &str) -> (String, Vec<String>) {
     (raw_pattern.to_string(), keywords)
 }
 
+fn search_pattern_looks_like_regex(raw: &str) -> bool {
+    // 默认 search 走正则（rg/grep），但“多关键词 AND”是额外增强：
+    // - 仅在看起来像“纯关键词”时启用 AND，避免破坏用户正则语义（尤其是带空格的正则）。
+    // - 一旦包含常见正则元字符，就视为 regex。
+    let s = raw.trim();
+    if s.is_empty() {
+        return false;
+    }
+    const META: &str = "^$.*+?()[]{}|\\";
+    s.chars().any(|c| META.contains(c))
+}
+
+fn parse_search_dsl_fallback(raw: &str) -> Option<(String, String, Option<bool>)> {
+    // 兼容一些“误把字段写进 pattern 字符串”的情况：
+    // - pattern=<...> in <root>
+    // - file=<...> in <root>
+    // - root=<root>, pattern=<...>
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // 1) <key>=<val> in <root>
+    if let Some((left, right)) = s.split_once(" in ") {
+        let left = left.trim();
+        let right = right.trim();
+        if !right.is_empty()
+            && (left.to_ascii_lowercase().starts_with("pattern=")
+                || left.to_ascii_lowercase().starts_with("file="))
+        {
+            let lower = left.to_ascii_lowercase();
+            let is_file = lower.starts_with("file=");
+            let val = left.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+            if !val.is_empty() {
+                return Some((val.to_string(), right.to_string(), Some(is_file)));
+            }
+        }
+    }
+
+    // 2) root=... pattern=...
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("root=") && lower.contains("pattern=") {
+        // 粗解析：按逗号分段
+        let mut root = None;
+        let mut pat = None;
+        for part in s.split(',') {
+            let t = part.trim();
+            let tl = t.to_ascii_lowercase();
+            if let Some(v) = tl.strip_prefix("root=") {
+                let v = t[t.len().saturating_sub(v.len())..].trim(); // keep original
+                if !v.is_empty() {
+                    root = Some(v.to_string());
+                }
+            }
+            if let Some(v) = tl.strip_prefix("pattern=") {
+                let v = t[t.len().saturating_sub(v.len())..].trim();
+                if !v.is_empty() {
+                    pat = Some(v.to_string());
+                }
+            }
+        }
+        if let (Some(p), Some(r)) = (pat, root) {
+            return Some((p, r, None));
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchHit {
     path: PathBuf,
@@ -935,6 +1003,26 @@ mod tests {
             .exclude_dirs
             .as_ref()
             .is_some_and(|v| v.iter().any(|x| x == "target")));
+    }
+
+    #[test]
+    fn search_regex_meta_disables_keyword_and() {
+        assert!(search_pattern_looks_like_regex("^apple"));
+        assert!(search_pattern_looks_like_regex("foo|bar"));
+        assert!(search_pattern_looks_like_regex("foo\\s+bar"));
+        assert!(!search_pattern_looks_like_regex("apple banana"));
+    }
+
+    #[test]
+    fn search_dsl_fallback_parses_pattern_in_root() {
+        let (p, r, f) = parse_search_dsl_fallback("pattern=^apple in ./prompts").expect("dsl");
+        assert_eq!(p, "^apple");
+        assert_eq!(r, "./prompts");
+        assert_eq!(f, Some(false));
+        let (p, r, f) = parse_search_dsl_fallback("file=motd.sh in .").expect("dsl");
+        assert_eq!(p, "motd.sh");
+        assert_eq!(r, ".");
+        assert_eq!(f, Some(true));
     }
 
     #[test]
@@ -2434,7 +2522,7 @@ fn run_stat_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 }
 
 fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    let pattern = call
+    let mut pattern = call
         .pattern
         .as_deref()
         .unwrap_or(call.input.trim())
@@ -2446,21 +2534,34 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             log_lines: vec![],
         });
     }
-    let (pattern_effective, keywords) = normalize_search_pattern(&pattern);
-    let root = call
+    let mut root = call
         .root
         .as_deref()
         .or(call.path.as_deref())
         .unwrap_or(".")
         .trim()
         .to_string();
+    let mut search_files = call.file.unwrap_or(false);
+    // 若调用方没有显式提供 root（或仅是 "."），但把字段写进了 pattern 字符串，则尽量自愈解析。
+    if call.root.as_deref().unwrap_or("").trim().is_empty()
+        && call.path.as_deref().unwrap_or("").trim().is_empty()
+    {
+        if let Some((p2, r2, f2)) = parse_search_dsl_fallback(&pattern) {
+            pattern = p2;
+            root = r2;
+            if let Some(f) = f2 {
+                search_files = f;
+            }
+        }
+    }
+
+    let (pattern_effective, keywords) = normalize_search_pattern(&pattern);
     if !Path::new(&root).exists() {
         return Ok(ToolOutcome {
             user_message: format!("search 根路径不存在：{root}"),
             log_lines: vec![],
         });
     }
-    let search_files = call.file.unwrap_or(false);
     let want_context = call.context.unwrap_or(false)
         || call.context_lines.is_some()
         || call.context_files.is_some()
@@ -2593,7 +2694,8 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             exclude_re: &exclude_re,
         }));
     }
-    if needles.len() >= 2 {
+    // 多关键词 AND：仅在“纯关键词”模式启用；带正则元字符时保留 regex 语义（rg/grep）。
+    if needles.len() >= 2 && !search_pattern_looks_like_regex(&pattern_effective) {
         return Ok(run_search_keywords_and(
             &root,
             &needles,

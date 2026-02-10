@@ -33,14 +33,12 @@
 - `adb` 工具是**非交互**执行：`input` 只写 `adb` 的参数部分（不要写 `adb` 前缀）。
   - 示例：`{"tool":"adb","input":"shell id","brief":"查看设备用户"}` 会实际执行：`adb -s 127.0.0.1:5555 shell id`
   - 常用：`shell <cmd>`、`push/pull`、`logcat`、`am start`、`pm list packages` 等。
-- 若需要“真正交互式 adb shell”（可以方向键移动、全屏 TUI 等），用 `bash interactive:true` 跑：`adb shell`（因为目前 `adb` 工具本身不提供 PTY 交互）。
 
 示例（长命令）：
 <tool>{"tool":"bash","input":"pkg update -y && pkg upgrade -y","brief":"验证 pkg 可用性","timeout_secs":180}</tool>
 
 示例（交互）：
 <tool>{"tool":"bash","input":"python","brief":"进入交互 python 验证键入/回显","interactive":true}</tool>
-<tool>{"tool":"bash","input":"adb shell","brief":"进入交互式 adb shell","interactive":true}</tool>
 
 安全约束：
 - 不要执行破坏性命令（如 `rm -rf`、`mkfs`、`dd if=` 等）除非用户明确要求；即使要求，也优先用只读/干跑方式验证。

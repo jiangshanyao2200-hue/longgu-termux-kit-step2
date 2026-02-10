@@ -8682,32 +8682,9 @@ fn run_loop(
 			                    }
 				                    if let Some(state) = pty.as_mut() {
 				                        let term_focus = matches!(pty_focus, PtyFocus::Terminal);
-				                        // 滚动回看：在“回看模式”（scroll>0）时，↑↓ 用于滚动，
-				                        // 避免一按方向键就把 scroll 归零导致“无法翻页”的观感。
-				                        // Ctrl+↑/↓：随时滚动（不转发给进程）。
+				                        // 滚动回看：只用 Ctrl+PgUp/PgDn（以及鼠标滚轮），避免占用 ↑↓，
+				                        // 让方向键在 Terminal 焦点下始终转发给 PTY（更符合“控制光标”的直觉）。
 				                        match key.code {
-				                            KeyCode::Up if ctrl && term_focus => {
-				                                state.scroll =
-				                                    state.scroll.saturating_add(1).min(PTY_SCROLLBACK_MAX);
-				                                state.dirty = true;
-				                                continue;
-				                            }
-				                            KeyCode::Down if ctrl && term_focus => {
-				                                state.scroll = state.scroll.saturating_sub(1);
-				                                state.dirty = true;
-				                                continue;
-				                            }
-				                            KeyCode::Up if term_focus && state.scroll > 0 => {
-				                                state.scroll =
-				                                    state.scroll.saturating_add(1).min(PTY_SCROLLBACK_MAX);
-				                                state.dirty = true;
-				                                continue;
-				                            }
-				                            KeyCode::Down if term_focus && state.scroll > 0 => {
-				                                state.scroll = state.scroll.saturating_sub(1);
-				                                state.dirty = true;
-				                                continue;
-				                            }
 				                            KeyCode::End if term_focus && state.scroll > 0 => {
 				                                state.scroll = 0;
 				                                state.dirty = true;

@@ -1579,12 +1579,28 @@ fn run_adb(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             first,
             "devices" | "connect" | "disconnect" | "start-server" | "kill-server" | "version"
         );
+    let skip_autoconnect = raw_mode
+        || matches!(
+            first,
+            "connect" | "disconnect" | "start-server" | "kill-server" | "version"
+        );
+
+    // 第一次使用 adb 时尽量自动拉起 tcp 连接；只有在“确实需要设备”的命令且自愈失败时才报错返回。
+    // 对 devices 这类全局命令：尝试自愈，但不因失败而提前返回，避免干扰用户自助排查。
+    let auto_connected = if skip_autoconnect {
+        false
+    } else {
+        ensure_adb_connected()
+    };
 
     // 兼容 deepseek-cli：input 不含 adb 前缀。
     let cmd = if global_cmd {
+        if first == "devices" && !auto_connected {
+            // ignore: 允许直接展示 adb devices 自身输出
+        }
         format!("adb {input}")
     } else {
-        if !ensure_adb_connected() {
+        if !auto_connected {
             return Ok(ToolOutcome {
                 user_message: format!(
                     "自动连接失败，无法连接 ADB 设备 {ADB_SERIAL}。\n可手动建立连接：\n1) su -c 'setprop service.adb.tcp.port 5555; setprop persist.adb.tcp.port 5555; setprop ctl.restart adbd'\n2) adb connect {ADB_SERIAL}\n完成后重试。"

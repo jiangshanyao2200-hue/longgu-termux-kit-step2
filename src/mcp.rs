@@ -22,6 +22,9 @@ const READ_MAX_LINES_CAP: usize = 1200;
 const SEARCH_DEFAULT_MAX_MATCHES: usize = 200;
 const SEARCH_MAX_MATCHES_CAP: usize = 1000;
 const SEARCH_MAX_FILESIZE: &str = "1M";
+const SEARCH_MAX_FILE_BYTES: usize = 1_048_576;
+const SEARCH_MAX_KEYWORDS: usize = 8;
+const SEARCH_MAX_FILES_SCAN: usize = 8_000;
 const TOOL_TIMEOUT_SECS: u64 = 10;
 const TOOL_TIMEOUT_KILL_SECS: u64 = 2;
 // termux_api 默认给更宽松的超时：避免某些系统 API（如 wifi 扫描/定位/SAF）在弱机上经常误超时。
@@ -415,6 +418,77 @@ fn apply_mind_msg_defaults(call: &mut ToolCall, raw_tool: &str) {
         call.target = Some(target);
         call.input.clear();
     }
+}
+
+fn parse_search_keywords(raw: &str) -> Vec<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut quote_end: Option<char> = None;
+
+    fn push_token(out: &mut Vec<String>, buf: &mut String) {
+        let t = compact_ws_inline(buf.trim());
+        buf.clear();
+        if t.is_empty() {
+            return;
+        }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+            return;
+        }
+        out.push(t);
+    }
+
+    for ch in s.chars() {
+        if let Some(end) = quote_end {
+            if ch == end {
+                quote_end = None;
+                push_token(&mut out, &mut buf);
+            } else {
+                buf.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                push_token(&mut out, &mut buf);
+                quote_end = Some('"');
+            }
+            '“' => {
+                push_token(&mut out, &mut buf);
+                quote_end = Some('”');
+            }
+            '‘' => {
+                push_token(&mut out, &mut buf);
+                quote_end = Some('’');
+            }
+            ',' | '，' | ';' | '；' | '\n' | '\t' | ' ' => {
+                push_token(&mut out, &mut buf);
+            }
+            _ => buf.push(ch),
+        }
+        if out.len() >= SEARCH_MAX_KEYWORDS {
+            break;
+        }
+    }
+    if quote_end.is_some() {
+        push_token(&mut out, &mut buf);
+    } else {
+        push_token(&mut out, &mut buf);
+    }
+    out.truncate(SEARCH_MAX_KEYWORDS);
+    out
+}
+
+fn normalize_search_pattern(raw_pattern: &str) -> (String, Vec<String>) {
+    let raw_pattern = raw_pattern.trim();
+    let keywords = parse_search_keywords(raw_pattern);
+    if keywords.len() == 1 {
+        return (keywords[0].clone(), keywords);
+    }
+    (raw_pattern.to_string(), keywords)
 }
 
 fn resolve_mind_target(call: &ToolCall) -> Option<String> {
@@ -1734,7 +1808,7 @@ fn count_file_lines(path: &str) -> Option<usize> {
 
 fn find_files_by_name_with_timeout(
     root: &Path,
-    pattern: &str,
+    needles: &[String],
     limit: usize,
     started: Instant,
     timeout_secs: u64,
@@ -1746,15 +1820,13 @@ fn find_files_by_name_with_timeout(
             .any(|d| d.eq_ignore_ascii_case(name))
     }
 
-    let pattern = pattern.trim();
-    if pattern.is_empty() || limit == 0 {
+    if needles.is_empty() || limit == 0 {
         return true;
     }
-    let needle = pattern.to_ascii_lowercase();
 
     fn walk(
         dir: &Path,
-        needle: &str,
+        needles: &[String],
         limit: usize,
         started: Instant,
         timeout_secs: u64,
@@ -1782,7 +1854,7 @@ fn find_files_by_name_with_timeout(
                 if is_excluded_dir(&name) {
                     continue;
                 }
-                if !walk(&path, needle, limit, started, timeout_secs, out) {
+                if !walk(&path, needles, limit, started, timeout_secs, out) {
                     return false;
                 }
                 continue;
@@ -1790,7 +1862,8 @@ fn find_files_by_name_with_timeout(
             if !path.is_file() {
                 continue;
             }
-            if name.to_ascii_lowercase().contains(needle) {
+            let lower = name.to_ascii_lowercase();
+            if needles.iter().all(|kw| lower.contains(kw)) {
                 let display = path.to_string_lossy().to_string();
                 let shown = short_display_path(&display);
                 if shown.is_empty() {
@@ -1811,7 +1884,7 @@ fn find_files_by_name_with_timeout(
         true
     }
 
-    walk(root, &needle, limit, started, timeout_secs, out)
+    walk(root, needles, limit, started, timeout_secs, out)
 }
 
 fn run_read_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
@@ -2098,6 +2171,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             log_lines: vec![],
         });
     }
+    let (pattern_effective, keywords) = normalize_search_pattern(&pattern);
     let root = call
         .root
         .as_deref()
@@ -2121,12 +2195,17 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .timeout_secs
         .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000));
     let timeout_hint = timeout_secs.or(Some(TOOL_TIMEOUT_SECS));
-    let pattern_preview = build_preview(&pattern, 80);
+    let pattern_preview = build_preview(&pattern_effective, 80);
     if search_files {
+        let needles: Vec<String> = keywords
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .take(SEARCH_MAX_KEYWORDS)
+            .collect();
         let mut matches: Vec<String> = Vec::new();
         let finished = find_files_by_name_with_timeout(
             Path::new(&root),
-            &pattern,
+            &needles,
             max_matches,
             started,
             timeout_hint.unwrap_or(TOOL_TIMEOUT_SECS),
@@ -2179,6 +2258,21 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             log_lines: vec![log],
         });
     }
+    let needles: Vec<String> = keywords
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .take(SEARCH_MAX_KEYWORDS)
+        .collect();
+    if needles.len() >= 2 {
+        return Ok(run_search_keywords_and(
+            &root,
+            &needles,
+            max_matches,
+            started,
+            timeout_hint.unwrap_or(TOOL_TIMEOUT_SECS),
+            &pattern_preview,
+        ));
+    }
     let mut engine = "rg";
     let mut rg_args: Vec<String> = vec![
         "--line-number".to_string(),
@@ -2194,7 +2288,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         rg_args.push(format!("!**/{d}/**"));
     }
     rg_args.push("--".to_string());
-    rg_args.push(pattern.clone());
+    rg_args.push(pattern_effective.clone());
     rg_args.push(root.clone());
 
     let mut grep_args: Vec<String> = vec![
@@ -2208,7 +2302,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         grep_args.push((*d).to_string());
     }
     grep_args.push("--".to_string());
-    grep_args.push(pattern);
+    grep_args.push(pattern_effective);
     grep_args.push(root.clone());
 
     let rg_refs: Vec<&str> = rg_args.iter().map(|s| s.as_str()).collect();
@@ -2275,6 +2369,180 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         user_message: body,
         log_lines: vec![log],
     })
+}
+
+fn run_search_keywords_and(
+    root: &str,
+    needles: &[String],
+    max_matches: usize,
+    started: Instant,
+    timeout_secs: u64,
+    pattern_preview: &str,
+) -> ToolOutcome {
+    let mut results: Vec<String> = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut skipped_large = 0usize;
+    let mut skipped_unreadable = 0usize;
+    let mut timed_out = false;
+    let mut limit_reached = false;
+
+    let root_path = Path::new(root);
+    let mut stack: Vec<PathBuf> = vec![root_path.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        if timeout_secs > 0 && started.elapsed().as_secs() >= timeout_secs {
+            timed_out = true;
+            break;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if timeout_secs > 0 && started.elapsed().as_secs() >= timeout_secs {
+                timed_out = true;
+                break;
+            }
+            if results.len() >= max_matches {
+                limit_reached = true;
+                break;
+            }
+            if files_scanned >= SEARCH_MAX_FILES_SCAN {
+                timed_out = true;
+                break;
+            }
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if SEARCH_EXCLUDE_DIRS
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(name.as_str()))
+                {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            files_scanned = files_scanned.saturating_add(1);
+            let size = fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
+            if size > SEARCH_MAX_FILE_BYTES {
+                skipped_large = skipped_large.saturating_add(1);
+                continue;
+            }
+
+            let file = match fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => {
+                    skipped_unreadable = skipped_unreadable.saturating_add(1);
+                    continue;
+                }
+            };
+            let mut reader = std::io::BufReader::new(file);
+            let mut buf: Vec<u8> = Vec::new();
+            let mut line_no = 0usize;
+            loop {
+                if timeout_secs > 0 && started.elapsed().as_secs() >= timeout_secs {
+                    timed_out = true;
+                    break;
+                }
+                if results.len() >= max_matches {
+                    limit_reached = true;
+                    break;
+                }
+                buf.clear();
+                let n = match reader.read_until(b'\n', &mut buf) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        skipped_unreadable = skipped_unreadable.saturating_add(1);
+                        break;
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                line_no = line_no.saturating_add(1);
+                let line = String::from_utf8_lossy(&buf);
+                let lower = line.to_ascii_lowercase();
+                if !needles.iter().all(|kw| lower.contains(kw)) {
+                    continue;
+                }
+                let display = path.to_string_lossy().to_string();
+                let shown = short_display_path(&display);
+                let shown = if shown.is_empty() {
+                    shorten_path(&display)
+                } else {
+                    shown
+                };
+                let content = line.trim_end_matches(['\n', '\r']);
+                results.push(format!("{shown}:{line_no}:{content}"));
+            }
+            if timed_out || limit_reached {
+                break;
+            }
+        }
+        if timed_out || limit_reached {
+            break;
+        }
+    }
+
+    let elapsed = started.elapsed();
+    let mut body = if results.is_empty() {
+        "未找到匹配".to_string()
+    } else {
+        results.join("\n")
+    };
+    if timed_out {
+        body = annotate_timeout(body, true, Some(timeout_secs));
+    }
+
+    let total_bytes = body.as_bytes().len();
+    let truncated_by_lines = body.lines().count() > OUTPUT_MAX_LINES;
+    let truncated_by_chars = body.chars().count() > OUTPUT_MAX_CHARS;
+    let need_save = total_bytes > SEARCH_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+    let saved_path = if need_save {
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let pid = unsafe { libc::getpid() };
+        let path = format!("{SEARCH_CACHE_DIR}/search_kw_{ts}_{pid}.log");
+        if try_write_shell_cache_impl(SEARCH_CACHE_DIR, &path, body.as_bytes(), &[]) {
+            Some(path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut body = truncate_command_output(body);
+    if let Some(p) = saved_path.as_deref() {
+        body.push_str(&format!("\n\n[saved:{p}]"));
+    }
+
+    let status = status_label(0, timed_out);
+    let mut log = format!(
+        "状态:{status} | 耗时:{}ms | root:{} | matches:{} | engine:and | pattern:{pattern_preview}",
+        elapsed.as_millis(),
+        shorten_path(root),
+        results.len()
+    );
+    if limit_reached {
+        log.push_str(&format!(" | cap_reached:true | cap:{max_matches}"));
+    }
+    if skipped_large > 0 {
+        log.push_str(&format!(" | skipped_large:{skipped_large}"));
+    }
+    if skipped_unreadable > 0 {
+        log.push_str(&format!(" | skipped_unreadable:{skipped_unreadable}"));
+    }
+    if let Some(p) = saved_path.as_deref() {
+        log.push_str(&format!(" | saved:{p}"));
+    }
+
+    ToolOutcome {
+        user_message: body,
+        log_lines: vec![log],
+    }
 }
 
 fn run_edit_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
@@ -4130,6 +4398,12 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
                 "file"
             } else {
                 "pattern"
+            };
+            let keywords = parse_search_keywords(pattern);
+            let pattern = match keywords.len() {
+                0 => pattern.to_string(),
+                1 => keywords[0].clone(),
+                _ => format!("\"{}\"", keywords.join(", ")),
             };
             build_preview(
                 &format!("{label}={pattern} in {}", display_tool_path(root)),

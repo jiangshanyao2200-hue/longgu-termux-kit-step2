@@ -2708,9 +2708,18 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 // 第二行：brief（超长时中间省略）
                 let brief_fit = truncate_middle_to_width(brief.trim(), avail);
                 if !brief_fit.trim().is_empty() {
+                    let arrow_style = Style::default()
+                        .fg(theme.dim)
+                        .bg(theme.bg)
+                        .add_modifier(Modifier::ITALIC);
+                    let brief_style = Style::default()
+                        .fg(theme.fg)
+                        .bg(theme.bg)
+                        .add_modifier(Modifier::ITALIC);
                     lines.push(Line::from(vec![
                         Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
-                        Span::styled(brief_fit, Style::default().fg(theme.fg).bg(theme.bg)),
+                        Span::styled("↲ ", arrow_style),
+                        Span::styled(brief_fit, brief_style),
                     ]));
                 }
 

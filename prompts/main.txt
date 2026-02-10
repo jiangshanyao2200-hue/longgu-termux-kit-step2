@@ -33,6 +33,8 @@
 - `adb` 工具是**非交互**执行：`input` 只写 `adb` 的参数部分（不要写 `adb` 前缀）。
   - 示例：`{"tool":"adb","input":"shell id","brief":"查看设备用户"}` 会实际执行：`adb -s 127.0.0.1:5555 shell id`
   - 常用：`shell <cmd>`、`push/pull`、`logcat`、`am start`、`pm list packages` 等。
+  - 超时：默认约 10s；可通过 `timeout_secs`/`timeout_ms` 覆盖（同 bash）。
+  - 大输出：若输出过大/被截断，会自动落盘到 `log/adb-cache/...`，并在末尾附 `[saved:...]` 供后续按需读取。
 
 示例（长命令）：
 <tool>{"tool":"bash","input":"pkg update -y && pkg upgrade -y","brief":"验证 pkg 可用性","timeout_secs":180}</tool>

@@ -60,6 +60,8 @@
   说明：
   - `adb` 工具为**非交互**执行：`input` 只写参数部分（不要加 `adb` 前缀）。
   - 默认目标设备：`127.0.0.1:5555`（自动 `adb connect`；必要时会尝试 `su` 重启 adbd tcp）。
+  - 超时：默认约 10s；可用 `timeout_secs/timeout_ms` 覆盖。
+  - 大输出：超阈值或被截断会落盘到 `log/adb-cache/...` 并附 `[saved:...]`。
 - termux_api：调用 termux-api。
   示例：{"tool":"termux_api","input":"termux-battery-status","brief":"我去了解下电池状态"}
 - search：全文搜索（优先使用）。

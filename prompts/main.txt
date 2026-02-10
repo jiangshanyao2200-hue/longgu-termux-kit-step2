@@ -54,6 +54,7 @@
   - `context_files`：最多返回多少个文件的上下文（默认 20，最大 60）
   - `context_hits_per_file`：每个文件最多展示多少处命中上下文（默认 3，最大 20）
 - 过滤（可选）：`include_glob` / `exclude_glob` / `exclude_dirs`（字符串或数组）。例如只搜 `*.rs`：`include_glob:["*.rs"]`。
+- 输出上限（可选）：默认使用“中档”上限（约 800 行 / 40000 字符）。可用 `output_level` 设置 `low/mid/high`（低=400/20000，中=800/40000，高=1200/60000）；也可用 `max_lines/max_chars` 细调（会自动 clamp）。
 - `count`：最大匹配条数（默认约 200，最大 1000）。
 - 超时：默认 `30s`；可用 `timeout_secs`/`timeout_ms` 覆盖；传 `0` 表示不启用超时（不建议）。
 - 大输出：若输出过大/被截断，会自动落盘到 `log/search-cache/...`，并在末尾附 `[saved:...]` 供后续按需读取。

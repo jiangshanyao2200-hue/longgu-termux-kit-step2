@@ -58,6 +58,31 @@ const TOOL_OUTPUT_RAW_MAX_CHARS: usize = 20_000;
 const TOOL_OUTPUT_RAW_MAX_LINES: usize = 400;
 const TOOL_META_RAW_MAX_CHARS: usize = 20_000;
 const TOOL_META_RAW_MAX_LINES: usize = 200;
+
+fn pick_search_output_limits(call: &ToolCall) -> (usize, usize) {
+    // 低/中/高：低 400/20000，中翻倍，高=低*3
+    let lvl = call
+        .output_level
+        .as_deref()
+        .unwrap_or("mid")
+        .trim()
+        .to_ascii_lowercase();
+    let (base_lines, base_chars) = match lvl.as_str() {
+        "low" | "l" | "small" => (400usize, 20_000usize),
+        "high" | "h" | "large" => (1200usize, 60_000usize),
+        _ => (800usize, 40_000usize),
+    };
+    let lines = call.max_lines.unwrap_or(base_lines).clamp(80, 1200);
+    let chars = call.max_chars.unwrap_or(base_chars).clamp(4_000, 60_000);
+    (lines, chars)
+}
+
+fn tool_output_limits_for_history(call: &ToolCall) -> (usize, usize) {
+    if call.tool == "search" {
+        return pick_search_output_limits(call);
+    }
+    (TOOL_OUTPUT_RAW_MAX_LINES, TOOL_OUTPUT_RAW_MAX_CHARS)
+}
 const WRITE_MAX_BYTES: usize = 400_000;
 const PATCH_MAX_BYTES: usize = 500_000;
 const EDIT_MAX_FILE_BYTES: usize = 800_000;
@@ -133,6 +158,8 @@ pub struct ToolCall {
     #[serde(default)]
     pub max_lines: Option<usize>,
     #[serde(default)]
+    pub max_chars: Option<usize>,
+    #[serde(default)]
     pub head: Option<bool>,
     #[serde(default)]
     pub tail: Option<bool>,
@@ -180,6 +207,10 @@ pub struct ToolCall {
     pub exclude_glob: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_dirs: Option<Vec<String>>,
+
+    // search 输出上限控制（可选）
+    #[serde(default)]
+    pub output_level: Option<String>,
 }
 
 fn parse_list_tokens(raw: &str, max: usize) -> Vec<String> {
@@ -400,6 +431,9 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                     .as_u64()
                     .or_else(|| val.as_str().and_then(|x| x.trim().parse::<u64>().ok()));
             }
+            "output_level" | "out_level" | "level" | "output" => {
+                call.output_level = s;
+            }
             "context" | "ctx" | "fast_context" => {
                 call.context = val
                     .as_bool()
@@ -429,6 +463,9 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             }
             "max_lines" | "lines" => {
                 call.max_lines = parse_usize_value(&val);
+            }
+            "max_chars" | "chars" | "max_char" => {
+                call.max_chars = parse_usize_value(&val);
             }
             "head" => {
                 call.head = val
@@ -1088,11 +1125,12 @@ fn format_tool_message_with_limits(
 }
 
 pub fn format_tool_message_raw(call: &ToolCall, outcome: &ToolOutcome) -> String {
+    let (out_lines, out_chars) = tool_output_limits_for_history(call);
     format_tool_message_with_limits(
         call,
         outcome,
-        TOOL_OUTPUT_RAW_MAX_LINES,
-        TOOL_OUTPUT_RAW_MAX_CHARS,
+        out_lines,
+        out_chars,
         TOOL_META_RAW_MAX_LINES,
         TOOL_META_RAW_MAX_CHARS,
     )
@@ -2438,6 +2476,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .or(Some(SEARCH_TIMEOUT_SECS));
     let timeout_hint = timeout_secs;
     let pattern_preview = build_preview(&pattern_effective, 80);
+    let (out_lines, out_chars) = pick_search_output_limits(call);
 
     let include_globs = call.include_glob.clone().unwrap_or_default();
     let exclude_globs = call.exclude_glob.clone().unwrap_or_default();
@@ -2480,8 +2519,8 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         }
 
         let total_bytes = body.as_bytes().len();
-        let truncated_by_lines = body.lines().count() > OUTPUT_MAX_LINES;
-        let truncated_by_chars = body.chars().count() > OUTPUT_MAX_CHARS;
+        let truncated_by_lines = body.lines().count() > out_lines;
+        let truncated_by_chars = body.chars().count() > out_chars;
         let need_save =
             total_bytes > SEARCH_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
         let saved_path = if need_save {
@@ -2497,7 +2536,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             None
         };
 
-        let mut body = truncate_command_output(body);
+        let mut body = truncate_tool_payload(&body, out_lines, out_chars);
         if let Some(p) = saved_path.as_deref() {
             body.push_str(&format!("\n\n[saved:{p}]"));
         }
@@ -2542,6 +2581,8 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             started,
             timeout_secs: timeout_hint.unwrap_or(SEARCH_TIMEOUT_SECS),
             pattern_preview: pattern_preview.as_str(),
+            out_lines,
+            out_chars,
             context_lines,
             context_files,
             hits_per_file,
@@ -2560,6 +2601,8 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             started,
             timeout_hint.unwrap_or(SEARCH_TIMEOUT_SECS),
             &pattern_preview,
+            out_lines,
+            out_chars,
             &include_re,
             &exclude_re,
             &extra_exclude_dirs,
@@ -2632,7 +2675,8 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let elapsed = started.elapsed();
 
     let match_count = stdout.lines().count();
-    let combined = collect_output(&stdout, &stderr);
+    let compact_stdout = compact_search_stdout(&stdout);
+    let combined = collect_output(&compact_stdout, &stderr);
     let no_match = combined.trim().is_empty() && code == 1 && !timed_out;
     let raw_body = if no_match {
         "未找到匹配".to_string()
@@ -2644,8 +2688,8 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .as_bytes()
         .len()
         .saturating_add(stderr.as_bytes().len());
-    let truncated_by_lines = raw_body.lines().count() > OUTPUT_MAX_LINES;
-    let truncated_by_chars = raw_body.chars().count() > OUTPUT_MAX_CHARS;
+    let truncated_by_lines = raw_body.lines().count() > out_lines;
+    let truncated_by_chars = raw_body.chars().count() > out_chars;
     let need_save =
         total_bytes > SEARCH_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
     let saved_path = if need_save {
@@ -2669,7 +2713,8 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             display_body.trim_end()
         );
     }
-    let mut body = annotate_timeout(truncate_command_output(display_body), timed_out, timeout_hint);
+    let mut body = annotate_timeout(display_body, timed_out, timeout_hint);
+    body = truncate_tool_payload(&body, out_lines, out_chars);
     let status_code = if no_match { 0 } else { code };
     body = annotate_nonzero_exit(body, timed_out, status_code);
     if let Some(p) = saved_path.as_deref() {
@@ -2700,6 +2745,8 @@ struct SearchWithContextArgs<'a> {
     started: Instant,
     timeout_secs: u64,
     pattern_preview: &'a str,
+    out_lines: usize,
+    out_chars: usize,
     context_lines: usize,
     context_files: usize,
     hits_per_file: usize,
@@ -2846,6 +2893,8 @@ fn build_context_pack(
     started: Instant,
     timed_out: bool,
     timeout_secs: u64,
+    out_lines: usize,
+    out_chars: usize,
     note_cap_reached: bool,
     note_scan_limit: bool,
     pattern_preview: &str,
@@ -2994,9 +3043,10 @@ fn build_context_pack(
 
     let elapsed = started.elapsed();
     let total_bytes = body.as_bytes().len();
-    let truncated_by_lines = body.lines().count() > OUTPUT_MAX_LINES;
-    let truncated_by_chars = body.chars().count() > OUTPUT_MAX_CHARS;
-    let need_save = total_bytes > SEARCH_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+    let truncated_by_lines = body.lines().count() > out_lines;
+    let truncated_by_chars = body.chars().count() > out_chars;
+    let need_save =
+        total_bytes > SEARCH_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
     let saved_path = if need_save {
         let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let pid = unsafe { libc::getpid() };
@@ -3010,7 +3060,7 @@ fn build_context_pack(
         None
     };
 
-    let mut body = truncate_command_output(body);
+    let mut body = truncate_tool_payload(&body, out_lines, out_chars);
     if let Some(p) = saved_path.as_deref() {
         body.push_str(&format!("\n\n[saved:{p}]"));
     }
@@ -3043,6 +3093,8 @@ fn run_search_with_context(args: SearchWithContextArgs<'_>) -> ToolOutcome {
             args.started,
             stats.timed_out,
             args.timeout_secs,
+            args.out_lines,
+            args.out_chars,
             stats.cap_reached,
             stats.scan_limit_reached,
             args.pattern_preview,
@@ -3178,6 +3230,8 @@ fn run_search_with_context(args: SearchWithContextArgs<'_>) -> ToolOutcome {
         args.started,
         timed_out,
         args.timeout_secs,
+        args.out_lines,
+        args.out_chars,
         note_cap_reached,
         false,
         args.pattern_preview,
@@ -3191,6 +3245,8 @@ fn run_search_keywords_and(
     started: Instant,
     timeout_secs: u64,
     pattern_preview: &str,
+    out_lines: usize,
+    out_chars: usize,
     include_re: &[Regex],
     exclude_re: &[Regex],
     extra_exclude_dirs: &[String],
@@ -3203,6 +3259,8 @@ fn run_search_keywords_and(
         started,
         timeout_secs,
         pattern_preview,
+        out_lines,
+        out_chars,
         context_lines: 1,
         context_files: 1,
         hits_per_file: 1,
@@ -3222,7 +3280,8 @@ fn run_search_keywords_and(
         } else {
             shown
         };
-        results.push(format!("{shown}:{}:{}", h.line_no, h.line));
+        let snippet = build_preview(h.line.trim(), 160);
+        results.push(format!("{shown}:{}:{snippet}", h.line_no, snippet = snippet));
     }
 
     let elapsed = started.elapsed();
@@ -3251,8 +3310,8 @@ fn run_search_keywords_and(
     }
 
     let total_bytes = body.as_bytes().len();
-    let truncated_by_lines = body.lines().count() > OUTPUT_MAX_LINES;
-    let truncated_by_chars = body.chars().count() > OUTPUT_MAX_CHARS;
+    let truncated_by_lines = body.lines().count() > out_lines;
+    let truncated_by_chars = body.chars().count() > out_chars;
     let need_save =
         total_bytes > SEARCH_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
     let saved_path = if need_save {
@@ -3268,7 +3327,7 @@ fn run_search_keywords_and(
         None
     };
 
-    let mut body = truncate_command_output(body);
+    let mut body = truncate_tool_payload(&body, out_lines, out_chars);
     if let Some(p) = saved_path.as_deref() {
         body.push_str(&format!("\n\n[saved:{p}]"));
     }
@@ -4805,6 +4864,20 @@ fn collect_output(stdout: &str, stderr: &str) -> String {
         sections.push(format!("[stderr]\n{}", err.trim_end()));
     }
     sections.join("\n").trim().to_string()
+}
+
+fn compact_search_stdout(stdout: &str) -> String {
+    const SNIP: usize = 160;
+    let mut out: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        if let Some((p, ln, content)) = parse_search_hit_line(line) {
+            let snippet = build_preview(content.trim(), SNIP);
+            out.push(format!("{p}:{ln}:{snippet}"));
+        } else {
+            out.push(build_preview(line.trim(), SNIP));
+        }
+    }
+    out.join("\n").trim_end().to_string()
 }
 
 fn truncate_by_lines(text: &str, max_lines: usize) -> (String, bool) {

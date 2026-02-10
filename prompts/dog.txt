@@ -75,6 +75,7 @@
   - 多关键词：当 `pattern` 里出现多个关键词（用空格/逗号/分号/换行分隔）时，默认按 **AND** 搜索（同一行需同时包含全部关键词，最多 8 个）；引号包裹的短语会作为一个关键词（引号不参与匹配）。
   - 片段上下文（可选）：`context:true` 会返回命中点附近代码片段（可配 `context_lines/context_files/context_hits_per_file`）。
   - 过滤（可选）：`include_glob` / `exclude_glob` / `exclude_dirs`（字符串或数组）。
+  - 输出上限（可选）：`output_level:low/mid/high`（低=400/20000，中=800/40000，高=1200/60000），或用 `max_lines/max_chars` 覆盖（会自动 clamp）。
   - 超时：默认 `30s`；可用 `timeout_secs`/`timeout_ms` 覆盖；传 `0` 表示不启用超时（不建议）。
   - 大输出：超阈值或被截断会落盘到 `log/search-cache/...` 并附 `[saved:...]`。
 - mind_msg：向萤Main同步信息（target=main）。

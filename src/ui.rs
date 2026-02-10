@@ -537,12 +537,12 @@ fn build_tool_compact_status(text: &str) -> String {
 
     if saved.as_deref().is_some_and(|s| !s.trim().is_empty()) {
         if timed_out {
-            return "执行超时（输出已保存）".to_string();
+            return "执行超时（输出已导出）".to_string();
         }
         if failed {
-            return "执行失败（输出已保存）".to_string();
+            return "执行失败（输出已导出）".to_string();
         }
-        return "输出过大已保存".to_string();
+        return "输出已导出".to_string();
     }
 
     if timed_out {
@@ -3188,7 +3188,7 @@ mod tests {
         assert!(joined.contains("安全测试"));
         assert!(joined.contains("换行"));
         assert!(!joined.contains("saved:log/adb-"));
-        assert!(joined.contains("输出过大已保存"));
+        assert!(joined.contains("输出已导出"));
     }
 }
 

@@ -535,14 +535,14 @@ fn build_tool_compact_status(text: &str) -> String {
     let truncated = text.contains("[输出已截断");
     let has_output = !text.contains("(no output)");
 
-    if let Some(p) = saved.as_deref().filter(|s| !s.trim().is_empty()) {
+    if saved.as_deref().is_some_and(|s| !s.trim().is_empty()) {
         if timed_out {
-            return format!("timeout | saved:{p}");
+            return "执行超时（输出已保存）".to_string();
         }
         if failed {
-            return format!("failed | saved:{p}");
+            return "执行失败（输出已保存）".to_string();
         }
-        return format!("saved:{p}");
+        return "输出过大已保存".to_string();
     }
 
     if timed_out {
@@ -3187,8 +3187,8 @@ mod tests {
         assert!(joined.contains("shell ls"));
         assert!(joined.contains("安全测试"));
         assert!(joined.contains("换行"));
-        assert!(joined.contains("saved:log/adb-"));
-        assert!(joined.contains("adb_test.log"));
+        assert!(!joined.contains("saved:log/adb-"));
+        assert!(joined.contains("输出过大已保存"));
     }
 }
 

@@ -57,7 +57,10 @@
   - timeout_secs/timeout_ms：调整超时；非交互不传通常为默认超时（约 10s），交互默认 0 不自动终止。
 - adb：执行 adb 命令。
   示例：{"tool":"adb","input":"shell getprop ro.product.model","brief":"OK！我看看设备型号"}
-  如连接失败需bash建立tcp连接，端口5555
+  说明：
+  - `adb` 工具为**非交互**执行：`input` 只写参数部分（不要加 `adb` 前缀）。
+  - 默认目标设备：`127.0.0.1:5555`（自动 `adb connect`；必要时会尝试 `su` 重启 adbd tcp）。
+  - 交互式场景（需要方向键、全屏 TUI、持续输入）：用 `bash` + `interactive:true` 启动 `adb shell`，不要用 `adb` 工具直接做交互。
 - termux_api：调用 termux-api。
   示例：{"tool":"termux_api","input":"termux-battery-status","brief":"我去了解下电池状态"}
 - search：全文搜索（优先使用）。

@@ -8604,24 +8604,6 @@ fn run_loop(
 				                        pty_view = false;
 				                        continue;
 				                    }
-					                    // Ctrl+Q：紧急退出（Kill）交互进程并离开终端视图。
-					                    if ctrl
-					                        && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
-					                        && !alt
-					                    {
-						                        if let Some(state) = pty.as_mut() {
-						                            let _ = state.ctrl_tx.send(PtyControl::Kill);
-						                        }
-						                        pty_view = false;
-						                        pty_focus = PtyFocus::Terminal;
-						                        pty_exit_requested = true;
-						                        push_sys_log(
-						                            &mut sys_log,
-						                            config.sys_log_limit,
-						                            "Terminal: killed (Ctrl+Q)",
-						                        );
-					                        continue;
-					                    }
 				                    if alt && !ctrl && matches!(key.code, KeyCode::Up) {
 				                        if let Some(state) = pty.as_mut() {
 				                            let snap = state.snapshot_plain();
@@ -8695,15 +8677,15 @@ fn run_loop(
 				                        // PgUp/PgDn：切换焦点（PTY ↔ 输入框）。
 				                        // - PgUp：焦点到 PTY（方向键/回车等直接操作终端）
 				                        // - PgDn：焦点到输入框（本地编辑一行，Enter 送入 PTY）
-				                        // Ctrl+PgUp/PgDn：本地滚动回看（不转发给进程）。
+				                        // Alt+PgUp/PgDn：本地滚动回看（不转发给进程）。
 				                        match key.code {
-				                            KeyCode::PageUp if ctrl => {
+				                            KeyCode::PageUp if alt && !ctrl => {
 				                                state.scroll =
 				                                    state.scroll.saturating_add(6).min(PTY_SCROLLBACK_MAX);
 				                                state.dirty = true;
 				                                continue;
 				                            }
-				                            KeyCode::PageDown if ctrl => {
+				                            KeyCode::PageDown if alt && !ctrl => {
 				                                state.scroll = state.scroll.saturating_sub(6);
 				                                state.dirty = true;
 				                                continue;

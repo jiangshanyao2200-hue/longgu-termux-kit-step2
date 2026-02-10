@@ -64,6 +64,10 @@
   - 大输出：超阈值或被截断会落盘到 `log/adb-cache/...` 并附 `[saved:...]`。
 - termux_api：调用 termux-api。
   示例：{"tool":"termux_api","input":"termux-battery-status","brief":"我去了解下电池状态"}
+  说明：
+  - `termux_api` 工具为**非交互**执行：`input` 只写 `termux-*` 命令。
+  - 超时：默认 25s；可用 `timeout_secs`/`timeout_ms` 覆盖；传 `0` 表示不启用超时（不建议）。
+  - 大输出：超阈值或被截断会落盘到 `log/termux-api-cache/...` 并附 `[saved:...]`。
 - search：全文搜索（优先使用）。
   示例：{"tool":"search","pattern":"TODO","root":"src","brief":"稍等，我在搜索待办"}
 - mind_msg：向萤Main同步信息（target=main）。

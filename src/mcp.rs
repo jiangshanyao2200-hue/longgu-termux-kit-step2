@@ -24,6 +24,8 @@ const SEARCH_MAX_MATCHES_CAP: usize = 1000;
 const SEARCH_MAX_FILESIZE: &str = "1M";
 const TOOL_TIMEOUT_SECS: u64 = 10;
 const TOOL_TIMEOUT_KILL_SECS: u64 = 2;
+// termux_api 默认给更宽松的超时：避免某些系统 API（如 wifi 扫描/定位/SAF）在弱机上经常误超时。
+const TERMUX_API_TIMEOUT_SECS: u64 = 25;
 const PATCH_TIMEOUT_MIN_SECS: u64 = 25;
 const PATCH_TIMEOUT_MID_SECS: u64 = 60;
 const PATCH_TIMEOUT_MAX_SECS: u64 = 120;
@@ -34,6 +36,9 @@ const SHELL_SAVE_THRESHOLD_BYTES: usize = 400_000;
 const ADB_CACHE_DIR: &str = "log/adb-cache";
 // adb 输出（尤其 logcat/dumpsys）可能更大：默认阈值略高，超出则落盘供后续按需读取。
 const ADB_SAVE_THRESHOLD_BYTES: usize = 900_000;
+const TERMUX_API_CACHE_DIR: &str = "log/termux-api-cache";
+// termux-api 输出通常偏中等，但也可能一次返回大量 JSON（如 SAF/传感器/Wi-Fi 扫描等）。
+const TERMUX_API_SAVE_THRESHOLD_BYTES: usize = 600_000;
 const TOOL_OUTPUT_MAX_CHARS: usize = 12_000;
 const TOOL_OUTPUT_MAX_LINES: usize = 240;
 const TOOL_OUTPUT_RAW_MAX_CHARS: usize = 20_000;
@@ -1142,7 +1147,7 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     match call.tool.as_str() {
         "bash" => run_bash(call),
         "adb" => run_adb(call),
-        "termux_api" => run_termux_api(&call.input),
+        "termux_api" => run_termux_api(call),
         "read_file" => run_read_file(call),
         "write_file" => run_write_file(call),
         "list_dir" => run_list_dir(call),
@@ -1285,36 +1290,6 @@ fn status_label(code: i32, timed_out: bool) -> String {
         "0".to_string()
     } else {
         code.to_string()
-    }
-}
-
-fn build_shell_outcome(
-    out: std::process::Output,
-    elapsed: std::time::Duration,
-    timeout_used: bool,
-    cwd_display: &str,
-    cmd_len: usize,
-) -> ToolOutcome {
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let code = status_code(out.status.code());
-    let timed_out = timeout_used && is_timeout_status(code);
-    let body = annotate_timeout(
-        truncate_command_output(collect_output(&stdout, &stderr)),
-        timed_out,
-        None,
-    );
-    let status = status_label(code, timed_out);
-    ToolOutcome {
-        user_message: if body.is_empty() {
-            "(no output)".to_string()
-        } else {
-            body
-        },
-        log_lines: vec![format!(
-            "状态:{status} | exit:{code} | 耗时:{}ms | cwd:{cwd_display} | cmd_len:{cmd_len}",
-            elapsed.as_millis()
-        )],
     }
 }
 
@@ -1643,9 +1618,66 @@ fn try_prepare_adb_tcp() -> bool {
         .unwrap_or(false)
 }
 
-fn run_termux_api(command_text: &str) -> anyhow::Result<ToolOutcome> {
+fn build_shell_outcome_termux_api(
+    out: std::process::Output,
+    elapsed: std::time::Duration,
+    timeout_used: bool,
+    cwd_display: &str,
+    cmd: &str,
+    timeout_hint_secs: Option<u64>,
+) -> ToolOutcome {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let code = status_code(out.status.code());
+    let timed_out = timeout_used && is_timeout_status(code);
+    let combined = collect_output(&stdout, &stderr);
+
+    let total_bytes = out.stdout.len().saturating_add(out.stderr.len());
+    let truncated_by_lines = combined.lines().count() > OUTPUT_MAX_LINES;
+    let truncated_by_chars = combined.chars().count() > OUTPUT_MAX_CHARS;
+    let need_save =
+        total_bytes > TERMUX_API_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+
+    let saved_path = if need_save {
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let pid = unsafe { libc::getpid() };
+        let path = format!("{TERMUX_API_CACHE_DIR}/termux_api_{ts}_{pid}.log");
+        if try_write_shell_cache_impl(TERMUX_API_CACHE_DIR, &path, &out.stdout, &out.stderr) {
+            Some(path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let body = annotate_timeout(truncate_command_output(combined), timed_out, timeout_hint_secs);
+    let body = annotate_nonzero_exit(body, timed_out, code);
+    let status = status_label(code, timed_out);
+    let mut log_lines = vec![format!(
+        "状态:{status} | exit:{code} | 耗时:{}ms | cwd:{cwd_display} | cmd_len:{}",
+        elapsed.as_millis(),
+        cmd.chars().count()
+    )];
+    if let Some(p) = saved_path.as_deref() {
+        log_lines.push(format!("saved:{p}"));
+    }
+
+    ToolOutcome {
+        user_message: if body.is_empty() {
+            "(no output)".to_string()
+        } else if let Some(p) = saved_path {
+            format!("{body}\n\n[saved:{p}]")
+        } else {
+            body
+        },
+        log_lines,
+    }
+}
+
+fn run_termux_api(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let cwd_display = current_dir_display();
-    let input = command_text.trim();
+    let input = call.input.trim();
     if let Err(e) = validate_termux_api(input) {
         return Ok(ToolOutcome {
             user_message: e.to_string(),
@@ -1657,17 +1689,24 @@ fn run_termux_api(command_text: &str) -> anyhow::Result<ToolOutcome> {
     }
 
     let started = Instant::now();
-    let (mut command, timeout_used) = build_command(BASH_SHELL, &["-lc", input]);
+    let timeout_secs = call
+        .timeout_secs
+        .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000))
+        .or(Some(TERMUX_API_TIMEOUT_SECS));
+    let timeout_hint = timeout_secs;
+    let (mut command, timeout_used) =
+        build_command_with_optional_timeout(BASH_SHELL, &["-lc", input], timeout_secs);
     let out = command
         .output()
         .with_context(|| format!("termux_api 执行失败：{input}"))?;
     let elapsed = started.elapsed();
-    Ok(build_shell_outcome(
+    Ok(build_shell_outcome_termux_api(
         out,
         elapsed,
         timeout_used,
         &cwd_display,
-        input.chars().count(),
+        input,
+        timeout_hint,
     ))
 }
 

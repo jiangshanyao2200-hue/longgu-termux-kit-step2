@@ -134,7 +134,6 @@ struct PtyUiState {
     // 用户主动同步的快照（Alt+↑）。若存在，工具结束时优先回传该快照。
     last_user_snapshot: Option<String>,
     screen_lines: Vec<String>,
-    last_output_at: Instant,
     dirty: bool,
 }
 
@@ -156,7 +155,6 @@ impl PtyUiState {
             input_log: String::new(),
             last_user_snapshot: None,
             screen_lines: Vec::new(),
-            last_output_at: Instant::now(),
             dirty: true,
         }
     }
@@ -165,7 +163,6 @@ impl PtyUiState {
         if bytes.is_empty() {
             return;
         }
-        self.last_output_at = Instant::now();
         self.parser.process(bytes);
         // 终端模拟（最小集）：响应 Cursor Position Report (CPR) 查询 `ESC[6n`。
         // 一些 TUI（例如 codex/crossterm）会向 stdout 写入 `ESC[6n`，并期待终端回写 `ESC[{row};{col}R` 到 stdin。
@@ -1097,66 +1094,6 @@ fn build_api_url(base: &str, path: &str) -> String {
 
 fn compact_ws_inline(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn pty_prompt_preview_and_waiting_kind(
-    state: &mut PtyUiState,
-) -> (Option<String>, Option<&'static str>, u64) {
-    state.rebuild_cache();
-    // 无输出停顿一段时间 + 光标可见 + 光标所在行像“提示输入”的尾部 → 视为等待输入/选择。
-    let idle_ms = state.last_output_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    if idle_ms < 450 {
-        return (None, None, idle_ms);
-    }
-    if state.parser.screen().hide_cursor() {
-        return (None, None, idle_ms);
-    }
-    let (row, _col) = state.parser.screen().cursor_position();
-    let line = state
-        .screen_lines
-        .get(row as usize)
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    let mut preview = compact_ws_inline(line.trim());
-    if preview.is_empty() {
-        // 光标可见但当前行空：更像“等待输入”，但需要更长空闲以降低误判。
-        if idle_ms >= 1200 {
-            return (None, Some("input"), idle_ms);
-        }
-        return (None, None, idle_ms);
-    }
-    preview = truncate_with_suffix(&preview, 140);
-
-    let lower = preview.to_ascii_lowercase();
-    // “选择/确认”类提示：尽量通用，不针对某个命令硬编码。
-    let looks_like_choice = lower.contains("[y/n]")
-        || lower.contains("[y/n]:")
-        || lower.contains("[y/n]?")
-        || lower.contains("do you want to continue")
-        || lower.contains("continue?")
-        || lower.contains("continue ?")
-        || lower.contains("proceed?")
-        || lower.contains("proceed ?")
-        || lower.contains("confirm")
-        || lower.contains("确认")
-        || lower.contains("继续");
-    if looks_like_choice {
-        return (Some(preview), Some("choice"), idle_ms);
-    }
-
-    let t = preview.trim_end();
-    let looks_like_input = t.ends_with(':')
-        || t.ends_with('?')
-        || t.ends_with(']')
-        || t.ends_with(')')
-        || t.ends_with('>')
-        || t.ends_with('$')
-        || t.ends_with('#');
-    if looks_like_input {
-        return (Some(preview), Some("input"), idle_ms);
-    }
-
-    (Some(preview), None, idle_ms)
 }
 
 fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
@@ -7595,41 +7532,13 @@ fn run_loop(
         };
         if matches!(screen, Screen::Chat) && pty.is_some() {
             anim_enabled = true;
-            let mut preview: Option<String> = None;
-            let mut waiting_kind: Option<&'static str> = None;
-            let mut idle_ms: u64 = 0;
-            if !pty_done && pty_view {
-                if let Some(state) = pty.as_mut() {
-                    let (p, k, idle) = pty_prompt_preview_and_waiting_kind(state);
-                    preview = p;
-                    waiting_kind = k;
-                    idle_ms = idle;
-                }
-            }
             let stage = if pty_done {
                 "命令执行完毕 ESC to exit"
-            } else if waiting_kind == Some("choice") {
-                "等待用户选择..."
-            } else if waiting_kind == Some("input") || (matches!(pty_focus, PtyFocus::ChatInput) && pty_view) {
-                "等待用户输入..."
-            } else if idle_ms >= 2000 {
-                "已无输出（可能在收尾）..."
             } else {
                 "正在执行中..."
             };
-            let show_preview =
-                waiting_kind.is_some() || idle_ms >= 2000;
-            let preview_tail = if show_preview {
-                preview
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| format!(" │{s}"))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
             let nav = if pty_view { "" } else { " · Home: Terminal" };
-            input_line = format!("Terminal OS/ {stage}{preview_tail}{nav}");
+            input_line = format!("Terminal OS/ {stage}{nav}");
         }
         // 输入提示行（横杠上方）：文本变化时触发（●闪烁 → 乱码展开）。
         // 需要把它并入 anim_enabled，否则 idle 时 poll_timeout 会很长导致动画不刷新。

@@ -467,6 +467,43 @@ fn extract_tool_explain(text: &str) -> Option<String> {
     None
 }
 
+fn extract_tool_saved_path(text: &str) -> Option<String> {
+    fn extract_from_line(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if let Some(pos) = trimmed.find("[saved:") {
+            let rest = &trimmed[pos + "[saved:".len()..];
+            let end = rest.find(']').unwrap_or(rest.len());
+            let token = rest[..end].trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+        let Some(pos) = trimmed.find("saved:") else {
+            return None;
+        };
+        let rest = trimmed[pos + "saved:".len()..].trim_start();
+        let token = rest
+            .split(|c: char| c.is_whitespace() || c == '|' || c == ',' || c == ')')
+            .next()
+            .unwrap_or("")
+            .trim();
+        (!token.is_empty()).then(|| token.to_string())
+    }
+
+    let (output_lines, meta_lines) = extract_tool_sections(text);
+    for line in meta_lines.iter() {
+        if let Some(p) = extract_from_line(line) {
+            return Some(p);
+        }
+    }
+    for line in output_lines.iter().rev() {
+        if let Some(p) = extract_from_line(line) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn extract_tool_status_token(text: &str) -> Option<String> {
     let (output_lines, meta_lines) = extract_tool_sections(text);
     for line in meta_lines.iter() {
@@ -2566,6 +2603,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         (!t.is_empty()).then_some(t.to_string())
                     })
                     .unwrap_or_else(|| tool_raw.clone());
+                let saved_path = extract_tool_saved_path(&msg.text);
                 let mut brief = compact_ws_inline(&brief);
                 if failed && !brief.contains("失败") {
                     brief.push_str("（失败）");
@@ -2587,9 +2625,66 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                             .bg(theme.bg)
                             .add_modifier(Modifier::BOLD),
                     )]));
+                    // 极窄宽度兜底：把 brief 放到下一行，至少可见。
+                    let avail = w.saturating_sub(2).max(1);
+                    let mut chunks = wrap_plain_line(&brief, avail);
+                    const BRIEF_WRAP_MAX_LINES: usize = 6;
+                    if chunks.len() > BRIEF_WRAP_MAX_LINES {
+                        chunks.truncate(BRIEF_WRAP_MAX_LINES);
+                        if let Some(last) = chunks.last_mut() {
+                            *last = truncate_to_width(&format!("{last} ..."), avail);
+                        }
+                    }
+                    for chunk in chunks {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "  ",
+                                Style::default().fg(theme.dim).bg(theme.bg),
+                            ),
+                            Span::styled(
+                                chunk,
+                                Style::default().fg(theme.fg).bg(theme.bg),
+                            ),
+                        ]));
+                    }
+                    if let Some(p) = saved_path.as_deref().filter(|s| !s.trim().is_empty()) {
+                        let saved = format!("saved:{p}");
+                        let mut saved_chunks = wrap_plain_line(&saved, avail);
+                        const SAVED_WRAP_MAX_LINES: usize = 2;
+                        if saved_chunks.len() > SAVED_WRAP_MAX_LINES {
+                            saved_chunks.truncate(SAVED_WRAP_MAX_LINES);
+                            if let Some(last) = saved_chunks.last_mut() {
+                                *last = truncate_to_width(&format!("{last} ..."), avail);
+                            }
+                        }
+                        for chunk in saved_chunks {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    "  ",
+                                    Style::default().fg(theme.dim).bg(theme.bg),
+                                ),
+                                Span::styled(
+                                    chunk,
+                                    Style::default().fg(theme.dim).bg(theme.bg),
+                                ),
+                            ]));
+                        }
+                    }
                 } else {
                     let avail = w.saturating_sub(fixed_w).max(1);
-                    let brief_fit = truncate_to_width(&brief, avail);
+                    let mut chunks = wrap_plain_line(&brief, avail);
+                    const BRIEF_WRAP_MAX_LINES: usize = 6;
+                    if chunks.len() > BRIEF_WRAP_MAX_LINES {
+                        chunks.truncate(BRIEF_WRAP_MAX_LINES);
+                        if let Some(last) = chunks.last_mut() {
+                            *last = truncate_to_width(&format!("{last} ..."), avail);
+                        }
+                    }
+                    if chunks.is_empty() {
+                        chunks.push(String::new());
+                    }
+                    let indent = " ".repeat(fixed_w);
+                    let first_chunk = chunks.remove(0);
                     lines.push(Line::from(vec![
                         Span::styled(head, Style::default().fg(theme.fg).bg(theme.bg)),
                         Span::styled(
@@ -2601,8 +2696,43 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         ),
                         Span::styled(suffix, Style::default().fg(theme.fg).bg(theme.bg)),
                         Span::styled(sep, Style::default().fg(theme.dim).bg(theme.bg)),
-                        Span::styled(brief_fit, Style::default().fg(theme.fg).bg(theme.bg)),
+                        Span::styled(first_chunk, Style::default().fg(theme.fg).bg(theme.bg)),
                     ]));
+                    for chunk in chunks {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                indent.clone(),
+                                Style::default().fg(theme.dim).bg(theme.bg),
+                            ),
+                            Span::styled(
+                                chunk,
+                                Style::default().fg(theme.fg).bg(theme.bg),
+                            ),
+                        ]));
+                    }
+                    if let Some(p) = saved_path.as_deref().filter(|s| !s.trim().is_empty()) {
+                        let saved = format!("saved:{p}");
+                        let mut saved_chunks = wrap_plain_line(&saved, avail);
+                        const SAVED_WRAP_MAX_LINES: usize = 2;
+                        if saved_chunks.len() > SAVED_WRAP_MAX_LINES {
+                            saved_chunks.truncate(SAVED_WRAP_MAX_LINES);
+                            if let Some(last) = saved_chunks.last_mut() {
+                                *last = truncate_to_width(&format!("{last} ..."), avail);
+                            }
+                        }
+                        for chunk in saved_chunks {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    indent.clone(),
+                                    Style::default().fg(theme.dim).bg(theme.bg),
+                                ),
+                                Span::styled(
+                                    chunk,
+                                    Style::default().fg(theme.dim).bg(theme.bg),
+                                ),
+                            ]));
+                        }
+                    }
                 }
 
                 if reveal_idx != Some(msg_idx) {
@@ -2617,8 +2747,10 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 out.extend(lines);
                 msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
                 if selected {
-                    if let Some(l) = out.get_mut(line_idx) {
-                        highlight_line(l, theme);
+                    for idx in line_idx..out.len() {
+                        if let Some(l) = out.get_mut(idx) {
+                            highlight_line(l, theme);
+                        }
                     }
                 }
                 push_blank_line(&mut out);
@@ -3014,6 +3146,49 @@ mod tests {
         let scrambled = cache.scramble_text(0, "hello", 0, true);
         assert!(scrambled.is_some());
         assert_ne!(scrambled.unwrap(), "hello");
+    }
+
+    #[test]
+    fn tool_compact_allows_wrapped_brief_and_saved_path_hint() {
+        let theme = Theme::cyberpunk();
+        let mut core = Core::new();
+        core.push_tool(
+            "操作: Shell\nexplain: 安全测试：获取 优化一点 工具解析如果brief过长，允许自动换行。\ninput: shell ls\noutput:\n```text\nOK\n```\nmeta:\n```text\n状态:0 | exit:0 | saved:log/adb-cache/adb_test.log\n```\n"
+                .to_string(),
+        );
+
+        let mut cache = ChatRenderCache::new();
+        let expanded_tools = BTreeSet::new();
+        let expanded_thinks = BTreeSet::new();
+        let layout = build_chat_layout(BuildChatLinesArgs {
+            theme: &theme,
+            core: &core,
+            render_cache: &mut cache,
+            width: 36,
+            streaming_idx: None,
+            reveal_idx: None,
+            reveal_len: 0,
+            tick: 0,
+            selected_msg_idx: None,
+            expanded_tool_idxs: &expanded_tools,
+            thinking_idx: None,
+            expanded_thinking_idxs: &expanded_thinks,
+            details_mode: false,
+            streaming_enabled: false,
+            pulse_idx: None,
+            pulse_style: None,
+        });
+        let joined = layout
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Worked with ADB"));
+        assert!(joined.contains("允许"));
+        assert!(joined.contains("自动换行"));
+        assert!(joined.contains("saved:"));
+        assert!(joined.contains("adb_test.log"));
     }
 }
 

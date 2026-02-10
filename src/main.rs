@@ -4967,7 +4967,7 @@ fn tool_confirm_prompt(reason: &str, call: &ToolCall) -> String {
         truncate_with_suffix(cmd_raw, 2000)
     };
     format!(
-        "危险指令需要确认：{reason}\n[{label}]\ncmd:\n```sh\n{cmd}\n```\n输入 yes 执行 / no 拒绝\n（可在 Settings → System → Exec perm 切到 Full 以免确认）"
+        "危险指令需要确认：{reason}\n[{label}]\ncmd:\n```sh\n{cmd}\n```\n输入 yes 执行 / no 拒绝"
     )
 }
 
@@ -7074,6 +7074,9 @@ fn run_loop(
     let mut pty: Option<PtyUiState> = None;
     let mut pty_view = false;
     let mut pty_focus = PtyFocus::Terminal;
+    // 交互 PTY 是否已自然结束（子进程退出）。结束后保留屏幕供用户确认/回看，
+    // 直到用户按 Esc 关闭终端视图。
+    let mut pty_done = false;
     // 用户已请求退出 PTY（Esc/Ctrl+[ 或 Ctrl+Q）。此时不允许 Home 复活终端视图，
     // 但保留 pty 状态直到 ToolStreamEnd 以便回传输出。
     let mut pty_exit_requested = false;
@@ -7106,6 +7109,7 @@ fn run_loop(
 		                render_cache: &mut render_cache,
 		                pty: &mut pty,
 		                pty_view: &mut pty_view,
+		                pty_done: &mut pty_done,
 		                pty_exit_requested: &mut pty_exit_requested,
 		                mode: &mut mode,
 		                scroll: &mut scroll,
@@ -7504,8 +7508,16 @@ fn run_loop(
         } else {
             settings_line.clone()
         };
-        if matches!(screen, Screen::Chat) && pty_view && pty.is_some() {
-            input_line = "PTY session (Home to Chat)".to_string();
+        if matches!(screen, Screen::Chat) && pty.is_some() {
+            let stage = if pty_done {
+                "◆-▶ 命令执行完毕（按Esc结束交互）"
+            } else if matches!(pty_focus, PtyFocus::ChatInput) && pty_view {
+                "◆—▶ 等待用户输入"
+            } else {
+                "◆—▶ 正在执行中"
+            };
+            let nav = if pty_view { "" } else { " · Home: Terminal" };
+            input_line = format!("PTY {stage}{nav}");
         }
         // 输入提示行（横杠上方）：文本变化时触发（●闪烁 → 乱码展开）。
         // 需要把它并入 anim_enabled，否则 idle 时 poll_timeout 会很长导致动画不刷新。
@@ -7701,9 +7713,9 @@ fn run_loop(
 	                    4u16
 	                } else {
 	                    input_lines.clamp(4, 10) as u16
-	                };
+                };
                 let desired_input_h = input_lines;
-                let max_input_h = size.height.saturating_sub(1 + 1 + 1 + 1 + 1 + 1); // header + header-sep + chat(min1) + status + sep + ctx
+                let max_input_h = size.height.saturating_sub(1 + 1 + 1 + 1 + 1 + 1 + 1); // header + header-sep + chat(min1) + spacer + status + sep + ctx
                 let input_h = desired_input_h.min(max_input_h.max(1));
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -7711,6 +7723,7 @@ fn run_loop(
                         Constraint::Length(1),
                         Constraint::Length(1),
                         Constraint::Min(1),
+                        Constraint::Length(1),
                         Constraint::Length(1),
                         Constraint::Length(1),
                         Constraint::Length(input_h),
@@ -7970,7 +7983,7 @@ fn run_loop(
                     f,
                     ui::DrawSeparatorArgs {
                         theme: &theme,
-                        area: chunks[3],
+                        area: chunks[5],
                         mode,
                         active_kind,
                         user_active: input_active,
@@ -7982,7 +7995,7 @@ fn run_loop(
 		                    f,
 		                    ui::DrawInputArgs {
 		                        theme: &theme,
-		                        area: chunks[5],
+		                        area: chunks[6],
 		                        input: input_text,
 		                        cursor: input_cursor,
 		                        focused: matches!(screen, Screen::Chat)
@@ -7998,7 +8011,7 @@ fn run_loop(
                     let menu_h = menu_items.len().min(available).max(1) as u16;
                     let menu_area = ratatui::layout::Rect {
                         x: chunks[2].x,
-                        y: chunks[3].y.saturating_sub(menu_h),
+                        y: chunks[4].y.saturating_sub(menu_h),
                         width: chunks[2].width,
                         height: menu_h,
                     };
@@ -8023,8 +8036,8 @@ fn run_loop(
                     heartbeat_count,
                     response_count,
                 };
-                ui::draw_context_bar(f, &theme, chunks[6], context_line);
-                input_width_cache = chunks[5].width.saturating_sub(2).max(1) as usize;
+                ui::draw_context_bar(f, &theme, chunks[7], context_line);
+                input_width_cache = chunks[6].width.saturating_sub(2).max(1) as usize;
             })?;
             settings_editor_width_cache = settings_draw
                 .editor_rect
@@ -8620,16 +8633,67 @@ fn run_loop(
 				                    let is_ctrl_lbracket_exit =
 				                        ctrl && !alt && matches!(key.code, KeyCode::Char('['));
 				                    if (is_plain_esc && !ctrl && !alt) || is_ctrl_lbracket_exit {
-				                        if let Some(state) = pty.as_mut() {
-				                            let _ = state.ctrl_tx.send(PtyControl::Kill);
+				                        if pty_done {
+				                            pty_view = false;
+				                            pty_focus = PtyFocus::Terminal;
+				                            pty_done = false;
+				                            pty_exit_requested = false;
+				                            pty = None;
+				                            push_sys_log(
+				                                &mut sys_log,
+				                                config.sys_log_limit,
+				                                "Terminal: closed",
+				                            );
+				                        } else {
+				                            if let Some(state) = pty.as_mut() {
+				                                let _ = state.ctrl_tx.send(PtyControl::Kill);
+				                            }
+				                            pty_view = false;
+				                            pty_focus = PtyFocus::Terminal;
+				                            pty_exit_requested = true;
+				                            push_sys_log(
+				                                &mut sys_log,
+				                                config.sys_log_limit,
+				                                "Terminal: exited",
+				                            );
 				                        }
-			                        pty_view = false;
-			                        pty_focus = PtyFocus::Terminal;
-			                        pty_exit_requested = true;
-			                        push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: exited");
 			                        continue;
 			                    }
 				                    if let Some(state) = pty.as_mut() {
+				                        let term_focus = matches!(pty_focus, PtyFocus::Terminal);
+				                        // 滚动回看：在“回看模式”（scroll>0）时，↑↓ 用于滚动，
+				                        // 避免一按方向键就把 scroll 归零导致“无法翻页”的观感。
+				                        // Ctrl+↑/↓：随时滚动（不转发给进程）。
+				                        match key.code {
+				                            KeyCode::Up if ctrl && term_focus => {
+				                                state.scroll =
+				                                    state.scroll.saturating_add(1).min(PTY_SCROLLBACK_MAX);
+				                                state.dirty = true;
+				                                continue;
+				                            }
+				                            KeyCode::Down if ctrl && term_focus => {
+				                                state.scroll = state.scroll.saturating_sub(1);
+				                                state.dirty = true;
+				                                continue;
+				                            }
+				                            KeyCode::Up if term_focus && state.scroll > 0 => {
+				                                state.scroll =
+				                                    state.scroll.saturating_add(1).min(PTY_SCROLLBACK_MAX);
+				                                state.dirty = true;
+				                                continue;
+				                            }
+				                            KeyCode::Down if term_focus && state.scroll > 0 => {
+				                                state.scroll = state.scroll.saturating_sub(1);
+				                                state.dirty = true;
+				                                continue;
+				                            }
+				                            KeyCode::End if term_focus && state.scroll > 0 => {
+				                                state.scroll = 0;
+				                                state.dirty = true;
+				                                continue;
+				                            }
+				                            _ => {}
+				                        }
 				                        // PgUp/PgDn：切换焦点（PTY ↔ 输入框）。
 				                        // - PgUp：焦点到 PTY（方向键/回车等直接操作终端）
 				                        // - PgDn：焦点到输入框（本地编辑一行，Enter 送入 PTY）
@@ -8655,6 +8719,11 @@ fn run_loop(
 				                                continue;
 				                            }
 				                            _ => {}
+				                        }
+
+				                        // 已自然结束：只允许回看/退出，不再转发输入。
+				                        if pty_done {
+				                            continue;
 				                        }
 
 		                        // ChatInput 焦点：本地编辑一行，Enter 送入 PTY。
@@ -10148,6 +10217,7 @@ struct DrainAsyncEventsArgs<'a> {
     render_cache: &'a mut ui::ChatRenderCache,
     pty: &'a mut Option<PtyUiState>,
     pty_view: &'a mut bool,
+    pty_done: &'a mut bool,
     pty_exit_requested: &'a mut bool,
     mode: &'a mut Mode,
     scroll: &'a mut u16,
@@ -11144,6 +11214,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         render_cache,
         pty,
         pty_view,
+        pty_done,
         pty_exit_requested,
         mode,
         scroll,
@@ -11378,6 +11449,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 let rows = rows.max(1);
                 *pty = Some(PtyUiState::new(ctrl_tx, cols, rows, saved_path));
                 *pty_view = true;
+                *pty_done = false;
                 *pty_exit_requested = false;
             }
             AsyncEvent::PtyOutput { bytes } => {
@@ -11440,9 +11512,16 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             .log_lines
                             .push(format!("saved:{}", state.saved_path));
                     }
-                    *pty_view = false;
-                    *pty = None;
-                    *pty_exit_requested = false;
+                    if *pty_exit_requested {
+                        // 用户主动中断：结束后直接清理。
+                        *pty_view = false;
+                        *pty = None;
+                        *pty_done = false;
+                        *pty_exit_requested = false;
+                    } else {
+                        // 自然结束：保留终端内容给用户确认（Esc 关闭）。
+                        *pty_done = true;
+                    }
                 }
                 let active_call_log = active_tool_stream
                     .as_ref()

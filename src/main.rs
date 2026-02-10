@@ -9050,15 +9050,16 @@ fn run_loop(
                                 thinking_full_text: &mut thinking_full_text,
                                 thinking_started_at: &mut thinking_started_at,
                             });
-                            clear_tool_preview_state(
-                                &mut tool_preview,
-                                &mut tool_preview_active,
-                                &mut tool_preview_pending_idle,
-                            );
-                            push_sys_log(&mut sys_log, config.sys_log_limit, "请求已被取消");
-                            let cancel_msg = "请求已被取消";
-                            push_system_and_log(
-                                &mut core,
+	                            clear_tool_preview_state(
+	                                &mut tool_preview,
+	                                &mut tool_preview_active,
+	                                &mut tool_preview_pending_idle,
+	                            );
+	                            streaming_state.reset();
+	                            push_sys_log(&mut sys_log, config.sys_log_limit, "请求已被取消");
+	                            let cancel_msg = "请求已被取消";
+	                            push_system_and_log(
+	                                &mut core,
                                 &mut metamemo,
                                 &mut context_usage,
                                 None,
@@ -9108,14 +9109,15 @@ fn run_loop(
                                 thinking_full_text: &mut thinking_full_text,
                                 thinking_started_at: &mut thinking_started_at,
                             });
-                            clear_tool_preview_state(
-                                &mut tool_preview,
-                                &mut tool_preview_active,
-                                &mut tool_preview_pending_idle,
-                            );
-                            let prompt = build_interrupt_prompt();
-                            push_system_and_log(
-                                &mut core,
+	                            clear_tool_preview_state(
+	                                &mut tool_preview,
+	                                &mut tool_preview_active,
+	                                &mut tool_preview_pending_idle,
+	                            );
+	                            streaming_state.reset();
+	                            let prompt = build_interrupt_prompt();
+	                            push_system_and_log(
+	                                &mut core,
                                 &mut metamemo,
                                 &mut context_usage,
                                 None,

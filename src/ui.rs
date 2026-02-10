@@ -181,6 +181,27 @@ fn wrap_plain_line(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+fn truncate_middle_to_width(text: &str, width: usize) -> String {
+    if width == 0 || text.is_empty() {
+        return String::new();
+    }
+    let total = UnicodeWidthStr::width(text);
+    if total <= width {
+        return text.to_string();
+    }
+    if width <= 6 {
+        return truncate_to_width(text, width);
+    }
+    let ellipsis = "...";
+    let keep = width.saturating_sub(UnicodeWidthStr::width(ellipsis));
+    let head = keep / 2 + (keep % 2);
+    let tail = keep / 2;
+    let head_str = slice_by_cells(text, 0, head.max(1));
+    let tail_start = total.saturating_sub(tail.max(1));
+    let tail_str = slice_by_cells(text, tail_start, tail.max(1));
+    format!("{head_str}{ellipsis}{tail_str}")
+}
+
 fn truncate_for_ui(text: &str) -> Cow<'_, str> {
     if text.len() <= MAX_CHAT_BYTES {
         return Cow::Borrowed(text);
@@ -502,6 +523,45 @@ fn extract_tool_saved_path(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn build_tool_compact_status(text: &str) -> String {
+    let saved = extract_tool_saved_path(text);
+    let status = extract_tool_status_token(text);
+    let timed_out = status.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("timeout"))
+        || text.contains("【Timed out】")
+        || text.contains("Timed out and terminated");
+    let failed = tool_status_result_line(text).is_some();
+    let truncated = text.contains("[输出已截断");
+    let has_output = !text.contains("(no output)");
+
+    if let Some(p) = saved.as_deref().filter(|s| !s.trim().is_empty()) {
+        if timed_out {
+            return format!("timeout | saved:{p}");
+        }
+        if failed {
+            return format!("failed | saved:{p}");
+        }
+        return format!("saved:{p}");
+    }
+
+    if timed_out {
+        return if has_output {
+            "执行超时（已返回部分输出）".to_string()
+        } else {
+            "执行超时".to_string()
+        };
+    }
+    if failed {
+        if let Some(token) = status.as_deref().filter(|s| !s.trim().is_empty()) {
+            return format!("执行失败（{token}）");
+        }
+        return "执行失败".to_string();
+    }
+    if truncated {
+        return "输出已截断".to_string();
+    }
+    "执行成功".to_string()
 }
 
 fn extract_tool_status_token(text: &str) -> Option<String> {
@@ -2596,95 +2656,28 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             if !show_details {
                 let mind = extract_tool_mind(&msg.text);
                 let dot = if mind == Some("dog") { "○" } else { "●" };
-                let failed = tool_status_result_line(&msg.text).is_some();
                 let brief = extract_tool_explain(&msg.text)
                     .or_else(|| {
                         let t = msg.text.lines().next().unwrap_or("").trim();
                         (!t.is_empty()).then_some(t.to_string())
                     })
                     .unwrap_or_else(|| tool_raw.clone());
-                let saved_path = extract_tool_saved_path(&msg.text);
-                let mut brief = compact_ws_inline(&brief);
-                if failed && !brief.contains("失败") {
-                    brief.push_str("（失败）");
-                }
+                let brief = compact_ws_inline(&brief);
 
                 let (prefix, tool_name, suffix) = tool_compact_title_parts(&tool_raw);
                 let head = format!("{dot} {prefix}");
                 let sep = " · ";
+                let target_raw = input_raw.as_deref().unwrap_or("");
+                let (_disp, target_disp) = normalize_tool_display(&tool_raw, target_raw);
+                let target_disp = compact_ws_inline(&target_disp);
                 let fixed = format!("{head}{tool_name}{suffix}{sep}");
                 let fixed_w = UnicodeWidthStr::width(fixed.as_str());
                 let w = width.max(1);
                 let line_idx = out.len();
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                if w <= fixed_w {
-                    lines.push(Line::from(vec![Span::styled(
-                        truncate_to_width(&fixed, w),
-                        Style::default()
-                            .fg(theme.yellow)
-                            .bg(theme.bg)
-                            .add_modifier(Modifier::BOLD),
-                    )]));
-                    // 极窄宽度兜底：把 brief 放到下一行，至少可见。
-                    let avail = w.saturating_sub(2).max(1);
-                    let mut chunks = wrap_plain_line(&brief, avail);
-                    const BRIEF_WRAP_MAX_LINES: usize = 6;
-                    if chunks.len() > BRIEF_WRAP_MAX_LINES {
-                        chunks.truncate(BRIEF_WRAP_MAX_LINES);
-                        if let Some(last) = chunks.last_mut() {
-                            *last = truncate_to_width(&format!("{last} ..."), avail);
-                        }
-                    }
-                    for chunk in chunks {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                "  ",
-                                Style::default().fg(theme.dim).bg(theme.bg),
-                            ),
-                            Span::styled(
-                                chunk,
-                                Style::default().fg(theme.fg).bg(theme.bg),
-                            ),
-                        ]));
-                    }
-                    if let Some(p) = saved_path.as_deref().filter(|s| !s.trim().is_empty()) {
-                        let saved = format!("saved:{p}");
-                        let mut saved_chunks = wrap_plain_line(&saved, avail);
-                        const SAVED_WRAP_MAX_LINES: usize = 2;
-                        if saved_chunks.len() > SAVED_WRAP_MAX_LINES {
-                            saved_chunks.truncate(SAVED_WRAP_MAX_LINES);
-                            if let Some(last) = saved_chunks.last_mut() {
-                                *last = truncate_to_width(&format!("{last} ..."), avail);
-                            }
-                        }
-                        for chunk in saved_chunks {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    "  ",
-                                    Style::default().fg(theme.dim).bg(theme.bg),
-                                ),
-                                Span::styled(
-                                    chunk,
-                                    Style::default().fg(theme.dim).bg(theme.bg),
-                                ),
-                            ]));
-                        }
-                    }
-                } else {
-                    let avail = w.saturating_sub(fixed_w).max(1);
-                    let mut chunks = wrap_plain_line(&brief, avail);
-                    const BRIEF_WRAP_MAX_LINES: usize = 6;
-                    if chunks.len() > BRIEF_WRAP_MAX_LINES {
-                        chunks.truncate(BRIEF_WRAP_MAX_LINES);
-                        if let Some(last) = chunks.last_mut() {
-                            *last = truncate_to_width(&format!("{last} ..."), avail);
-                        }
-                    }
-                    if chunks.is_empty() {
-                        chunks.push(String::new());
-                    }
-                    let indent = " ".repeat(fixed_w);
-                    let first_chunk = chunks.remove(0);
+                let avail_inline = w.saturating_sub(fixed_w);
+                if w > fixed_w && !target_disp.trim().is_empty() {
+                    let cmd_fit = truncate_middle_to_width(target_disp.trim(), avail_inline.max(1));
                     lines.push(Line::from(vec![
                         Span::styled(head, Style::default().fg(theme.fg).bg(theme.bg)),
                         Span::styled(
@@ -2696,43 +2689,49 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         ),
                         Span::styled(suffix, Style::default().fg(theme.fg).bg(theme.bg)),
                         Span::styled(sep, Style::default().fg(theme.dim).bg(theme.bg)),
-                        Span::styled(first_chunk, Style::default().fg(theme.fg).bg(theme.bg)),
+                        Span::styled(cmd_fit, Style::default().fg(theme.fg).bg(theme.bg)),
                     ]));
-                    for chunk in chunks {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                indent.clone(),
-                                Style::default().fg(theme.dim).bg(theme.bg),
-                            ),
-                            Span::styled(
-                                chunk,
-                                Style::default().fg(theme.fg).bg(theme.bg),
-                            ),
-                        ]));
+                } else {
+                    lines.push(Line::from(vec![Span::styled(
+                        truncate_to_width(&fixed, w),
+                        Style::default()
+                            .fg(theme.yellow)
+                            .bg(theme.bg)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
+                }
+
+                let indent_w = fixed_w.min(w.saturating_sub(1)).max(2);
+                let indent = " ".repeat(indent_w);
+                let avail = w.saturating_sub(indent_w).max(1);
+
+                // 第二行：brief（超长时中间省略）
+                let brief_fit = truncate_middle_to_width(brief.trim(), avail);
+                if !brief_fit.trim().is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                        Span::styled(brief_fit, Style::default().fg(theme.fg).bg(theme.bg)),
+                    ]));
+                }
+
+                // 第三行：状态摘要（超时/失败/成功/保存路径等）
+                let status = build_tool_compact_status(&msg.text);
+                let mut status_chunks = wrap_plain_line(&status, avail);
+                const STATUS_MAX_LINES: usize = 2;
+                if status_chunks.len() > STATUS_MAX_LINES {
+                    status_chunks.truncate(STATUS_MAX_LINES);
+                    if let Some(last) = status_chunks.last_mut() {
+                        *last = truncate_to_width(&format!("{last} ..."), avail);
                     }
-                    if let Some(p) = saved_path.as_deref().filter(|s| !s.trim().is_empty()) {
-                        let saved = format!("saved:{p}");
-                        let mut saved_chunks = wrap_plain_line(&saved, avail);
-                        const SAVED_WRAP_MAX_LINES: usize = 2;
-                        if saved_chunks.len() > SAVED_WRAP_MAX_LINES {
-                            saved_chunks.truncate(SAVED_WRAP_MAX_LINES);
-                            if let Some(last) = saved_chunks.last_mut() {
-                                *last = truncate_to_width(&format!("{last} ..."), avail);
-                            }
-                        }
-                        for chunk in saved_chunks {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    indent.clone(),
-                                    Style::default().fg(theme.dim).bg(theme.bg),
-                                ),
-                                Span::styled(
-                                    chunk,
-                                    Style::default().fg(theme.dim).bg(theme.bg),
-                                ),
-                            ]));
-                        }
+                }
+                for chunk in status_chunks {
+                    if chunk.trim().is_empty() {
+                        continue;
                     }
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                        Span::styled(chunk, Style::default().fg(theme.dim).bg(theme.bg)),
+                    ]));
                 }
 
                 if reveal_idx != Some(msg_idx) {
@@ -3185,9 +3184,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("Worked with ADB"));
-        assert!(joined.contains("允许"));
-        assert!(joined.contains("自动换行"));
-        assert!(joined.contains("saved:"));
+        assert!(joined.contains("shell ls"));
+        assert!(joined.contains("安全测试"));
+        assert!(joined.contains("换行"));
+        assert!(joined.contains("saved:log/adb-"));
         assert!(joined.contains("adb_test.log"));
     }
 }

@@ -123,6 +123,9 @@ struct PtyUiState {
     parser: vt100::Parser,
     cols: u16,
     rows: u16,
+    pending_cols: u16,
+    pending_rows: u16,
+    pending_since: Option<Instant>,
     scroll: u16,
     scroll_applied: u16,
     saved_path: String,
@@ -131,6 +134,7 @@ struct PtyUiState {
     // 用户主动同步的快照（Alt+↑）。若存在，工具结束时优先回传该快照。
     last_user_snapshot: Option<String>,
     screen_lines: Vec<String>,
+    last_output_at: Instant,
     dirty: bool,
 }
 
@@ -143,12 +147,16 @@ impl PtyUiState {
             parser,
             cols,
             rows,
+            pending_cols: cols,
+            pending_rows: rows,
+            pending_since: None,
             scroll: 0,
             scroll_applied: 0,
             saved_path,
             input_log: String::new(),
             last_user_snapshot: None,
             screen_lines: Vec::new(),
+            last_output_at: Instant::now(),
             dirty: true,
         }
     }
@@ -157,6 +165,7 @@ impl PtyUiState {
         if bytes.is_empty() {
             return;
         }
+        self.last_output_at = Instant::now();
         self.parser.process(bytes);
         // 终端模拟（最小集）：响应 Cursor Position Report (CPR) 查询 `ESC[6n`。
         // 一些 TUI（例如 codex/crossterm）会向 stdout 写入 `ESC[6n`，并期待终端回写 `ESC[{row};{col}R` 到 stdin。
@@ -207,13 +216,29 @@ impl PtyUiState {
         if cols == 0 || rows == 0 {
             return;
         }
-        if self.cols == cols && self.rows == rows {
+        if self.cols == cols && self.rows == rows && self.pending_since.is_none() {
             return;
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.parser.set_size(rows, cols);
-        let _ = self.ctrl_tx.send(PtyControl::Resize { cols, rows });
+        if self.pending_cols != cols || self.pending_rows != rows {
+            self.pending_cols = cols;
+            self.pending_rows = rows;
+            self.pending_since = Some(Instant::now());
+        }
+        // Termux 软键盘弹出/收回会造成尺寸快速抖动：等尺寸稳定一小段时间再 resize，
+        // 避免 vt100 parser 频繁 set_size 导致“屏幕跳动/错位”。
+        const RESIZE_DEBOUNCE_MS: u64 = 160;
+        if let Some(since) = self.pending_since
+            && since.elapsed() < Duration::from_millis(RESIZE_DEBOUNCE_MS)
+        {
+            return;
+        }
+        self.cols = self.pending_cols;
+        self.rows = self.pending_rows;
+        self.pending_since = None;
+        self.parser.set_size(self.rows, self.cols);
+        let _ = self
+            .ctrl_tx
+            .send(PtyControl::Resize { cols: self.cols, rows: self.rows });
         self.dirty = true;
     }
 
@@ -1072,6 +1097,75 @@ fn build_api_url(base: &str, path: &str) -> String {
 
 fn compact_ws_inline(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn pty_prompt_preview_and_waiting_kind(state: &mut PtyUiState) -> (Option<String>, Option<&'static str>) {
+    state.rebuild_cache();
+    // 无输出停顿一段时间 + 光标可见 + 光标所在行像“提示输入”的尾部 → 视为等待输入/选择。
+    if state.last_output_at.elapsed() < Duration::from_millis(900) {
+        return (None, None);
+    }
+    if state.parser.screen().hide_cursor() {
+        return (None, None);
+    }
+    let (row, _col) = state.parser.screen().cursor_position();
+    let line = state
+        .screen_lines
+        .get(row as usize)
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let mut preview = compact_ws_inline(line.trim());
+    if preview.is_empty() {
+        return (None, None);
+    }
+    preview = truncate_with_suffix(&preview, 140);
+
+    let lower = preview.to_ascii_lowercase();
+    // “选择/确认”类提示：尽量通用，不针对某个命令硬编码。
+    let looks_like_choice = lower.contains("[y/n]")
+        || lower.contains("[y/n]:")
+        || lower.contains("[y/n]?")
+        || lower.contains("[y/n] ")
+        || lower.contains("[y/n")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("[y/n]")
+        || lower.contains("do you want to continue")
+        || lower.contains("continue?")
+        || lower.contains("continue ?")
+        || lower.contains("proceed?")
+        || lower.contains("proceed ?")
+        || lower.contains("confirm")
+        || lower.contains("确认")
+        || lower.contains("继续");
+    if looks_like_choice {
+        return (Some(preview), Some("choice"));
+    }
+
+    let t = preview.trim_end();
+    let looks_like_input = t.ends_with(':')
+        || t.ends_with('?')
+        || t.ends_with(']')
+        || t.ends_with(')')
+        || t.ends_with('>')
+        || t.ends_with('$')
+        || t.ends_with('#');
+    if looks_like_input {
+        return (Some(preview), Some("input"));
+    }
+
+    (Some(preview), Some("input"))
 }
 
 fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
@@ -7509,15 +7603,32 @@ fn run_loop(
             settings_line.clone()
         };
         if matches!(screen, Screen::Chat) && pty.is_some() {
+            anim_enabled = true;
+            let mut preview: Option<String> = None;
+            let mut waiting_kind: Option<&'static str> = None;
+            if !pty_done && pty_view {
+                if let Some(state) = pty.as_mut() {
+                    let (p, k) = pty_prompt_preview_and_waiting_kind(state);
+                    preview = p;
+                    waiting_kind = k;
+                }
+            }
             let stage = if pty_done {
-                "◆-▶ 命令执行完毕（按Esc结束交互）"
-            } else if matches!(pty_focus, PtyFocus::ChatInput) && pty_view {
-                "◆—▶ 等待用户输入"
+                "命令执行完毕 ESC to exit"
+            } else if waiting_kind == Some("choice") {
+                "等待用户选择..."
+            } else if waiting_kind == Some("input") || (matches!(pty_focus, PtyFocus::ChatInput) && pty_view) {
+                "等待用户输入..."
             } else {
-                "◆—▶ 正在执行中"
+                "正在执行中..."
             };
+            let preview_tail = preview
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!(" │{s}"))
+                .unwrap_or_default();
             let nav = if pty_view { "" } else { " · Home: Terminal" };
-            input_line = format!("PTY {stage}{nav}");
+            input_line = format!("Terminal OS/ {stage}{preview_tail}{nav}");
         }
         // 输入提示行（横杠上方）：文本变化时触发（●闪烁 → 乱码展开）。
         // 需要把它并入 anim_enabled，否则 idle 时 poll_timeout 会很长导致动画不刷新。

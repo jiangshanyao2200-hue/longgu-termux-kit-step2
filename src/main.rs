@@ -1099,14 +1099,17 @@ fn compact_ws_inline(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn pty_prompt_preview_and_waiting_kind(state: &mut PtyUiState) -> (Option<String>, Option<&'static str>) {
+fn pty_prompt_preview_and_waiting_kind(
+    state: &mut PtyUiState,
+) -> (Option<String>, Option<&'static str>, u64) {
     state.rebuild_cache();
     // 无输出停顿一段时间 + 光标可见 + 光标所在行像“提示输入”的尾部 → 视为等待输入/选择。
-    if state.last_output_at.elapsed() < Duration::from_millis(900) {
-        return (None, None);
+    let idle_ms = state.last_output_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    if idle_ms < 450 {
+        return (None, None, idle_ms);
     }
     if state.parser.screen().hide_cursor() {
-        return (None, None);
+        return (None, None, idle_ms);
     }
     let (row, _col) = state.parser.screen().cursor_position();
     let line = state
@@ -1116,7 +1119,11 @@ fn pty_prompt_preview_and_waiting_kind(state: &mut PtyUiState) -> (Option<String
         .unwrap_or("");
     let mut preview = compact_ws_inline(line.trim());
     if preview.is_empty() {
-        return (None, None);
+        // 光标可见但当前行空：更像“等待输入”，但需要更长空闲以降低误判。
+        if idle_ms >= 1200 {
+            return (None, Some("input"), idle_ms);
+        }
+        return (None, None, idle_ms);
     }
     preview = truncate_with_suffix(&preview, 140);
 
@@ -1125,22 +1132,6 @@ fn pty_prompt_preview_and_waiting_kind(state: &mut PtyUiState) -> (Option<String
     let looks_like_choice = lower.contains("[y/n]")
         || lower.contains("[y/n]:")
         || lower.contains("[y/n]?")
-        || lower.contains("[y/n] ")
-        || lower.contains("[y/n")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
-        || lower.contains("[y/n]")
         || lower.contains("do you want to continue")
         || lower.contains("continue?")
         || lower.contains("continue ?")
@@ -1150,7 +1141,7 @@ fn pty_prompt_preview_and_waiting_kind(state: &mut PtyUiState) -> (Option<String
         || lower.contains("确认")
         || lower.contains("继续");
     if looks_like_choice {
-        return (Some(preview), Some("choice"));
+        return (Some(preview), Some("choice"), idle_ms);
     }
 
     let t = preview.trim_end();
@@ -1162,10 +1153,10 @@ fn pty_prompt_preview_and_waiting_kind(state: &mut PtyUiState) -> (Option<String
         || t.ends_with('$')
         || t.ends_with('#');
     if looks_like_input {
-        return (Some(preview), Some("input"));
+        return (Some(preview), Some("input"), idle_ms);
     }
 
-    (Some(preview), Some("input"))
+    (Some(preview), None, idle_ms)
 }
 
 fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
@@ -7606,11 +7597,13 @@ fn run_loop(
             anim_enabled = true;
             let mut preview: Option<String> = None;
             let mut waiting_kind: Option<&'static str> = None;
+            let mut idle_ms: u64 = 0;
             if !pty_done && pty_view {
                 if let Some(state) = pty.as_mut() {
-                    let (p, k) = pty_prompt_preview_and_waiting_kind(state);
+                    let (p, k, idle) = pty_prompt_preview_and_waiting_kind(state);
                     preview = p;
                     waiting_kind = k;
+                    idle_ms = idle;
                 }
             }
             let stage = if pty_done {
@@ -7619,14 +7612,22 @@ fn run_loop(
                 "等待用户选择..."
             } else if waiting_kind == Some("input") || (matches!(pty_focus, PtyFocus::ChatInput) && pty_view) {
                 "等待用户输入..."
+            } else if idle_ms >= 2000 {
+                "已无输出（可能在收尾）..."
             } else {
                 "正在执行中..."
             };
-            let preview_tail = preview
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| format!(" │{s}"))
-                .unwrap_or_default();
+            let show_preview =
+                waiting_kind.is_some() || idle_ms >= 2000;
+            let preview_tail = if show_preview {
+                preview
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| format!(" │{s}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let nav = if pty_view { "" } else { " · Home: Terminal" };
             input_line = format!("Terminal OS/ {stage}{preview_tail}{nav}");
         }
@@ -7916,7 +7917,7 @@ fn run_loop(
 		                        };
 		                        let block = Block::default()
 		                            .borders(Borders::ALL)
-		                            .title("Terminal")
+		                            .title("-● Terminal OS ●-+")
 		                            .border_style(Style::default().fg(border));
 		                        let inner = block.inner(chunks[2]);
 		                        let cols = inner.width.max(1);

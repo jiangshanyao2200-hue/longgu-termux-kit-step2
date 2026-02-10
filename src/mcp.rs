@@ -1345,6 +1345,16 @@ fn annotate_timeout(body: String, timed_out: bool, timeout_hint_secs: Option<u64
     }
 }
 
+fn annotate_nonzero_exit(body: String, timed_out: bool, code: i32) -> String {
+    if timed_out || code == 0 {
+        return body;
+    }
+    if body.trim().is_empty() {
+        return format!("执行失败（exit:{code}）。");
+    }
+    body
+}
+
 fn run_bash(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let cwd_display = current_dir_display();
     let cmd = call.input.trim();
@@ -1440,6 +1450,7 @@ fn build_shell_outcome_bash(
     };
 
     let body = annotate_timeout(truncate_command_output(combined), timed_out, timeout_hint_secs);
+    let body = annotate_nonzero_exit(body, timed_out, code);
     let status = status_label(code, timed_out);
     let mut log_lines = vec![format!(
         "状态:{status} | exit:{code} | 耗时:{}ms | cwd:{cwd_display} | cmd_len:{}",
@@ -1494,6 +1505,7 @@ fn build_shell_outcome_adb(
     };
 
     let body = annotate_timeout(truncate_command_output(combined), timed_out, timeout_hint_secs);
+    let body = annotate_nonzero_exit(body, timed_out, code);
     let status = status_label(code, timed_out);
     let mut log_lines = vec![format!(
         "状态:{status} | exit:{code} | 耗时:{}ms | cwd:{cwd_display} | cmd_len:{}",
@@ -1519,9 +1531,22 @@ fn ensure_adb_connected() -> bool {
     if is_adb_ready() {
         return true;
     }
+    // 尽量自愈：adb server 未启动时先拉起。
+    let _ = adb_quick(&["start-server"], 6);
+    // 尝试直连（可能已处于 tcp 模式，仅断线）。
+    let _ = adb_quick(&["connect", ADB_SERIAL], 8);
+    if is_adb_ready() {
+        return true;
+    }
+    // 尝试脚本化打开 tcp 并重启 adbd（需要 root）。
     let _ = try_prepare_adb_tcp();
-    let _ = Command::new("adb").args(["connect", ADB_SERIAL]).output();
+    let _ = adb_quick(&["connect", ADB_SERIAL], 10);
     is_adb_ready()
+}
+
+fn adb_quick(args: &[&str], timeout_secs: u64) -> std::io::Result<std::process::Output> {
+    let (mut cmd, _) = build_command_with_timeout("adb", args, timeout_secs.max(1));
+    cmd.output()
 }
 
 fn is_adb_ready() -> bool {
@@ -1547,20 +1572,31 @@ fn run_adb(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     }
 
     let started = Instant::now();
-    if !ensure_adb_connected() {
-        return Ok(ToolOutcome {
-            user_message: format!(
-                "自动连接失败，无法连接 ADB 设备 {ADB_SERIAL}。\n请手动建立连接：\n1) su -c 'setprop service.adb.tcp.port 5555; setprop ctl.restart adbd'\n2) adb connect {ADB_SERIAL}\n完成后重试该命令。"
-            ),
-            log_lines: vec![format!(
-                "状态:adb_offline | 耗时:{}ms | cwd:{cwd_display}",
-                started.elapsed().as_millis()
-            )],
-        });
-    }
+    let first = input.split_whitespace().next().unwrap_or("");
+    let raw_mode = first.starts_with('-');
+    let global_cmd = raw_mode
+        || matches!(
+            first,
+            "devices" | "connect" | "disconnect" | "start-server" | "kill-server" | "version"
+        );
 
     // 兼容 deepseek-cli：input 不含 adb 前缀。
-    let cmd = format!("adb -s {ADB_SERIAL} {input}");
+    let cmd = if global_cmd {
+        format!("adb {input}")
+    } else {
+        if !ensure_adb_connected() {
+            return Ok(ToolOutcome {
+                user_message: format!(
+                    "自动连接失败，无法连接 ADB 设备 {ADB_SERIAL}。\n可手动建立连接：\n1) su -c 'setprop service.adb.tcp.port 5555; setprop persist.adb.tcp.port 5555; setprop ctl.restart adbd'\n2) adb connect {ADB_SERIAL}\n完成后重试。"
+                ),
+                log_lines: vec![format!(
+                    "状态:adb_offline | 耗时:{}ms | cwd:{cwd_display}",
+                    started.elapsed().as_millis()
+                )],
+            });
+        }
+        format!("adb -s {ADB_SERIAL} {input}")
+    };
     let timeout_secs = call
         .timeout_secs
         .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000));
@@ -1582,7 +1618,8 @@ fn run_adb(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 }
 
 fn try_prepare_adb_tcp() -> bool {
-    let cmd = "su -c 'setprop service.adb.tcp.port 5555; setprop ctl.restart adbd'";
+    // 兼容不同 ROM：service/persist 两种 key 都尝试，最后 restart adbd。
+    let cmd = "su -c 'setprop service.adb.tcp.port 5555; setprop persist.adb.tcp.port 5555; setprop ctl.restart adbd'";
     let (mut command, _) = build_command(BASH_SHELL, &["-lc", cmd]);
     command
         .output()

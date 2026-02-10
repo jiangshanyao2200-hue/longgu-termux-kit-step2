@@ -24,6 +24,7 @@ const SEARCH_MAX_MATCHES_CAP: usize = 1000;
 const SEARCH_MAX_FILESIZE: &str = "1M";
 const SEARCH_MAX_FILE_BYTES: usize = 1_048_576;
 const SEARCH_MAX_KEYWORDS: usize = 8;
+const SEARCH_MAX_GLOBS: usize = 16;
 const SEARCH_MAX_FILES_SCAN: usize = 8_000;
 const SEARCH_TIMEOUT_SECS: u64 = 30;
 const SEARCH_CONTEXT_DEFAULT_LINES: usize = 20;
@@ -181,11 +182,73 @@ pub struct ToolCall {
     pub exclude_dirs: Option<Vec<String>>,
 }
 
-fn parse_string_list_value(v: &Value) -> Option<Vec<String>> {
+fn parse_list_tokens(raw: &str, max: usize) -> Vec<String> {
+    let s = raw.trim();
+    if s.is_empty() || max == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut quote_end: Option<char> = None;
+
+    fn push_token(out: &mut Vec<String>, buf: &mut String) {
+        let t = compact_ws_inline(buf.trim());
+        buf.clear();
+        if t.is_empty() {
+            return;
+        }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+            return;
+        }
+        out.push(t);
+    }
+
+    for ch in s.chars() {
+        if let Some(end) = quote_end {
+            if ch == end {
+                quote_end = None;
+                push_token(&mut out, &mut buf);
+            } else {
+                buf.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                push_token(&mut out, &mut buf);
+                quote_end = Some('"');
+            }
+            '“' => {
+                push_token(&mut out, &mut buf);
+                quote_end = Some('”');
+            }
+            '‘' => {
+                push_token(&mut out, &mut buf);
+                quote_end = Some('’');
+            }
+            ',' | '，' | ';' | '；' | '\n' | '\t' | ' ' => {
+                push_token(&mut out, &mut buf);
+            }
+            _ => buf.push(ch),
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    if quote_end.is_some() {
+        push_token(&mut out, &mut buf);
+    } else {
+        push_token(&mut out, &mut buf);
+    }
+    out.truncate(max);
+    out
+}
+
+fn parse_string_list_value_max(v: &Value, max: usize) -> Option<Vec<String>> {
     match v {
         Value::Null => None,
         Value::String(s) => {
-            let tokens = parse_search_keywords(s);
+            let tokens = parse_list_tokens(s, max);
             (!tokens.is_empty()).then_some(tokens)
         }
         Value::Array(arr) => {
@@ -200,13 +263,17 @@ fn parse_string_list_value(v: &Value) -> Option<Vec<String>> {
                         continue;
                     }
                     out.push(t.to_string());
+                    if out.len() >= max {
+                        break;
+                    }
                 }
             }
+            out.truncate(max);
             (!out.is_empty()).then_some(out)
         }
         Value::Object(_) | Value::Bool(_) | Value::Number(_) => {
             value_to_nonempty_string(v).and_then(|s| {
-                let tokens = parse_search_keywords(&s);
+                let tokens = parse_list_tokens(&s, max);
                 (!tokens.is_empty()).then_some(tokens)
             })
         }
@@ -348,13 +415,13 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                 call.context_hits_per_file = parse_usize_value(&val);
             }
             "include_glob" | "include_globs" | "include" => {
-                call.include_glob = parse_string_list_value(&val);
+                call.include_glob = parse_string_list_value_max(&val, SEARCH_MAX_GLOBS);
             }
             "exclude_glob" | "exclude_globs" | "exclude" => {
-                call.exclude_glob = parse_string_list_value(&val);
+                call.exclude_glob = parse_string_list_value_max(&val, SEARCH_MAX_GLOBS);
             }
             "exclude_dirs" | "exclude_dir" => {
-                call.exclude_dirs = parse_string_list_value(&val);
+                call.exclude_dirs = parse_string_list_value_max(&val, 32);
             }
             "count" => call.count = parse_usize_value(&val),
             "start_line" | "start" => {
@@ -499,65 +566,7 @@ fn apply_mind_msg_defaults(call: &mut ToolCall, raw_tool: &str) {
 }
 
 fn parse_search_keywords(raw: &str) -> Vec<String> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return Vec::new();
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut buf = String::new();
-    let mut quote_end: Option<char> = None;
-
-    fn push_token(out: &mut Vec<String>, buf: &mut String) {
-        let t = compact_ws_inline(buf.trim());
-        buf.clear();
-        if t.is_empty() {
-            return;
-        }
-        if out.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
-            return;
-        }
-        out.push(t);
-    }
-
-    for ch in s.chars() {
-        if let Some(end) = quote_end {
-            if ch == end {
-                quote_end = None;
-                push_token(&mut out, &mut buf);
-            } else {
-                buf.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '"' => {
-                push_token(&mut out, &mut buf);
-                quote_end = Some('"');
-            }
-            '“' => {
-                push_token(&mut out, &mut buf);
-                quote_end = Some('”');
-            }
-            '‘' => {
-                push_token(&mut out, &mut buf);
-                quote_end = Some('’');
-            }
-            ',' | '，' | ';' | '；' | '\n' | '\t' | ' ' => {
-                push_token(&mut out, &mut buf);
-            }
-            _ => buf.push(ch),
-        }
-        if out.len() >= SEARCH_MAX_KEYWORDS {
-            break;
-        }
-    }
-    if quote_end.is_some() {
-        push_token(&mut out, &mut buf);
-    } else {
-        push_token(&mut out, &mut buf);
-    }
-    out.truncate(SEARCH_MAX_KEYWORDS);
-    out
+    parse_list_tokens(raw, SEARCH_MAX_KEYWORDS)
 }
 
 fn normalize_search_pattern(raw_pattern: &str) -> (String, Vec<String>) {

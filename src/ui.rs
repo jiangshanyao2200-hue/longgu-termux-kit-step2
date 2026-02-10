@@ -198,61 +198,6 @@ fn truncate_for_ui(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn collapse_internal_tool_echo_for_ui(text: &str) -> Option<String> {
-    fn is_header(line: &str) -> bool {
-        let l = line.trim_start();
-        (l.starts_with("● Ran CMD") || l.starts_with("○ Ran CMD"))
-            || (l.starts_with("● Tool result") || l.starts_with("○ Tool result"))
-    }
-
-    fn is_continuation(line: &str) -> bool {
-        let l = line.trim_start();
-        l.starts_with('↳')
-            || l.starts_with('┆')
-            || l.starts_with("meta:")
-            || l.starts_with("output:")
-            || l.starts_with("input:")
-            || l.starts_with("explain:")
-            || l.starts_with("状态:")
-            || l.starts_with("Tool result:")
-    }
-
-    let mut out: Vec<String> = Vec::new();
-    let mut skipping = false;
-    let mut inserted = false;
-    for raw in text.lines() {
-        let line = raw.trim_end();
-        if !skipping {
-            if is_header(line) {
-                if !inserted {
-                    out.push("（内部执行日志已折叠：Shift+Tab 可查看详情）".to_string());
-                    inserted = true;
-                }
-                skipping = true;
-                continue;
-            }
-            out.push(line.to_string());
-            continue;
-        }
-
-        if line.trim().is_empty() {
-            skipping = false;
-            continue;
-        }
-        if is_header(line) || is_continuation(line) {
-            continue;
-        }
-        skipping = false;
-        out.push(line.to_string());
-    }
-
-    if inserted {
-        Some(out.join("\n"))
-    } else {
-        None
-    }
-}
-
 fn should_compact_user_message(text: &str) -> bool {
     let lines = text.lines().count().max(1);
     let chars = text.chars().count();
@@ -2923,23 +2868,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             None
         };
         let msg_ref_base: &crate::Message = decorated.as_ref().unwrap_or(msg);
-        let mut assistant_view: Option<crate::Message> = None;
-        let mut cache_key: Option<u8> = None;
-        if msg_ref_base.role == Role::Assistant && reveal_idx != Some(msg_idx) {
-            if !details_mode {
-                if let Some(clean) = collapse_internal_tool_echo_for_ui(&msg_ref_base.text) {
-                    let mut next = msg_ref_base.clone();
-                    next.text = clean;
-                    assistant_view = Some(next);
-                    cache_key = Some(101);
-                } else {
-                    cache_key = Some(100);
-                }
-            } else {
-                cache_key = Some(100);
-            }
-        }
-        let msg_ref: &crate::Message = assistant_view.as_ref().unwrap_or(msg_ref_base);
+        let msg_ref: &crate::Message = msg_ref_base;
 
         let mut rendered = if reveal_idx == Some(msg_idx) {
             render_message_lines(
@@ -2957,12 +2886,6 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             .and_then(|entry| entry.as_ref())
             && pulse.is_none()
             && !animated_assistant
-            && (cache_key.is_none()
-                || render_cache
-                    .tool_key
-                    .get(msg_idx)
-                    .and_then(|k| *k)
-                    == cache_key)
         {
             lines.clone()
         } else {
@@ -2970,11 +2893,6 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 render_message_lines(theme, msg_ref, width, dot, dot_color, base_style, None);
             if !animated_assistant && let Some(slot) = render_cache.per_msg.get_mut(msg_idx) {
                 *slot = Some(lines.clone());
-            }
-            if let Some(key) = cache_key
-                && let Some(slot) = render_cache.tool_key.get_mut(msg_idx)
-            {
-                *slot = Some(key);
             }
             lines
         };

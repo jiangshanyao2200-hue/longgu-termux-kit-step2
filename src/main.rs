@@ -1074,6 +1074,122 @@ fn compact_ws_inline(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
+    fn is_header(line: &str) -> bool {
+        let l = line.trim_start();
+        (l.starts_with("● Ran CMD") || l.starts_with("○ Ran CMD"))
+            || (l.starts_with("● Tool result") || l.starts_with("○ Tool result"))
+    }
+
+    fn is_continuation(line: &str) -> bool {
+        let l = line.trim_start();
+        l.starts_with('↳')
+            || l.starts_with('┆')
+            || l.starts_with("meta:")
+            || l.starts_with("output:")
+            || l.starts_with("input:")
+            || l.starts_with("explain:")
+            || l.starts_with("状态:")
+            || l.starts_with("Tool result:")
+    }
+
+    let mut assistant_lines: Vec<String> = Vec::new();
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur_block: Vec<String> = Vec::new();
+    let mut in_block = false;
+
+    let flush_block = |blocks: &mut Vec<String>, cur: &mut Vec<String>| {
+        if cur.is_empty() {
+            return;
+        }
+        while cur.last().is_some_and(|l| l.trim().is_empty()) {
+            cur.pop();
+        }
+        if !cur.is_empty() {
+            blocks.push(cur.join("\n").trim_end().to_string());
+        }
+        cur.clear();
+    };
+
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if !in_block {
+            if is_header(line) {
+                in_block = true;
+                cur_block.push(line.to_string());
+            } else {
+                assistant_lines.push(line.to_string());
+            }
+            continue;
+        }
+
+        if line.trim().is_empty() {
+            flush_block(&mut blocks, &mut cur_block);
+            in_block = false;
+            continue;
+        }
+        if is_header(line) {
+            flush_block(&mut blocks, &mut cur_block);
+            cur_block.push(line.to_string());
+            in_block = true;
+            continue;
+        }
+        if is_continuation(line) {
+            cur_block.push(line.to_string());
+            continue;
+        }
+        flush_block(&mut blocks, &mut cur_block);
+        in_block = false;
+        assistant_lines.push(line.to_string());
+    }
+    if in_block {
+        flush_block(&mut blocks, &mut cur_block);
+    }
+
+    while assistant_lines.last().is_some_and(|l| l.trim().is_empty()) {
+        assistant_lines.pop();
+    }
+    (assistant_lines.join("\n").trim().to_string(), blocks)
+}
+
+fn wrap_tool_echo_block_as_tool_message(block: &str) -> String {
+    let mut cleaned_lines: Vec<String> = Vec::new();
+    let mut status: Option<String> = None;
+    for raw in block.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        let stripped = if let Some(rest) = trimmed.strip_prefix("● ") {
+            rest
+        } else if let Some(rest) = trimmed.strip_prefix("○ ") {
+            rest
+        } else {
+            line
+        };
+        if status.is_none() {
+            if let Some(pos) = stripped.find("状态:") {
+                let rest = stripped[pos + "状态:".len()..].trim();
+                let tok = rest
+                    .split(|c: char| c.is_whitespace() || c == '|' || c == ',')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !tok.is_empty() {
+                    status = Some(tok.to_string());
+                }
+            }
+        }
+        cleaned_lines.push(stripped.to_string());
+    }
+    let mut cleaned = cleaned_lines.join("\n").trim_end().to_string();
+    truncate_to_max_bytes(&mut cleaned, 24_000);
+    let meta = status
+        .map(|s| format!("状态:{s}"))
+        .unwrap_or_else(|| "状态:unknown".to_string());
+    format!(
+        "操作: TOOL_ECHO\nexplain: 解析到内部工具回显（已从正文剥离）\noutput:\n```text\n{cleaned}\n```\nmeta:\n```text\n{meta}\n```\n"
+    )
+}
+
 fn load_prompt(path: &Path) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读取提示词失败: {}", path.display()))?;
@@ -10538,6 +10654,13 @@ fn handle_model_stream_end(
             }
             assistant_text = cleaned;
         }
+        let (assistant_clean, tool_echo_blocks) = extract_internal_tool_echo_blocks(&assistant_text);
+        assistant_text = assistant_clean;
+        let tool_echo_msgs: Vec<String> = tool_echo_blocks
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|b| wrap_tool_echo_block_as_tool_message(&b))
+            .collect();
         if extracted_from_assistant && !extracted.is_empty() {
             let mut preview = tool_block_from_assistant.take().unwrap_or_else(|| {
                 extracted
@@ -10719,6 +10842,12 @@ fn handle_model_stream_end(
             );
             push_sys_log(sys_log, sys_log_limit, "日记工具缺失");
         }
+        if !tool_echo_msgs.is_empty() {
+            for msg in tool_echo_msgs {
+                core.push_tool(msg);
+            }
+            jump_to_bottom(scroll, follow_bottom);
+        }
     } else {
         let raw_assistant = streaming_state.raw_text.trim_end().to_string();
         let mut assistant_text = raw_assistant.clone();
@@ -10735,6 +10864,13 @@ fn handle_model_stream_end(
         // 心跳场景：DeepSeek 偶发把“答复”放进 reasoning（thinking_full_text）而 content 为空。
         // 若本次 content 为空，则用 thinking 内容回填到正文，避免只看到心跳 banner。
         assistant_text = heartbeat_reply_text(assistant_text, thinking_full_text);
+        let (assistant_clean, tool_echo_blocks) = extract_internal_tool_echo_blocks(&assistant_text);
+        assistant_text = assistant_clean;
+        let tool_echo_msgs: Vec<String> = tool_echo_blocks
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|b| wrap_tool_echo_block_as_tool_message(&b))
+            .collect();
         runlog_event(
             "INFO",
             "model.response.end",
@@ -10811,6 +10947,12 @@ fn handle_model_stream_end(
         }
         if out_tokens > 0 || !assistant_text.trim().is_empty() {
             let _ = store_token_totals(token_total_path, token_totals);
+        }
+        if !tool_echo_msgs.is_empty() {
+            for msg in tool_echo_msgs {
+                core.push_tool(msg);
+            }
+            jump_to_bottom(scroll, follow_bottom);
         }
     }
     {

@@ -39,6 +39,8 @@ const ADB_SAVE_THRESHOLD_BYTES: usize = 900_000;
 const TERMUX_API_CACHE_DIR: &str = "log/termux-api-cache";
 // termux-api 输出通常偏中等，但也可能一次返回大量 JSON（如 SAF/传感器/Wi-Fi 扫描等）。
 const TERMUX_API_SAVE_THRESHOLD_BYTES: usize = 600_000;
+const SEARCH_CACHE_DIR: &str = "log/search-cache";
+const SEARCH_SAVE_THRESHOLD_BYTES: usize = 400_000;
 const TOOL_OUTPUT_MAX_CHARS: usize = 12_000;
 const TOOL_OUTPUT_MAX_LINES: usize = 240;
 const TOOL_OUTPUT_RAW_MAX_CHARS: usize = 20_000;
@@ -1730,7 +1732,14 @@ fn count_file_lines(path: &str) -> Option<usize> {
     Some(count)
 }
 
-fn find_files_by_name(root: &Path, pattern: &str, limit: usize, out: &mut Vec<String>) {
+fn find_files_by_name_with_timeout(
+    root: &Path,
+    pattern: &str,
+    limit: usize,
+    started: Instant,
+    timeout_secs: u64,
+    out: &mut Vec<String>,
+) -> bool {
     fn is_excluded_dir(name: &str) -> bool {
         SEARCH_EXCLUDE_DIRS
             .iter()
@@ -1739,20 +1748,33 @@ fn find_files_by_name(root: &Path, pattern: &str, limit: usize, out: &mut Vec<St
 
     let pattern = pattern.trim();
     if pattern.is_empty() || limit == 0 {
-        return;
+        return true;
     }
     let needle = pattern.to_ascii_lowercase();
 
-    fn walk(dir: &Path, needle: &str, limit: usize, out: &mut Vec<String>) {
+    fn walk(
+        dir: &Path,
+        needle: &str,
+        limit: usize,
+        started: Instant,
+        timeout_secs: u64,
+        out: &mut Vec<String>,
+    ) -> bool {
         if out.len() >= limit {
-            return;
+            return true;
+        }
+        if timeout_secs > 0 && started.elapsed().as_secs() >= timeout_secs {
+            return false;
         }
         let Ok(rd) = fs::read_dir(dir) else {
-            return;
+            return true;
         };
         for entry in rd.flatten() {
             if out.len() >= limit {
-                return;
+                return true;
+            }
+            if timeout_secs > 0 && started.elapsed().as_secs() >= timeout_secs {
+                return false;
             }
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -1760,7 +1782,9 @@ fn find_files_by_name(root: &Path, pattern: &str, limit: usize, out: &mut Vec<St
                 if is_excluded_dir(&name) {
                     continue;
                 }
-                walk(&path, needle, limit, out);
+                if !walk(&path, needle, limit, started, timeout_secs, out) {
+                    return false;
+                }
                 continue;
             }
             if !path.is_file() {
@@ -1784,9 +1808,10 @@ fn find_files_by_name(root: &Path, pattern: &str, limit: usize, out: &mut Vec<St
                 }
             }
         }
+        true
     }
 
-    walk(root, &needle, limit, out);
+    walk(root, &needle, limit, started, timeout_secs, out)
 }
 
 fn run_read_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
@@ -2092,25 +2117,66 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .unwrap_or(SEARCH_DEFAULT_MAX_MATCHES)
         .clamp(1, SEARCH_MAX_MATCHES_CAP);
     let started = Instant::now();
+    let timeout_secs = call
+        .timeout_secs
+        .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000));
+    let timeout_hint = timeout_secs.or(Some(TOOL_TIMEOUT_SECS));
     let pattern_preview = build_preview(&pattern, 80);
     if search_files {
         let mut matches: Vec<String> = Vec::new();
-        find_files_by_name(Path::new(&root), &pattern, max_matches, &mut matches);
+        let finished = find_files_by_name_with_timeout(
+            Path::new(&root),
+            &pattern,
+            max_matches,
+            started,
+            timeout_hint.unwrap_or(TOOL_TIMEOUT_SECS),
+            &mut matches,
+        );
         let elapsed = started.elapsed();
         let match_count = matches.len();
-        let body = if match_count == 0 {
+        let mut body = if match_count == 0 {
             "未找到匹配".to_string()
         } else {
             matches.join("\n")
         };
+        if !finished {
+            body = annotate_timeout(body, true, timeout_hint);
+        }
+
+        let total_bytes = body.as_bytes().len();
+        let truncated_by_lines = body.lines().count() > OUTPUT_MAX_LINES;
+        let truncated_by_chars = body.chars().count() > OUTPUT_MAX_CHARS;
+        let need_save =
+            total_bytes > SEARCH_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+        let saved_path = if need_save {
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let pid = unsafe { libc::getpid() };
+            let path = format!("{SEARCH_CACHE_DIR}/search_files_{ts}_{pid}.log");
+            if try_write_shell_cache_impl(SEARCH_CACHE_DIR, &path, body.as_bytes(), &[]) {
+                Some(path)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut body = truncate_command_output(body);
+        if let Some(p) = saved_path.as_deref() {
+            body.push_str(&format!("\n\n[saved:{p}]"));
+        }
+        let mut log = format!(
+            "状态:0 | 耗时:{}ms | root:{} | matches:{} | engine:find | file:true | pattern:{pattern_preview}",
+            elapsed.as_millis(),
+            shorten_path(&root),
+            match_count
+        );
+        if let Some(p) = saved_path.as_deref() {
+            log.push_str(&format!(" | saved:{p}"));
+        }
         return Ok(ToolOutcome {
-            user_message: truncate_command_output(body),
-            log_lines: vec![format!(
-                "状态:0 | 耗时:{}ms | root:{} | matches:{} | engine:find | file:true | pattern:{pattern_preview}",
-                elapsed.as_millis(),
-                shorten_path(&root),
-                match_count
-            )],
+            user_message: body,
+            log_lines: vec![log],
         });
     }
     let mut engine = "rg";
@@ -2148,31 +2214,66 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let rg_refs: Vec<&str> = rg_args.iter().map(|s| s.as_str()).collect();
     let grep_refs: Vec<&str> = grep_args.iter().map(|s| s.as_str()).collect();
 
-    let mut out = run_command_output("rg", &rg_refs);
+    let mut out = run_command_output_with_optional_timeout("rg", &rg_refs, timeout_secs);
     if out.is_err() {
         engine = "grep";
-        out = run_command_output("grep", &grep_refs);
+        out = run_command_output_with_optional_timeout("grep", &grep_refs, timeout_secs);
     }
     let (code, stdout, stderr, timed_out) =
         out.unwrap_or_else(|_| (127, String::new(), "search failed".to_string(), false));
     let elapsed = started.elapsed();
 
     let match_count = stdout.lines().count();
-    let mut body = collect_output(&stdout, &stderr);
-    if body.trim().is_empty() && code == 1 && !timed_out {
-        body = "未找到匹配".to_string();
+    let combined = collect_output(&stdout, &stderr);
+    let no_match = combined.trim().is_empty() && code == 1 && !timed_out;
+    let raw_body = if no_match {
+        "未找到匹配".to_string()
+    } else {
+        combined
+    };
+
+    let total_bytes = stdout
+        .as_bytes()
+        .len()
+        .saturating_add(stderr.as_bytes().len());
+    let truncated_by_lines = raw_body.lines().count() > OUTPUT_MAX_LINES;
+    let truncated_by_chars = raw_body.chars().count() > OUTPUT_MAX_CHARS;
+    let need_save =
+        total_bytes > SEARCH_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+    let saved_path = if need_save {
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let pid = unsafe { libc::getpid() };
+        let path = format!("{SEARCH_CACHE_DIR}/search_{ts}_{pid}.log");
+        if try_write_shell_cache_impl(SEARCH_CACHE_DIR, &path, stdout.as_bytes(), stderr.as_bytes())
+        {
+            Some(path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut body = annotate_timeout(truncate_command_output(raw_body), timed_out, timeout_hint);
+    let status_code = if no_match { 0 } else { code };
+    body = annotate_nonzero_exit(body, timed_out, status_code);
+    if let Some(p) = saved_path.as_deref() {
+        body.push_str(&format!("\n\n[saved:{p}]"));
     }
-    let body = annotate_timeout(truncate_command_output(body), timed_out, None);
-    let status = status_label(code, timed_out);
+    let status = status_label(status_code, timed_out);
+    let mut log = format!(
+        "状态:{status} | 耗时:{}ms | root:{} | matches:{} | engine:{engine} | pattern:{pattern_preview}",
+        elapsed.as_millis(),
+        shorten_path(&root),
+        match_count
+    );
+    if let Some(p) = saved_path.as_deref() {
+        log.push_str(&format!(" | saved:{p}"));
+    }
 
     Ok(ToolOutcome {
         user_message: body,
-        log_lines: vec![format!(
-            "状态:{status} | 耗时:{}ms | root:{} | matches:{} | engine:{engine} | pattern:{pattern_preview}",
-            elapsed.as_millis(),
-            shorten_path(&root),
-            match_count
-        )],
+        log_lines: vec![log],
     })
 }
 
@@ -4485,8 +4586,12 @@ fn run_patch_command(
     Ok((code, stdout, stderr, timed_out))
 }
 
-fn run_command_output(program: &str, args: &[&str]) -> anyhow::Result<(i32, String, String, bool)> {
-    let (mut command, timeout_used) = build_command(program, args);
+fn run_command_output_with_optional_timeout(
+    program: &str,
+    args: &[&str],
+    timeout_secs: Option<u64>,
+) -> anyhow::Result<(i32, String, String, bool)> {
+    let (mut command, timeout_used) = build_command_with_optional_timeout(program, args, timeout_secs);
     let out = command
         .output()
         .with_context(|| format!("执行失败：{program}"))?;

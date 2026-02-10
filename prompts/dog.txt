@@ -70,6 +70,10 @@
   - 大输出：超阈值或被截断会落盘到 `log/termux-api-cache/...` 并附 `[saved:...]`。
 - search：全文搜索（优先使用）。
   示例：{"tool":"search","pattern":"TODO","root":"src","brief":"稍等，我在搜索待办"}
+  说明：
+  - 默认优先使用 `rg`，不可用则自动降级为 `grep`。
+  - 超时：默认约 10s；可用 `timeout_secs`/`timeout_ms` 覆盖；传 `0` 表示不启用超时（不建议）。
+  - 大输出：超阈值或被截断会落盘到 `log/search-cache/...` 并附 `[saved:...]`。
 - mind_msg：向萤Main同步信息（target=main）。
   示例：{"tool":"mind_msg","target":"main","content":"我已完成排查，发现了两个问题。","brief":"同步进度"}
   

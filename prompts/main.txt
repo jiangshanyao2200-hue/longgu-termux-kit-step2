@@ -43,6 +43,13 @@
 - 超时：默认 `25s`（更适合 Wi‑Fi 扫描/定位/SAF 等慢接口）；可通过 `timeout_secs`/`timeout_ms` 覆盖；传 `0` 表示不启用超时（不建议）。
 - 大输出：若输出过大/被截断，会自动落盘到 `log/termux-api-cache/...`，并在末尾附 `[saved:...]` 供后续按需读取。
 
+可用参数（search）：
+- `search` 工具用于全文检索：优先用 `rg`，不可用则自动降级为 `grep`。
+- 入参：`pattern` + `root`（或直接用 `input` 作为 pattern）。
+- `count`：最大匹配条数（默认约 200，最大 1000）。
+- 超时：默认约 10s；可用 `timeout_secs`/`timeout_ms` 覆盖；传 `0` 表示不启用超时（不建议）。
+- 大输出：若输出过大/被截断，会自动落盘到 `log/search-cache/...`，并在末尾附 `[saved:...]` 供后续按需读取。
+
 示例（长命令）：
 <tool>{"tool":"bash","input":"pkg update -y && pkg upgrade -y","brief":"验证 pkg 可用性","timeout_secs":180}</tool>
 

@@ -66,9 +66,14 @@
 - `view_image` 工具用于查看本地图片（非交互）：优先用 `path` 指定路径（也可把路径写在 `input`）。
   - 兼容别名：`tool:"viewimage"` / `tool:"img"` / `tool:"image"` 会自动映射到 `view_image`（建议仍用 `view_image`）。
 - `open`（bool，可选，默认 false）：用 `termux-open` 调起系统查看器打开图片（用户侧预览）。
-- `width/height`（int，可选）：用于 ASCII 预览的尺寸（默认 60x30；仅当安装了 `chafa` 时生效）。
-  - 若未安装 `chafa`，会返回图片基本信息，并提示安装以启用预览。
-  - 若预览输出过大，会自动落盘到 `log/image-cache/...` 并附 `[saved:...]`。
+- `preview`（bool，可选，默认 true）：是否输出 ASCII 预览（需要 `chafa`）。`width/height`（int，可选）控制尺寸（默认 60x30）。
+- `meta`（bool，可选）：输出图片结构化信息（优先用 ImageMagick 的 `identify`）。
+- `exif`（bool，可选）：输出 EXIF（`exiftool -json -n`）。
+- `ocr`（bool，可选）：OCR（`tesseract <img> stdout`），可配 `lang`（默认 `eng`，如 `chi_sim`）。
+- `qr`（bool，可选）：识别二维码/条码（`zbarimg --raw`）。
+- `hash`（bool，可选）：输出 `sha256sum`。
+- `auto_install`（bool，可选，默认 false）：若缺依赖则尝试 `pkg install -y` 自动安装（可能耗时较长）。
+- 大输出：当报告过大/被截断时，会自动落盘到 `log/image-cache/...` 并附 `[saved:...]` 供后续按需读取。
 
 可用参数（plan）：
 - `plan` 工具是**纯 UI**：用于在聊天区插入“萤·开始工作 / 萤·工作结束”的分隔区块，减少视觉疲劳（不执行命令、无副作用）。

@@ -748,6 +748,45 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
     let truncated = text.contains("[输出已截断");
     let has_output = !text.contains("(no output)");
 
+    fn compact_error_reason(text: &str) -> Option<String> {
+        let lower = text.to_ascii_lowercase();
+        let mapping: [(&[&str], &str); 9] = [
+            (&["no such file or directory"], "No such file or directory"),
+            (&["permission denied"], "Permission denied"),
+            (&["connection refused"], "Connection refused"),
+            (&["timed out", "timeout"], "Timeout"),
+            (&["not found"], "Not found"),
+            (&["format error", "格式错误"], "Format error"),
+            (&["缺少 brief", "缺少 input", "缺少 pattern", "缺少 path"], "Missing field"),
+            (&["root path does not exist", "根路径不存在"], "Root path not found"),
+            (&["binary file", "二进制"], "Binary file"),
+        ];
+        for (needles, reason) in mapping {
+            if needles.iter().any(|n| lower.contains(n)) {
+                return Some(reason.to_string());
+            }
+        }
+
+        let (out_lines, meta_lines) = extract_tool_sections(text);
+        for line in meta_lines.iter().rev().chain(out_lines.iter()) {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let t = t
+                .trim_start_matches("工具执行失败：")
+                .trim_start_matches("读取文件失败：")
+                .trim_start_matches("操作失败：")
+                .trim_start_matches("执行失败：")
+                .trim();
+            if t.is_empty() {
+                continue;
+            }
+            return Some(compact_preview(t, 46));
+        }
+        None
+    }
+
     fn spinner(tick: usize) -> &'static str {
         match tick % 3 {
             0 => ".",
@@ -771,19 +810,19 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
 
     if saved.as_deref().is_some_and(|s| !s.trim().is_empty()) {
         if timed_out {
-            return Some("执行超时：输出已导出".to_string());
+            return Some("△ Timeout · output exported".to_string());
         }
         if failed_line.is_some() {
-            return Some("操作失败：输出已导出".to_string());
+            return Some("△ Error · output exported".to_string());
         }
-        return Some("输出已导出".to_string());
+        return Some("△ Output exported".to_string());
     }
 
     if timed_out {
         return Some(if has_output {
-            "执行超时：已返回部分输出".to_string()
+            "△ Timeout (partial output)".to_string()
         } else {
-            "执行超时".to_string()
+            "△ Timeout".to_string()
         });
     }
     if let Some(line) = failed_line {
@@ -791,23 +830,18 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
         if let Some(rest) = reason.strip_prefix("执行失败：") {
             reason = rest.trim().to_string();
         }
-        if reason.eq_ignore_ascii_case("fail") || reason.eq_ignore_ascii_case("error") {
-            let (out_lines, _meta_lines) = extract_tool_sections(text);
-            if let Some(first) = out_lines
-                .into_iter()
-                .map(|s| s.trim().to_string())
-                .find(|s| !s.is_empty())
-            {
-                reason = compact_preview(&first, 60);
-            }
+        if reason.eq_ignore_ascii_case("fail")
+            || reason.eq_ignore_ascii_case("error")
+            || reason.eq_ignore_ascii_case("failed")
+        {
+            reason = compact_error_reason(text).unwrap_or_else(|| "Error".to_string());
+        } else {
+            reason = compact_preview(&reason, 46);
         }
-        if reason.is_empty() {
-            return Some("操作失败".to_string());
-        }
-        return Some(format!("操作失败：{reason}"));
+        return Some(format!("△ Error: {reason}"));
     }
     if truncated {
-        return Some("输出已截断".to_string());
+        return Some("△ Output truncated".to_string());
     }
     // 正常成功：不显示状态行（避免“机械化”）
     None
@@ -3660,7 +3694,12 @@ mod tests {
         assert!(joined.contains("安全测试"));
         assert!(joined.contains("换行"));
         assert!(!joined.contains("saved:log/adb-"));
-        assert!(joined.contains("导出"));
+        let joined_no_ws = joined
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        assert!(joined_no_ws.contains("outputexported"));
     }
 }
 

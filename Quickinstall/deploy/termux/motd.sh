@@ -20,6 +20,85 @@ META_WRITTEN=0
 mkdir -p "$LOG_DIR" >/dev/null 2>&1 || true
 [ -x "$BASH_BIN" ] || BASH_BIN="$(command -v bash 2>/dev/null || echo bash)"
 
+cleanup_old_guards() {
+  local keep="${AITERMUX_MOTD_GUARD_KEEP:-8}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || return 0
+  (( keep <= 0 )) && return 0
+
+  local -a guards=()
+  shopt -s nullglob
+  guards=("$LOG_DIR"/motd-guard-*)
+  shopt -u nullglob
+
+  ((${#guards[@]} <= keep)) && return 0
+
+  # Keep newest N by mtime; remove the rest.
+  ls -1t "$LOG_DIR"/motd-guard-* 2>/dev/null | tail -n +$((keep + 1)) | xargs -r rm -f -- 2>/dev/null || true
+}
+
+prune_keep_newest_files() {
+  local dir="$1"
+  local keep="${2:-10}"
+  [[ -d "$dir" ]] || return 0
+  [[ "$keep" =~ ^[0-9]+$ ]] || return 0
+  (( keep <= 0 )) && return 0
+
+  shopt -s nullglob
+  local -a files=("$dir"/*)
+  shopt -u nullglob
+  ((${#files[@]} <= keep)) && return 0
+
+  ls -1t "$dir"/* 2>/dev/null | tail -n +$((keep + 1)) | xargs -r rm -f -- 2>/dev/null || true
+}
+
+trim_file_tail_bytes() {
+  local path="$1"
+  local max_kb="${2:-512}"
+  [[ -f "$path" ]] || return 0
+  [[ "$max_kb" =~ ^[0-9]+$ ]] || return 0
+  (( max_kb <= 0 )) && return 0
+
+  local max_bytes=$((max_kb * 1024))
+  local size_bytes=""
+  size_bytes="$(wc -c <"$path" 2>/dev/null || true)"
+  [[ "$size_bytes" =~ ^[0-9]+$ ]] || return 0
+  (( size_bytes <= max_bytes )) && return 0
+
+  local tmp="$LOG_DIR/.trim.$$.$RANDOM"
+  if tail -c "$max_bytes" "$path" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+}
+
+cleanup_system_log_dir() {
+  local enabled="${AITERMUX_MOTD_CLEAN_SYSTEM_LOG:-1}"
+  [[ "$enabled" = "0" ]] && return 0
+
+  local sys_root="$ROOT_DIR/system"
+  local sys_log="$sys_root/log"
+  [[ -d "$sys_log" ]] || return 0
+
+  local keep="${AITERMUX_MOTD_SYSTEM_LOG_KEEP:-10}"
+  local runtime_kb="${AITERMUX_MOTD_SYSTEM_RUNTIME_MAX_KB:-512}"
+
+  # The main runtime log can grow quickly; trim it aggressively.
+  trim_file_tail_bytes "$sys_log/runtime.log" "$runtime_kb" || true
+
+  # Old/one-off install logs (safe to delete; kept tiny but noisy).
+  rm -f "$sys_log/pkg_termux_api_install.log" 2>/dev/null || true
+
+  # Cache dirs: keep only newest N cache files.
+  prune_keep_newest_files "$sys_log/adb-cache" "$keep" || true
+  prune_keep_newest_files "$sys_log/bash-cache" "$keep" || true
+  prune_keep_newest_files "$sys_log/search-cache" "$keep" || true
+  prune_keep_newest_files "$sys_log/termux-api-cache" "$keep" || true
+
+  # Temp/debug snippets: remove all (they are reproducible).
+  rm -f "$sys_log/tmp"/* 2>/dev/null || true
+}
+
 TTY_ID="$(tty 2>/dev/null | tr -c 'a-zA-Z0-9' '_' | tr -s '_' '_' | sed 's/^_*//;s/_*$//')"
 if [ -n "${TTY_ID:-}" ]; then
   GUARD_FILE="$LOG_DIR/motd-guard-$TTY_ID"
@@ -38,6 +117,9 @@ if [ -n "${TTY_ID:-}" ]; then
     printf '%s\n' "$NOW_SEC" >"$GUARD_FILE" 2>/dev/null || true
   fi
 fi
+
+cleanup_old_guards || true
+cleanup_system_log_dir || true
 
 if [ "$DEBUG" != "1" ]; then
   : >"$ERR_LOG" 2>/dev/null || true

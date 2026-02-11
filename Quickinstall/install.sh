@@ -19,7 +19,8 @@ usage() {
 AITermux 一键覆盖部署（Termux）
 
 用法：
-  bash ~/AItermux/Quickinstall/install.sh [--dry-run] [--skip-preview] [--quiet]
+  bash ~/AItermux/install.sh [--dry-run] [--skip-preview] [--quiet]
+  # 或者（等价入口）：cd ~/AItermux/system && bash install.sh [args...]
 
 参数：
   --dry-run       仅打印操作，不写入文件

@@ -2,4 +2,5 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$ROOT/scripts/selfcheck.sh" "$@"
+AITERMUX_HOME="${AITERMUX_HOME:-$(cd "$ROOT/.." && pwd)}"
+exec "$AITERMUX_HOME/install.sh" "$@"

@@ -58,10 +58,10 @@ Termux 一键运行（自动自检并安装依赖）
 
 ```bash
 cd ~/AItermux/system
-bash Quickinstall/install.sh
+bash install.sh
 ```
 
-安装脚本位于仓库内 `Quickinstall/`，安装到用户目录 `~/AItermux/`，会执行：
+安装脚本位于 `~/AItermux/install.sh`（`~/AItermux/system/install.sh` 只是转调入口），覆盖部署到用户目录 `~/AItermux/`，会执行：
 - 备份并覆盖启动链路文件：`~/.termux/motd.sh`、`$PREFIX/bin/login`、`$PREFIX/etc/motd.sh`、`$PREFIX/etc/termux-login.sh`、`$PREFIX/bin/tx11start`
 - 同步 `~/AItermux/system` 工程代码（保留本地 `config/*.json` 与 `memory/`）
 - 安装 `~/AItermux/bin/aitermux` 启动器
@@ -71,15 +71,15 @@ bash Quickinstall/install.sh
 可选参数：
 
 ```bash
-bash Quickinstall/install.sh --dry-run
-bash Quickinstall/install.sh --skip-preview
-bash Quickinstall/install.sh --quiet
+bash install.sh --dry-run
+bash install.sh --skip-preview
+bash install.sh --quiet
 ```
 
 如有错误，运行自检脚本：
 
 ```bash
-./selfcheck.sh
+./scripts/selfcheck.sh
 ```
 
 直接使用 cargo run 也会在启动前尝试执行 scripts/bootstrap.sh 自动补齐依赖；如需跳过：cargo run -- --no-bootstrap。
@@ -184,7 +184,7 @@ cp -n config/system.example.json   config/system.json
 ├── src/                   # 源代码目录
 ├── Cargo.toml            # Rust 项目配置
 ├── run.sh                # 一键运行脚本
-└── selfcheck.sh          # 自检脚本
+└── install.sh            # 安装入口（会转调 ~/AItermux/install.sh）
 ```
 
 ---

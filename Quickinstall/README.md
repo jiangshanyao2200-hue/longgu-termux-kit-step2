@@ -5,16 +5,23 @@
 ## 用法
 
 ```bash
+cd ~/AItermux
+bash install.sh
+```
+
+也可以从子目录运行（等价）：
+
+```bash
 cd ~/AItermux/system
-bash Quickinstall/install.sh
+bash install.sh
 ```
 
 ## 可选参数
 
 ```bash
-bash Quickinstall/install.sh --dry-run
-bash Quickinstall/install.sh --skip-preview
-bash Quickinstall/install.sh --quiet
+bash install.sh --dry-run
+bash install.sh --skip-preview
+bash install.sh --quiet
 ```
 
 ## 说明

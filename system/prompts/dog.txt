@@ -38,9 +38,11 @@
  - 使用 mind_msg 与主意识沟通时，只输出工具调用，不输出额外正文；收到主意识消息需优先 mind_msg 回复。
 
 基础工具：
-- list_dir：列出目录内容（带关键信息：type/size/mtime/readonly；小文件可能附带 lines）。
+- list_dir：列出目录内容（带关键信息：type/size/mtime/readonly + relpath）。
   - 也支持对“文件路径”直接输出单条信息（可替代 stat_file）。
+  - 可选：`depth`（递归深度，1=仅当前目录），`max_entries`（最多返回多少条 entry）。
   示例：{"tool":"list_dir","path":".","brief":"我看看目录结构"}
+  示例（递归两层）：{"tool":"list_dir","path":"system","depth":2,"max_entries":300,"brief":"列出 system 两层结构"}
 - stat_file：已合并到 list_dir（兼容保留）。
   示例：{"tool":"stat_file","path":"Cargo.toml","brief":"我确认一下文件状态"}
 - read_file：读取文件片段（建议分段）。

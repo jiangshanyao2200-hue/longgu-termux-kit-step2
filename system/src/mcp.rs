@@ -103,8 +103,9 @@ const WRITE_MAX_BYTES: usize = 400_000;
 const PATCH_MAX_BYTES: usize = 500_000;
 const EDIT_MAX_FILE_BYTES: usize = 800_000;
 const EDIT_MAX_MATCHES: usize = 400;
-const LIST_LINECOUNT_MAX_BYTES: usize = 400_000;
-const LIST_LINECOUNT_MAX_FILES: usize = 80;
+const LIST_MAX_DEPTH_CAP: usize = 4;
+const LIST_MAX_ENTRIES_DEFAULT: usize = 300;
+const LIST_MAX_ENTRIES_CAP: usize = 1200;
 const MEMORY_CHECK_DEFAULT_RESULTS: usize = 10;
 const MEMORY_CHECK_MAX_RESULTS: usize = 20;
 const MEMORY_ADD_PREVIEW_LINES: usize = 8;
@@ -232,6 +233,13 @@ pub struct ToolCall {
     // search 输出上限控制（可选）
     #[serde(default)]
     pub output_level: Option<String>,
+
+    // list_dir：递归深度（1=仅当前目录）。为避免 token/性能暴涨，默认仍为 1。
+    #[serde(default)]
+    pub depth: Option<usize>,
+    // list_dir：最多返回多少条 entry（每条一行）。超出会截断并提示。
+    #[serde(default)]
+    pub max_entries: Option<usize>,
 }
 
 fn parse_list_tokens(raw: &str, max: usize) -> Vec<String> {
@@ -459,6 +467,12 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             }
             "output_level" | "out_level" | "level" | "output" => {
                 call.output_level = s;
+            }
+            "depth" | "max_depth" => {
+                call.depth = parse_usize_value(&val);
+            }
+            "max_entries" | "entries" | "entry_cap" => {
+                call.max_entries = parse_usize_value(&val);
             }
             "context" | "ctx" | "fast_context" => {
                 call.context = val
@@ -2953,25 +2967,13 @@ fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         }
     }
 
-    fn fmt_lines_suffix(path: &Path, bytes: u64, lines_budget: &mut usize) -> String {
-        if !path.is_file() {
-            return String::new();
+    fn abs_path(cwd: &Path, raw: &str) -> PathBuf {
+        let p = Path::new(raw);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
         }
-        if bytes as usize > LIST_LINECOUNT_MAX_BYTES {
-            return String::new();
-        }
-        if *lines_budget >= LIST_LINECOUNT_MAX_FILES {
-            return String::new();
-        }
-        if is_probably_binary_file(path) {
-            return String::new();
-        }
-        let p = path.to_string_lossy().to_string();
-        if let Some(n) = count_file_lines(&p) {
-            *lines_budget = lines_budget.saturating_add(1);
-            return format!(" | lines:{n}");
-        }
-        String::new()
     }
 
     // 合并 stat_file 能力：path 是文件时，直接输出单条“增强版 list”。
@@ -2979,17 +2981,14 @@ fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         let meta = fs::metadata(p).with_context(|| format!("获取文件信息失败：{path}"))?;
         let elapsed = started.elapsed();
         let bytes = meta.len();
-        let mut lines_budget = 0usize;
-        let lines = fmt_lines_suffix(p, bytes, &mut lines_budget);
         let body = format!(
-            "{} | path:{} | size:{} ({}) | mtime:{} | readonly:{}{}",
+            "{} | path:{} | size:{} ({}) | mtime:{} | readonly:{}",
             fmt_kind(&meta),
             shorten_path(&path),
             bytes,
             format_bytes(bytes),
             fmt_mtime(&meta),
-            meta.permissions().readonly(),
-            lines
+            meta.permissions().readonly()
         );
         return Ok(ToolOutcome {
             user_message: body,
@@ -3001,40 +3000,122 @@ fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         });
     }
 
-    let mut out: Vec<String> = Vec::new();
-    let mut names: Vec<(String, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(&path).with_context(|| format!("列目录失败：{path}"))? {
-        let entry = entry?;
-        let name = sanitize_search_line(&entry.file_name().to_string_lossy());
-        names.push((name, entry.path()));
-    }
-    names.sort_by(|a, b| a.0.cmp(&b.0));
+    let depth = call.depth.unwrap_or(1).clamp(1, LIST_MAX_DEPTH_CAP);
+    let max_entries = call
+        .max_entries
+        .unwrap_or(LIST_MAX_ENTRIES_DEFAULT)
+        .clamp(1, LIST_MAX_ENTRIES_CAP);
 
-    let mut lines_budget = 0usize;
-    for (name, ep) in names.into_iter() {
-        let meta = fs::metadata(&ep).ok();
-        let (kind, bytes, mtime, ro) = if let Some(m) = meta.as_ref() {
-            (fmt_kind(m), m.len(), fmt_mtime(m), m.permissions().readonly())
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let abs = abs_path(&cwd, &path);
+    let real = fs::canonicalize(&abs).unwrap_or(abs.clone());
+
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!("cwd: {}", shorten_path(&cwd.to_string_lossy())));
+    out.push(format!("path: {path}"));
+    out.push(format!("real: {}", shorten_path(&real.to_string_lossy())));
+    out.push(format!("depth: {depth} | entry_cap: {max_entries}"));
+    out.push(String::new());
+
+    let mut produced = 0usize;
+    let mut truncated = false;
+
+    fn join_rel(prefix: &str, name: &str) -> String {
+        if prefix.is_empty() {
+            name.to_string()
         } else {
-            ("other", 0u64, "unknown".to_string(), false)
+            format!("{prefix}/{name}")
+        }
+    }
+
+    fn list_one_dir(
+        root: &Path,
+        rel_prefix: &str,
+        level: usize,
+        max_level: usize,
+        max_entries: usize,
+        produced: &mut usize,
+        truncated: &mut bool,
+        out: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        if *produced >= max_entries {
+            *truncated = true;
+            return Ok(());
+        }
+        let mut items: Vec<(String, PathBuf)> = Vec::new();
+        let rd = match fs::read_dir(root) {
+            Ok(rd) => rd,
+            Err(_) => {
+                let here = if rel_prefix.is_empty() {
+                    ".".to_string()
+                } else {
+                    format!("{rel_prefix}/")
+                };
+                out.push(format!("dir | size:- | mtime:unknown | readonly:? | {here} [unreadable]"));
+                *produced = produced.saturating_add(1);
+                return Ok(());
+            }
         };
-        let display_name = if ep.is_dir() {
-            format!("{name}/")
-        } else {
-            name
-        };
-        let size_part = if kind == "file" {
-            format!("size:{} ({})", bytes, format_bytes(bytes))
-        } else {
-            "size:-".to_string()
-        };
-        let lines = meta
-            .as_ref()
-            .filter(|m| m.is_file())
-            .map(|m| fmt_lines_suffix(&ep, m.len(), &mut lines_budget))
-            .unwrap_or_default();
+        for entry in rd.flatten() {
+            let name = sanitize_search_line(&entry.file_name().to_string_lossy());
+            items.push((name, entry.path()));
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, ep) in items.into_iter() {
+            if *produced >= max_entries {
+                *truncated = true;
+                break;
+            }
+            let meta = fs::metadata(&ep).ok();
+            let (kind, bytes, mtime, ro) = if let Some(m) = meta.as_ref() {
+                (fmt_kind(m), m.len(), fmt_mtime(m), m.permissions().readonly())
+            } else {
+                ("other", 0u64, "unknown".to_string(), false)
+            };
+            let rel = join_rel(rel_prefix, &name);
+            let display = if kind == "dir" { format!("{rel}/") } else { rel };
+            let size_part = if kind == "file" {
+                format!("size:{} ({})", bytes, format_bytes(bytes))
+            } else {
+                "size:-".to_string()
+            };
+            out.push(format!(
+                "{kind} | {size_part} | mtime:{mtime} | readonly:{ro} | {display}"
+            ));
+            *produced = produced.saturating_add(1);
+
+            if kind == "dir" && level < max_level && !*truncated {
+                let next_prefix = join_rel(rel_prefix, &name);
+                list_one_dir(
+                    &ep,
+                    &next_prefix,
+                    level.saturating_add(1),
+                    max_level,
+                    max_entries,
+                    produced,
+                    truncated,
+                    out,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    list_one_dir(
+        p,
+        "",
+        1,
+        depth,
+        max_entries,
+        &mut produced,
+        &mut truncated,
+        &mut out,
+    )?;
+    if truncated {
+        out.push(String::new());
         out.push(format!(
-            "{kind} | {size_part} | mtime:{mtime} | readonly:{ro}{lines} | {display_name}"
+            "[truncated:true entries:{produced} entry_cap:{max_entries} depth:{depth}]"
         ));
     }
     let elapsed = started.elapsed();
@@ -3042,7 +3123,7 @@ fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     if body.is_empty() {
         body = "(empty)".to_string();
     }
-    let total_entries = out.len();
+    let total_entries = produced;
     let truncated_by_lines = total_entries > OUTPUT_MAX_LINES;
     let truncated_by_chars = body.chars().count() > OUTPUT_MAX_CHARS;
 

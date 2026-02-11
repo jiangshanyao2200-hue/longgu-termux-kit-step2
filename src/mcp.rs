@@ -48,8 +48,6 @@ const SEARCH_CONTEXT_MAX_FILES: usize = 60;
 const SEARCH_CONTEXT_MAX_HITS_PER_FILE: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 10;
 const TOOL_TIMEOUT_KILL_SECS: u64 = 2;
-const IMAGE_TOOL_TIMEOUT_SECS: u64 = 25;
-const IMAGE_AUTO_INSTALL_TIMEOUT_SECS: u64 = 600;
 // termux_api 默认给更宽松的超时：避免某些系统 API（如 wifi 扫描/定位/SAF）在弱机上经常误超时。
 const TERMUX_API_TIMEOUT_SECS: u64 = 25;
 const PATCH_TIMEOUT_MIN_SECS: u64 = 25;
@@ -67,8 +65,6 @@ const TERMUX_API_CACHE_DIR: &str = "log/termux-api-cache";
 const TERMUX_API_SAVE_THRESHOLD_BYTES: usize = 600_000;
 const SEARCH_CACHE_DIR: &str = "log/search-cache";
 const SEARCH_SAVE_THRESHOLD_BYTES: usize = 400_000;
-const IMAGE_CACHE_DIR: &str = "log/image-cache";
-const IMAGE_SAVE_THRESHOLD_BYTES: usize = 250_000;
 const TOOL_OUTPUT_MAX_CHARS: usize = 12_000;
 const TOOL_OUTPUT_MAX_LINES: usize = 240;
 const TOOL_OUTPUT_RAW_MAX_CHARS: usize = 20_000;
@@ -234,30 +230,6 @@ pub struct ToolCall {
     // search 输出上限控制（可选）
     #[serde(default)]
     pub output_level: Option<String>,
-
-    // view_image
-    #[serde(default)]
-    pub open: Option<bool>,
-    #[serde(default)]
-    pub preview: Option<bool>,
-    #[serde(default)]
-    pub width: Option<usize>,
-    #[serde(default)]
-    pub height: Option<usize>,
-    #[serde(default)]
-    pub meta: Option<bool>,
-    #[serde(default)]
-    pub exif: Option<bool>,
-    #[serde(default)]
-    pub ocr: Option<bool>,
-    #[serde(default)]
-    pub qr: Option<bool>,
-    #[serde(default)]
-    pub hash: Option<bool>,
-    #[serde(default)]
-    pub auto_install: Option<bool>,
-    #[serde(default)]
-    pub lang: Option<String>,
 }
 
 fn parse_list_tokens(raw: &str, max: usize) -> Vec<String> {
@@ -486,55 +458,6 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "output_level" | "out_level" | "level" | "output" => {
                 call.output_level = s;
             }
-            "open" | "launch" => {
-                call.open = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
-            }
-            "preview" | "render" | "ascii" => {
-                call.preview = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
-            }
-            "width" | "w" => {
-                call.width = parse_usize_value(&val);
-            }
-            "height" | "h" => {
-                call.height = parse_usize_value(&val);
-            }
-            "meta" | "identify" | "imagemagick" => {
-                call.meta = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
-            }
-            "exif" => {
-                call.exif = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
-            }
-            "ocr" => {
-                call.ocr = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
-            }
-            "qr" | "barcode" => {
-                call.qr = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
-            }
-            "hash" | "sha256" => {
-                call.hash = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
-            }
-            "auto_install" | "autoinstall" | "install" => {
-                call.auto_install = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
-            }
-            "lang" | "language" | "ocr_lang" => {
-                call.lang = s;
-            }
             "context" | "ctx" | "fast_context" => {
                 call.context = val
                     .as_bool()
@@ -629,7 +552,6 @@ fn normalize_tool_name(name: &str) -> String {
         "stat" | "info" | "file_info" => "stat_file",
         "read" | "readfile" => "read_file",
         "write" | "writefile" => "write_file",
-        "image" | "img" | "viewimg" | "viewimage" | "view_image" => "view_image",
         "grep" | "rg" | "ripgrep" => "search",
         "edit" => "edit_file",
         "patch" => "apply_patch",
@@ -1217,32 +1139,6 @@ mod tests {
         let call = parse_tool_call_payload(r#"{"tool":"ls","input":"."}"#).expect("call");
         assert_eq!(call.tool, "list_dir");
         assert_eq!(call.input, ".");
-
-        let call =
-            parse_tool_call_payload(r#"{"tool":"viewimage","path":"a.png","brief":"x"}"#).expect("call");
-        assert_eq!(call.tool, "view_image");
-        assert_eq!(call.path.as_deref(), Some("a.png"));
-    }
-
-    #[test]
-    fn parse_view_image_options() {
-        let call = parse_tool_call_payload(
-            r#"{"tool":"view_image","path":"a.png","brief":"x","open":true,"preview":false,"ocr":true,"lang":"chi_sim","meta":true,"exif":true,"qr":true,"hash":true,"auto_install":true,"width":80,"height":40}"#,
-        )
-        .expect("call");
-        assert_eq!(call.tool, "view_image");
-        assert_eq!(call.path.as_deref(), Some("a.png"));
-        assert_eq!(call.open, Some(true));
-        assert_eq!(call.preview, Some(false));
-        assert_eq!(call.ocr, Some(true));
-        assert_eq!(call.lang.as_deref(), Some("chi_sim"));
-        assert_eq!(call.meta, Some(true));
-        assert_eq!(call.exif, Some(true));
-        assert_eq!(call.qr, Some(true));
-        assert_eq!(call.hash, Some(true));
-        assert_eq!(call.auto_install, Some(true));
-        assert_eq!(call.width, Some(80));
-        assert_eq!(call.height, Some(40));
     }
 
     #[test]
@@ -1510,7 +1406,6 @@ fn tool_usage(tool: &str) -> &'static str {
         "read_file" => {
             r#"{"tool":"read_file","path":"src/main.rs","head":true,"max_lines":200,"brief":"读取文件开头"}"#
         }
-        "view_image" => r#"{"tool":"view_image","path":"Pictures/demo.png","open":true,"brief":"打开图片预览"}"#,
         "write_file" => {
             r#"{"tool":"write_file","path":"notes/demo.txt","content":"hello","brief":"写入文件"}"#
         }
@@ -1607,12 +1502,6 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
             }
         }
         "list_dir" | "stat_file" | "read_file" => {
-            let path = call.path.as_deref().unwrap_or(call.input.trim()).trim();
-            if path.is_empty() {
-                return Err(tool_format_error(tool, "缺少 path"));
-            }
-        }
-        "view_image" => {
             let path = call.path.as_deref().unwrap_or(call.input.trim()).trim();
             if path.is_empty() {
                 return Err(tool_format_error(tool, "缺少 path"));
@@ -1822,7 +1711,6 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         "termux_api" => run_termux_api(call),
         "work" | "plan" => run_work(call),
         "read_file" => run_read_file(call),
-        "view_image" => run_view_image(call),
         "write_file" => run_write_file(call),
         "list_dir" => run_list_dir(call),
         "stat_file" => run_stat_file(call),
@@ -3105,373 +2993,6 @@ fn run_stat_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             elapsed.as_millis(),
             shorten_path(&path)
         )],
-    })
-}
-
-fn run_view_image(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    fn cmd_exists(name: &str) -> bool {
-        Command::new("sh")
-            .args(["-lc", &format!("command -v {name} >/dev/null 2>&1")])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
-    fn pkg_install(pkgs: &[String], timeout_secs: u64) -> anyhow::Result<std::process::Output> {
-        if pkgs.is_empty() {
-            return Command::new("sh")
-                .args(["-lc", "true"])
-                .output()
-                .context("pkg install no-op 失败");
-        }
-        let mut args: Vec<String> = vec!["install".to_string(), "-y".to_string()];
-        for p in pkgs.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            args.push(p.to_string());
-        }
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let (mut cmd, _) = build_command_with_timeout("pkg", &args_ref, timeout_secs.max(10));
-        let out = cmd
-            .env("TERMUX_PKG_NO_MIRROR_SELECT", "1")
-            .env("LANG", "C.UTF-8")
-            .env("LC_ALL", "C.UTF-8")
-            .output()
-            .context("pkg install 执行失败")?;
-        Ok(out)
-    }
-
-    fn append_section(report: &mut String, title: &str, body: &str) {
-        if report.is_empty() {
-            report.push_str(title);
-        } else {
-            report.push_str("\n\n");
-            report.push_str(title);
-        }
-        report.push('\n');
-        report.push_str(body.trim_end());
-    }
-
-    let path = pick_path(call)?;
-    let started = Instant::now();
-    let meta = fs::metadata(&path).with_context(|| format!("读取文件失败：{path}"))?;
-    if !meta.is_file() {
-        return Ok(ToolOutcome {
-            user_message: "不是文件（无法预览）".to_string(),
-            log_lines: vec!["状态:fail".to_string()],
-        });
-    }
-    let size = meta.len() as usize;
-
-    let mime = Command::new("file")
-        .args(["--mime-type", "-b", &path])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let do_open = call.open.unwrap_or(false);
-    if do_open {
-        let _ = Command::new("termux-open").arg(&path).output();
-    }
-
-    let auto_install = call.auto_install.unwrap_or(false);
-    let preview = call.preview.unwrap_or(true);
-    let want_meta = call.meta.unwrap_or(false);
-    let want_exif = call.exif.unwrap_or(false);
-    let want_ocr = call.ocr.unwrap_or(false);
-    let want_qr = call.qr.unwrap_or(false);
-    let want_hash = call.hash.unwrap_or(false);
-
-    let width = call.width.unwrap_or(60).clamp(20, 160);
-    let height = call.height.unwrap_or(30).clamp(10, 80);
-    let timeout_secs = call
-        .timeout_secs
-        .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000))
-        .or(Some(IMAGE_TOOL_TIMEOUT_SECS));
-    let timeout_hint = timeout_secs;
-
-    let mut report = String::new();
-    let mut install_log: Vec<String> = Vec::new();
-    let mut any_fail = false;
-    let mut any_timeout = false;
-
-    // 依赖自愈（可选）
-    if auto_install {
-        let mut pkgs: Vec<String> = Vec::new();
-        if preview && !cmd_exists("chafa") {
-            pkgs.push("chafa".to_string());
-        }
-        if want_meta && !cmd_exists("identify") {
-            pkgs.push("imagemagick".to_string());
-        }
-        if want_exif && !cmd_exists("exiftool") {
-            pkgs.push("exiftool".to_string());
-        }
-        if want_ocr && !cmd_exists("tesseract") {
-            pkgs.push("tesseract".to_string());
-        }
-        if want_qr && !cmd_exists("zbarimg") {
-            pkgs.push("zbar".to_string());
-        }
-        // OCR 语言数据包（尽量安装；失败不阻断）
-        if want_ocr {
-            let lang = call.lang.as_deref().unwrap_or("eng").trim();
-            if !lang.is_empty() && lang.len() <= 32 {
-                pkgs.push(format!("tesseract-data-{lang}"));
-            }
-        }
-
-        if !pkgs.is_empty() && cmd_exists("pkg") {
-            match pkg_install(&pkgs, IMAGE_AUTO_INSTALL_TIMEOUT_SECS) {
-                Ok(out) => {
-                    let code = status_code(out.status.code());
-                    if code == 0 {
-                        install_log.push(format!("auto_install: ok ({})", pkgs.join(",")));
-                    } else {
-                        install_log.push(format!(
-                            "auto_install: fail (exit:{code}) ({})",
-                            pkgs.join(",")
-                        ));
-                    }
-                }
-                Err(e) => install_log.push(format!("auto_install: fail ({e:#})")),
-            }
-        }
-    }
-
-    // 基本信息
-    let mut base = String::new();
-    base.push_str(&format!("Image: {}\n", shorten_path(&path)));
-    base.push_str(&format!("Type: {mime}\n"));
-    base.push_str(&format!("Size: {size} bytes\n"));
-    if !install_log.is_empty() {
-        base.push_str(&format!("Install: {}\n", install_log.join(" | ")));
-    }
-    base.push_str(&format!("Open: {}\n", if do_open { "true" } else { "false" }));
-    append_section(&mut report, "BASIC", &base);
-
-    // Hash
-    if want_hash && cmd_exists("sha256sum") {
-        let out = Command::new("sha256sum").arg(&path).output().ok();
-        if let Some(out) = out {
-            let code = status_code(out.status.code());
-            if code != 0 {
-                any_fail = true;
-            }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = collect_output(&stdout, &stderr);
-            let body = annotate_nonzero_exit(truncate_command_output(combined), false, code);
-            append_section(&mut report, "HASH", &body);
-        }
-    } else if want_hash {
-        any_fail = true;
-        append_section(&mut report, "HASH", "(missing dependency: sha256sum)");
-    }
-
-    // QR / Barcode
-    if want_qr && cmd_exists("zbarimg") {
-        let (mut cmd, timeout_used) = build_command_with_optional_timeout(
-            "zbarimg",
-            &["--raw", "-q", &path],
-            timeout_secs,
-        );
-        let out = cmd.output().ok();
-        if let Some(out) = out {
-            let code = status_code(out.status.code());
-            let timed_out = timeout_used && is_timeout_status(code);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = collect_output(&stdout, &stderr);
-            if timed_out {
-                any_timeout = true;
-            } else if code != 0 {
-                any_fail = true;
-            }
-            let body =
-                annotate_timeout(truncate_command_output(combined), timed_out, timeout_hint);
-            let body = annotate_nonzero_exit(body, timed_out, code);
-            append_section(&mut report, "QR", &body);
-        }
-    } else if want_qr {
-        any_fail = true;
-        append_section(&mut report, "QR", "(missing dependency: zbarimg)");
-    }
-
-    // Meta（ImageMagick identify：用 format 输出关键字段，避免 -verbose 爆炸）
-    if want_meta && cmd_exists("identify") {
-        let fmt = "%m\n%w\n%h\n%[channels]\n%z\n%[colorspace]\n%[depth]\n%[compression]\n%[filesize]\n%[alpha]\n";
-        let args: Vec<String> = vec![
-            "-format".to_string(),
-            fmt.to_string(),
-            path.clone(),
-        ];
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let (mut cmd, timeout_used) =
-            build_command_with_optional_timeout("identify", &args_ref, timeout_secs);
-        let out = cmd.output().ok();
-        if let Some(out) = out {
-            let code = status_code(out.status.code());
-            let timed_out = timeout_used && is_timeout_status(code);
-            if timed_out {
-                any_timeout = true;
-            } else if code != 0 {
-                any_fail = true;
-            }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = collect_output(&stdout, &stderr);
-            let body =
-                annotate_timeout(truncate_command_output(combined), timed_out, timeout_hint);
-            let body = annotate_nonzero_exit(body, timed_out, code);
-            append_section(&mut report, "META", &body);
-        }
-    } else if want_meta {
-        any_fail = true;
-        append_section(&mut report, "META", "(missing dependency: identify/imagemagick)");
-    }
-
-    // EXIF（JSON 更适合模型后续解析；过大则导出）
-    if want_exif && cmd_exists("exiftool") {
-        let (mut cmd, timeout_used) = build_command_with_optional_timeout(
-            "exiftool",
-            &["-json", "-n", &path],
-            timeout_secs,
-        );
-        let out = cmd.output().ok();
-        if let Some(out) = out {
-            let code = status_code(out.status.code());
-            let timed_out = timeout_used && is_timeout_status(code);
-            if timed_out {
-                any_timeout = true;
-            } else if code != 0 {
-                any_fail = true;
-            }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = collect_output(&stdout, &stderr);
-            let body =
-                annotate_timeout(truncate_command_output(combined), timed_out, timeout_hint);
-            let body = annotate_nonzero_exit(body, timed_out, code);
-            append_section(&mut report, "EXIF", &body);
-        }
-    } else if want_exif {
-        any_fail = true;
-        append_section(&mut report, "EXIF", "(missing dependency: exiftool)");
-    }
-
-    // OCR（tesseract 输出纯文本）
-    if want_ocr && cmd_exists("tesseract") {
-        let lang = call.lang.as_deref().unwrap_or("eng").trim();
-        let mut args: Vec<String> = vec![path.clone(), "stdout".to_string()];
-        if !lang.is_empty() {
-            args.push("-l".to_string());
-            args.push(lang.to_string());
-        }
-        // tesseract 的进度信息有时走 stderr；统一收集。
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let (mut cmd, timeout_used) =
-            build_command_with_optional_timeout("tesseract", &args_ref, timeout_secs);
-        let out = cmd.output().ok();
-        if let Some(out) = out {
-            let code = status_code(out.status.code());
-            let timed_out = timeout_used && is_timeout_status(code);
-            if timed_out {
-                any_timeout = true;
-            } else if code != 0 {
-                any_fail = true;
-            }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = collect_output(&stdout, &stderr);
-            let body =
-                annotate_timeout(truncate_command_output(combined), timed_out, timeout_hint);
-            let body = annotate_nonzero_exit(body, timed_out, code);
-            append_section(&mut report, "OCR", &body);
-        }
-    } else if want_ocr {
-        any_fail = true;
-        append_section(&mut report, "OCR", "(missing dependency: tesseract)");
-    }
-
-    // ASCII Preview（chafa）
-    if preview && cmd_exists("chafa") {
-        let size_arg = format!("--size={width}x{height}");
-        let args: Vec<String> = vec![
-            "--colors=none".to_string(),
-            "--format=symbols".to_string(),
-            size_arg,
-            path.clone(),
-        ];
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let (mut cmd, timeout_used) =
-            build_command_with_optional_timeout("chafa", &args_ref, timeout_secs);
-        let out = cmd.output().ok();
-        if let Some(out) = out {
-            let code = status_code(out.status.code());
-            let timed_out = timeout_used && is_timeout_status(code);
-            if timed_out {
-                any_timeout = true;
-            } else if code != 0 {
-                any_fail = true;
-            }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = collect_output(&stdout, &stderr);
-            let body =
-                annotate_timeout(truncate_command_output(combined.clone()), timed_out, timeout_hint);
-            let body = annotate_nonzero_exit(body, timed_out, code);
-            append_section(&mut report, "PREVIEW", &body);
-        }
-    } else if preview {
-        append_section(&mut report, "PREVIEW", "(no preview: install `chafa`)");
-    }
-
-    // 导出（当报告过大/可能被截断时）
-    let elapsed = started.elapsed();
-    let report_bytes = report.as_bytes().len();
-    let total_chars = report.chars().count();
-    let truncated_by_lines = report.lines().count() > OUTPUT_MAX_LINES;
-    let truncated_by_chars = total_chars > OUTPUT_MAX_CHARS;
-    let need_save =
-        report_bytes > IMAGE_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
-    let saved_path = if need_save {
-        let _ = fs::create_dir_all(IMAGE_CACHE_DIR);
-        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let pid = unsafe { libc::getpid() };
-        let p = format!("{IMAGE_CACHE_DIR}/image_report_{ts}_{pid}.log");
-        if fs::write(&p, report.as_bytes()).is_ok() {
-            Some(p)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let status = if any_timeout {
-        "timeout"
-    } else if any_fail {
-        "fail"
-    } else {
-        "0"
-    };
-    let mut log_lines = vec![format!(
-        "状态:{status} | 耗时:{}ms | path:{}",
-        elapsed.as_millis(),
-        shorten_path(&path)
-    )];
-    if let Some(p) = saved_path.as_deref() {
-        log_lines.push(format!("saved:{p}"));
-    }
-    let mut user_message = truncate_command_output(report);
-    if let Some(p) = saved_path {
-        user_message.push_str(&format!("\n\n[saved:{p}]"));
-    }
-    Ok(ToolOutcome {
-        user_message,
-        log_lines,
     })
 }
 
@@ -6315,48 +5836,6 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
             }
             build_preview(&display, limit)
         }
-        "view_image" => {
-            let path = call.path.as_deref().unwrap_or(call.input.trim());
-            let mut display = display_tool_path(path);
-            let width = call.width.unwrap_or(60).clamp(20, 160);
-            let height = call.height.unwrap_or(30).clamp(10, 80);
-            display = format!("{display} {width}x{height}");
-            let mut flags: Vec<String> = Vec::new();
-            if call.open.unwrap_or(false) {
-                flags.push("open".to_string());
-            }
-            if call.preview.unwrap_or(true) {
-                flags.push("preview".to_string());
-            }
-            if call.meta.unwrap_or(false) {
-                flags.push("meta".to_string());
-            }
-            if call.exif.unwrap_or(false) {
-                flags.push("exif".to_string());
-            }
-            if call.ocr.unwrap_or(false) {
-                let lang = call.lang.as_deref().unwrap_or("eng").trim();
-                if lang.is_empty() {
-                    flags.push("ocr".to_string());
-                } else {
-                    flags.push(format!("ocr:{lang}"));
-                }
-            }
-            if call.qr.unwrap_or(false) {
-                flags.push("qr".to_string());
-            }
-            if call.hash.unwrap_or(false) {
-                flags.push("hash".to_string());
-            }
-            if call.auto_install.unwrap_or(false) {
-                flags.push("install".to_string());
-            }
-            if !flags.is_empty() {
-                display.push(' ');
-                display.push_str(&flags.join(","));
-            }
-            build_preview(&display, limit)
-        }
         "list_dir" => {
             let path = call.path.as_deref().unwrap_or(call.input.trim());
             build_preview(&display_tool_path(path), limit)
@@ -6525,7 +6004,6 @@ pub fn tool_display_label(tool: &str) -> String {
         "termux_api" => "Termux",
         "plan" | "work" => "Plan",
         "read_file" => "READ",
-        "view_image" => "Image",
         "write_file" => "Write",
         "list_dir" => "List",
         "stat_file" => "Info",

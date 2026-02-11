@@ -103,6 +103,8 @@ const WRITE_MAX_BYTES: usize = 400_000;
 const PATCH_MAX_BYTES: usize = 500_000;
 const EDIT_MAX_FILE_BYTES: usize = 800_000;
 const EDIT_MAX_MATCHES: usize = 400;
+const LIST_LINECOUNT_MAX_BYTES: usize = 400_000;
+const LIST_LINECOUNT_MAX_FILES: usize = 80;
 const MEMORY_CHECK_DEFAULT_RESULTS: usize = 10;
 const MEMORY_CHECK_MAX_RESULTS: usize = 20;
 const MEMORY_ADD_PREVIEW_LINES: usize = 8;
@@ -2923,21 +2925,124 @@ fn run_write_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let path = pick_path(call)?;
     let started = Instant::now();
-    let mut entries: Vec<String> = Vec::new();
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Ok(ToolOutcome {
+            user_message: format!("路径不存在：{path}"),
+            log_lines: vec![],
+        });
+    }
+
+    fn fmt_mtime(meta: &fs::Metadata) -> String {
+        meta.modified()
+            .ok()
+            .and_then(|t| {
+                let dt: chrono::DateTime<Local> = t.into();
+                Some(dt.format("%Y-%m-%d %H:%M").to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn fmt_kind(meta: &fs::Metadata) -> &'static str {
+        if meta.is_dir() {
+            "dir"
+        } else if meta.is_file() {
+            "file"
+        } else {
+            "other"
+        }
+    }
+
+    fn fmt_lines_suffix(path: &Path, bytes: u64, lines_budget: &mut usize) -> String {
+        if !path.is_file() {
+            return String::new();
+        }
+        if bytes as usize > LIST_LINECOUNT_MAX_BYTES {
+            return String::new();
+        }
+        if *lines_budget >= LIST_LINECOUNT_MAX_FILES {
+            return String::new();
+        }
+        if is_probably_binary_file(path) {
+            return String::new();
+        }
+        let p = path.to_string_lossy().to_string();
+        if let Some(n) = count_file_lines(&p) {
+            *lines_budget = lines_budget.saturating_add(1);
+            return format!(" | lines:{n}");
+        }
+        String::new()
+    }
+
+    // 合并 stat_file 能力：path 是文件时，直接输出单条“增强版 list”。
+    if p.is_file() {
+        let meta = fs::metadata(p).with_context(|| format!("获取文件信息失败：{path}"))?;
+        let elapsed = started.elapsed();
+        let bytes = meta.len();
+        let mut lines_budget = 0usize;
+        let lines = fmt_lines_suffix(p, bytes, &mut lines_budget);
+        let body = format!(
+            "{} | path:{} | size:{} ({}) | mtime:{} | readonly:{}{}",
+            fmt_kind(&meta),
+            shorten_path(&path),
+            bytes,
+            format_bytes(bytes),
+            fmt_mtime(&meta),
+            meta.permissions().readonly(),
+            lines
+        );
+        return Ok(ToolOutcome {
+            user_message: body,
+            log_lines: vec![format!(
+                "状态:0 | 耗时:{}ms | path:{} | type:file",
+                elapsed.as_millis(),
+                shorten_path(&path)
+            )],
+        });
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut names: Vec<(String, PathBuf)> = Vec::new();
     for entry in fs::read_dir(&path).with_context(|| format!("列目录失败：{path}"))? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let line = if is_dir { format!("{name}/") } else { name };
-        entries.push(line);
+        let name = sanitize_search_line(&entry.file_name().to_string_lossy());
+        names.push((name, entry.path()));
     }
-    entries.sort();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut lines_budget = 0usize;
+    for (name, ep) in names.into_iter() {
+        let meta = fs::metadata(&ep).ok();
+        let (kind, bytes, mtime, ro) = if let Some(m) = meta.as_ref() {
+            (fmt_kind(m), m.len(), fmt_mtime(m), m.permissions().readonly())
+        } else {
+            ("other", 0u64, "unknown".to_string(), false)
+        };
+        let display_name = if ep.is_dir() {
+            format!("{name}/")
+        } else {
+            name
+        };
+        let size_part = if kind == "file" {
+            format!("size:{} ({})", bytes, format_bytes(bytes))
+        } else {
+            "size:-".to_string()
+        };
+        let lines = meta
+            .as_ref()
+            .filter(|m| m.is_file())
+            .map(|m| fmt_lines_suffix(&ep, m.len(), &mut lines_budget))
+            .unwrap_or_default();
+        out.push(format!(
+            "{kind} | {size_part} | mtime:{mtime} | readonly:{ro}{lines} | {display_name}"
+        ));
+    }
     let elapsed = started.elapsed();
-    let mut body = entries.join("\n");
+    let mut body = out.join("\n");
     if body.is_empty() {
         body = "(empty)".to_string();
     }
-    let total_entries = entries.len();
+    let total_entries = out.len();
     let truncated_by_lines = total_entries > OUTPUT_MAX_LINES;
     let truncated_by_chars = body.chars().count() > OUTPUT_MAX_CHARS;
 
@@ -2962,38 +3067,8 @@ fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 }
 
 fn run_stat_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    let path = pick_path(call)?;
-    let started = Instant::now();
-    let meta = fs::metadata(&path).with_context(|| format!("获取文件信息失败：{path}"))?;
-    let elapsed = started.elapsed();
-    let file_type = if meta.is_dir() {
-        "dir"
-    } else if meta.is_file() {
-        "file"
-    } else {
-        "other"
-    };
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| format!("{}", d.as_secs()))
-        .unwrap_or_else(|| "unknown".to_string());
-    let size_bytes = meta.len();
-    let body = format!(
-        "type: {file_type}\nsize: {size_bytes} ({})\nmodified(unix): {modified}\nreadonly: {}",
-        format_bytes(size_bytes),
-        meta.permissions().readonly()
-    );
-
-    Ok(ToolOutcome {
-        user_message: body,
-        log_lines: vec![format!(
-            "状态:0 | 耗时:{}ms | path:{}",
-            elapsed.as_millis(),
-            shorten_path(&path)
-        )],
-    })
+    // stat_file 已并入“增强版 list_dir”（list_dir 对文件路径会输出单条信息）。
+    run_list_dir(call)
 }
 
 fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {

@@ -4,6 +4,16 @@
 
 ## 用法
 
+首次安装（从 GitHub 克隆到默认目录）：
+
+```bash
+git clone https://github.com/jiangshanyao2200-hue/longgu-termux-kit-step2.git ~/AItermux
+cd ~/AItermux
+bash install.sh
+```
+
+已存在 `~/AItermux` 时，直接覆盖部署：
+
 ```bash
 cd ~/AItermux
 bash install.sh

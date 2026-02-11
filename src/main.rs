@@ -64,6 +64,7 @@ pub use crate::types::{
 };
 
 const TOOL_STREAM_PREVIEW_MAX: usize = 8000;
+const TOOL_CALLS_MAX_PER_ASSISTANT_MSG: usize = 3;
 const HEARTBEAT_FADE_FRAMES: u64 = 4;
 const HEARTBEAT_BLINK_FRAMES: u64 = 4;
 const HEARTBEAT_CYCLE_FRAMES: u64 = HEARTBEAT_FADE_FRAMES * 3 + HEARTBEAT_BLINK_FRAMES;
@@ -9744,11 +9745,11 @@ fn run_loop(
                                 })
                                 && burst_count >= 3;
                             let paste_context = paste_capture.is_some()
-                                || !pending_pastes.is_empty()
                                 || looks_like_paste
                                 || multi_line_guard
                                 || guard_active;
-                            if paste_context {
+                            let force_send = alt && !ctrl;
+                            if paste_context && !force_send {
                                 last_input_at = Some(now);
                                 paste_guard_until =
                                     Some(now + Duration::from_millis(config.paste_send_inhibit_ms));
@@ -10709,6 +10710,25 @@ fn handle_model_stream_end(
             }
             assistant_text = cleaned;
         }
+        if extracted_from_assistant && extracted.len() > TOOL_CALLS_MAX_PER_ASSISTANT_MSG {
+            let n = extracted.len();
+            extracted.clear();
+            extracted_from_assistant = false;
+            tool_block_from_assistant = None;
+            tool_preview.clear();
+            *tool_preview_active = false;
+            *tool_preview_pending_idle = false;
+            push_system_and_log(
+                core,
+                meta,
+                context_usage,
+                Some("tool"),
+                &format!(
+                    "工具调用过多：检测到 {n} 个工具调用（上限 {TOOL_CALLS_MAX_PER_ASSISTANT_MSG}）。已拒绝本轮工具执行，请拆分为多轮，每轮最多 {TOOL_CALLS_MAX_PER_ASSISTANT_MSG} 个。",
+                ),
+            );
+            push_sys_log(sys_log, sys_log_limit, "工具调用过多：已拒绝执行");
+        }
         let (assistant_clean, tool_echo_blocks) = extract_internal_tool_echo_blocks(&assistant_text);
         assistant_text = assistant_clean;
         let tool_echo_msgs: Vec<String> = tool_echo_blocks
@@ -10765,6 +10785,21 @@ fn handle_model_stream_end(
             } else {
                 extracted.retain(|c| c.tool == "context_compact");
             }
+        }
+        // plan 只能单独出现：避免模型把 “plan + 工具执行” 混在同一条回复里造成节奏/输出爆炸。
+        if extracted.len() > 1 && extracted.iter().any(|c| c.tool == "plan" || c.tool == "work") {
+            extracted.clear();
+            tool_preview.clear();
+            *tool_preview_active = false;
+            *tool_preview_pending_idle = false;
+            push_system_and_log(
+                core,
+                meta,
+                context_usage,
+                Some("tool"),
+                "检测到 plan 与其它工具同批输出：已拒绝本轮工具执行。请将 plan:start / plan:end 单独一条回复输出；执行阶段每轮只调用一个工具。",
+            );
+            push_sys_log(sys_log, sys_log_limit, "plan 混批：已拒绝执行");
         }
         if extracted.is_empty()
             && let Some(stub_idx) = tool_preview_chat_idx.take()

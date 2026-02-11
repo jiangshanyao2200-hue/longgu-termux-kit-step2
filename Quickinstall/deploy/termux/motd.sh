@@ -52,7 +52,12 @@ trap cleanup EXIT INT TERM
 
 pick_random() {
   local -a pool=()
-  mapfile -t pool < <(find "$START_DIR" -maxdepth 1 -type f -name '*.sh' ! -name '_*.sh' | sort)
+  # 只从“动画脚本”里选：1.sh..11.sh（避免把实验脚本/辅助脚本选进去）
+  mapfile -t pool < <(
+    find "$START_DIR" -maxdepth 1 -type f -name '*.sh' -perm -111 -print 2>/dev/null \
+      | grep -E '/(10|11|[1-9])\\.sh$' \
+      | sort
+  )
   [ "${#pool[@]}" -gt 0 ] || return 1
   printf '%s\n' "${pool[RANDOM % ${#pool[@]}]}"
 }
@@ -168,11 +173,12 @@ else
   final_size=""
 fi
 
-# Global animation tuning (most startboot scripts honor these env vars).
-export FPS="${AITERMUX_MOTD_FPS:-12}"
-export DURATION="${AITERMUX_MOTD_DURATION:-1.7}"
-export HOLD="${AITERMUX_MOTD_HOLD:-0.4}"
-export SPEED="${AITERMUX_MOTD_SPEED:-1.0}"
+# Global animation tuning (startboot scripts honor these env vars).
+# 说明：只默认固定 FPS（保护性能），其它节奏参数默认留空，让各动画脚本使用自己的默认值。
+export FPS="${AITERMUX_MOTD_FPS:-10}"
+export DURATION="${AITERMUX_MOTD_DURATION:-}"
+export HOLD="${AITERMUX_MOTD_HOLD:-}"
+export SPEED="${AITERMUX_MOTD_SPEED:-}"
 
 normalize_timeout() {
   local t="$1"
@@ -191,7 +197,8 @@ normalize_timeout() {
   fi
 }
 
-timeout_start="$(normalize_timeout "${AITERMUX_MOTD_TIMEOUT_START:-4}")"
+# 默认超时要足够大：避免动画在弱机上被 timeout “腰斩”，导致抽帧/节奏错乱。
+timeout_start="$(normalize_timeout "${AITERMUX_MOTD_TIMEOUT_START:-12}")"
 timeout_limit="$(normalize_timeout "${AITERMUX_MOTD_TIMEOUT:-$timeout_start}")"
 
 start_ns="$(date +%s%N 2>/dev/null || echo 0)"
@@ -199,7 +206,7 @@ rc=0
 if command -v timeout >/dev/null 2>&1 && [ "$timeout_limit" != "0" ]; then
   timeout_opts=()
   timeout --help 2>/dev/null | grep -q -- '--foreground' && timeout_opts+=(-f)
-  timeout "${timeout_opts[@]}" -k 0.2s "$timeout_limit" "$BASH_BIN" "$anim" "${args[@]}" || rc=$?
+  timeout "${timeout_opts[@]}" -k 0.6s "$timeout_limit" "$BASH_BIN" "$anim" "${args[@]}" || rc=$?
 else
   "$BASH_BIN" "$anim" "${args[@]}" || rc=$?
 fi
@@ -217,7 +224,7 @@ fi
     printf 'size=%s\n' "$final_size"
   fi
   printf 'timeout=%s\n' "$timeout_limit"
-  printf 'fps=%s duration=%s hold=%s speed=%s\n' "$FPS" "$DURATION" "$HOLD" "$SPEED"
+  printf 'fps=%s duration=%s hold=%s speed=%s\n' "$FPS" "${DURATION:-script-default}" "${HOLD:-script-default}" "${SPEED:-script-default}"
   printf 'elapsed_ms=%s rc=%s\n' "$elapsed_ms" "$rc"
 } >"$META_LOG" 2>/dev/null || true
 

@@ -428,6 +428,239 @@ fn extract_tool_sections(text: &str) -> (Vec<String>, Vec<String>) {
     (output_lines, meta_lines)
 }
 
+fn extract_tool_kv_token(text: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}:");
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(pos) = trimmed.find(&needle) else {
+            continue;
+        };
+        let rest = trimmed[pos + needle.len()..].trim();
+        let token = rest
+            .split(|c: char| c.is_whitespace() || c == '|' || c == ',' || c == ')')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn parse_plan_fields(raw: &str) -> (Option<String>, Vec<String>, Option<String>, Vec<String>) {
+    #[derive(Clone, Copy)]
+    enum Mode {
+        None,
+        Steps,
+    }
+    fn split_kv(line: &str) -> Option<(&'static str, String)> {
+        let t = line.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let lower = t.to_ascii_lowercase();
+        for (k, key, zh_key) in [
+            ("target", "target:", "目标:"),
+            ("steps", "steps:", "步骤:"),
+            ("time", "time:", "预计耗时:"),
+            ("time", "time:", "耗时:"),
+        ] {
+            if lower.starts_with(key) {
+                return Some((k, t[key.len()..].trim().to_string()));
+            }
+            if t.starts_with(zh_key) || t.starts_with(&zh_key.replace(':', "：")) {
+                let rest = t
+                    .trim_start_matches(zh_key)
+                    .trim_start_matches(&zh_key.replace(':', "："))
+                    .trim();
+                return Some((k, rest.to_string()));
+            }
+        }
+        None
+    }
+
+    let mut target: Option<String> = None;
+    let mut steps: Vec<String> = Vec::new();
+    let mut time: Option<String> = None;
+    let mut report: Vec<String> = Vec::new();
+    let mut mode = Mode::None;
+
+    for line in raw.lines() {
+        if let Some((k, v)) = split_kv(line) {
+            match k {
+                "target" => {
+                    mode = Mode::None;
+                    if !v.trim().is_empty() {
+                        target = Some(v);
+                    }
+                }
+                "steps" => {
+                    mode = Mode::Steps;
+                    if !v.trim().is_empty() {
+                        steps.push(v);
+                    }
+                }
+                "time" => {
+                    mode = Mode::None;
+                    if !v.trim().is_empty() {
+                        time = Some(v);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match mode {
+            Mode::Steps => steps.push(t.to_string()),
+            Mode::None => report.push(t.to_string()),
+        }
+    }
+    (target, steps, time, report)
+}
+
+fn format_plan_display(raw_body: &str, is_end: bool) -> String {
+    let (target, steps, time, report) = parse_plan_fields(raw_body);
+    let mut out = String::new();
+    if is_end {
+        if !report.is_empty() {
+            out.push_str("工作结果汇报：\n");
+            for line in report {
+                out.push_str(&format!("  {line}\n"));
+            }
+        } else if target.is_some() || !steps.is_empty() {
+            // 兜底：如果用户把汇报写成了 target/steps 结构，也能展示出来。
+            if let Some(t) = target {
+                out.push_str(&format!("工作结果：{t}\n"));
+            }
+            if !steps.is_empty() {
+                for s in steps {
+                    out.push_str(&format!("  {s}\n"));
+                }
+            }
+        }
+        if let Some(t) = time.filter(|s| !s.trim().is_empty()) {
+            out.push_str(&format!("工作耗时：{t}\n"));
+        }
+        return out.trim_end().to_string();
+    }
+
+    if let Some(t) = target.filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("目标：{t}\n"));
+    } else if !report.is_empty() {
+        out.push_str(&format!("目标：{}\n", report[0]));
+    }
+
+    let effective_steps = if !steps.is_empty() {
+        steps
+    } else if report.len() > 1 {
+        report[1..].iter().map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    if !effective_steps.is_empty() {
+        out.push_str("步骤：\n");
+        for s in effective_steps {
+            out.push_str(&format!("  - {s}\n"));
+        }
+    }
+    if let Some(t) = time.filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("预计耗时：{t}\n"));
+    }
+    out.trim_end().to_string()
+}
+
+fn build_plan_panel_lines(
+    theme: &Theme,
+    width: usize,
+    is_end: bool,
+    running: bool,
+    body: &str,
+    tick: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let title = if is_end {
+        "Working finished"
+    } else {
+        "Start to working"
+    };
+    let w = width.max(1);
+    let dim_style = Style::default().fg(theme.dim).bg(theme.bg);
+    let label_style = Style::default()
+        .fg(theme.fg)
+        .bg(theme.bg)
+        .add_modifier(Modifier::BOLD);
+
+    // Plan 渲染节奏：
+    // - tool stub / parsing / running 阶段：只显示 “● Planning...” 占位，避免先出现上下横线再补正文的跳动感。
+    // - 完整态：一次性绘制框架（标题 + 正文 + 底横线），正文仍可由 plan_reveal 做“打字机”渐显。
+    if running {
+        let dots = match tick % 3 {
+            0 => ".",
+            1 => "..",
+            _ => "...",
+        };
+        let stub = truncate_to_width(&format!("● Planning{dots}"), w);
+        lines.push(Line::from(Span::styled(stub, dim_style)));
+        return lines;
+    }
+
+    // 标题左侧增加两段横线，视觉更稳：`──○ Start... ○────`
+    let header = format!("──○ {title} ○");
+    let header_w = UnicodeWidthStr::width(header.as_str());
+    // 顶部：居左固定标题，右侧用浅色横线补齐（更稳定，不会随宽度抖动居中）。
+    let mut top_spans: Vec<Span<'static>> = Vec::new();
+    top_spans.push(Span::styled(
+        truncate_to_width(&header, w),
+        label_style,
+    ));
+    if header_w < w {
+        top_spans.push(Span::styled("─".repeat(w.saturating_sub(header_w)), dim_style));
+    }
+    lines.push(Line::from(top_spans));
+
+    let avail = w.saturating_sub(2).max(1);
+    let body = body.trim_end();
+    let mut any = false;
+    for raw in body.lines() {
+        let t = raw.trim_end();
+        if t.trim().is_empty() {
+            continue;
+        }
+        any = true;
+        for chunk in wrap_plain_line(t, avail) {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme.dim).bg(theme.bg)),
+                Span::styled(chunk, Style::default().fg(theme.fg).bg(theme.bg)),
+            ]));
+        }
+    }
+    if !any {
+        let stub = if running {
+            let dots = match tick % 3 {
+                0 => ".",
+                1 => "..",
+                _ => "...",
+            };
+            format!("准备中{dots}")
+        } else {
+            "(无内容)".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().fg(theme.dim).bg(theme.bg)),
+            Span::styled(stub, Style::default().fg(theme.dim).bg(theme.bg)),
+        ]));
+    }
+    // 底部分隔线：纯横杠、浅色，形成区域隔离（开始/结束都保留）。
+    lines.push(Line::from(Span::styled("─".repeat(w), dim_style)));
+    lines
+}
+
 fn extract_brief_value(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     for prefix in ["explain:", "brief:"] {
@@ -543,7 +776,7 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
         if failed_line.is_some() {
             return Some("操作失败：输出已导出".to_string());
         }
-        return Some("处理完成：输出已导出".to_string());
+        return Some("输出已导出".to_string());
     }
 
     if timed_out {
@@ -574,7 +807,7 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
         return Some(format!("操作失败：{reason}"));
     }
     if truncated {
-        return Some("处理完成：输出已截断".to_string());
+        return Some("输出已截断".to_string());
     }
     // 正常成功：不显示状态行（避免“机械化”）
     None
@@ -846,6 +1079,9 @@ fn summarize_tool_message(text: &str) -> String {
     if tool.eq_ignore_ascii_case("bash") {
         tool = "bash";
     }
+    if tool.eq_ignore_ascii_case("plan") || tool.eq_ignore_ascii_case("work") {
+        tool = "plan";
+    }
     if tool.eq_ignore_ascii_case("search") {
         let pattern = raw_input
             .as_deref()
@@ -1081,6 +1317,7 @@ fn tool_compact_title_parts(tool_raw: &str) -> (String, String, String) {
         "Shell" => ("Worked with ".to_string(), "ADB".to_string(), String::new()),
         "Run" | "bash" | "Bash" | "BASH" => ("Ran ".to_string(), "CMD".to_string(), String::new()),
         "Termux" => (String::new(), "Termux".to_string(), " API".to_string()),
+        "Plan" | "plan" => (String::new(), "Plan".to_string(), String::new()),
         "MAdd" => (String::new(), "Memory".to_string(), " Add".to_string()),
         "MEdit" => (String::new(), "Memory".to_string(), " Edit".to_string()),
         "MRead" => (String::new(), "Memory".to_string(), " Read".to_string()),
@@ -1088,7 +1325,7 @@ fn tool_compact_title_parts(tool_raw: &str) -> (String, String, String) {
         "Write" => (String::new(), "Wrote".to_string(), String::new()),
         "Edit" => (String::new(), "Edited".to_string(), String::new()),
         "Patch" => (String::new(), "Patched".to_string(), String::new()),
-        "Read" => (String::new(), "Read".to_string(), String::new()),
+        "Read" | "READ" => (String::new(), "READ".to_string(), String::new()),
         "List" => (String::new(), "Listed".to_string(), String::new()),
         "Search" => (String::new(), "Search".to_string(), String::new()),
         "Info" => (String::new(), "Info".to_string(), String::new()),
@@ -1193,34 +1430,62 @@ fn render_tool_detail_lines(
 
     const OUTPUT_MAX_LINES: usize = 18;
     const META_MAX_LINES: usize = 8;
-    const HARD_MAX_SECTION_LINES: usize = 2_000;
+    // 详情模式（按 → 展开）仍需“硬兜底”：避免大文件/异常输出把 TUI 撑爆。
+    const DETAIL_OUTPUT_MAX_LINES: usize = 800;
+    const DETAIL_META_MAX_LINES: usize = 300;
+    const HARD_MAX_SECTION_CHARS: usize = 120_000;
+    const HARD_MAX_WRAP_CHUNKS_PER_LINE: usize = 10;
     let mut out = Vec::new();
     let heading_style = Style::default().fg(theme.dim).bg(theme.bg);
     let pipe_style = Style::default().fg(theme.dim).bg(theme.bg);
     let content_style = Style::default().fg(theme.fg).bg(theme.bg);
 
-    let mut push_section = |title: &str, lines: &[String], max_lines: usize| {
+    let mut push_section =
+        |title: &str, lines: &[String], max_lines: usize, max_chars: usize| {
         if lines.is_empty() {
             return;
         }
         let header = format!("  {title}:");
         out.push(Line::from(vec![Span::styled(header, heading_style)]));
         let mut truncated = false;
-        let mut shown = lines;
-        // full 模式：默认不截断，但仍保留一个极高的安全阈值（防止异常超大输出拖垮 TUI）。
-        let mut cap = max_lines;
+        let mut truncated_reason: Option<&'static str> = None;
+
+        // full 模式：仍要硬兜底（行数 + 字符数），避免用户按 → 时把界面炸掉。
+        let cap_lines = if full { max_lines } else { max_lines };
+        let mut cap_chars = if full { max_chars } else { usize::MAX };
         if full {
-            cap = HARD_MAX_SECTION_LINES;
+            cap_chars = cap_chars.min(HARD_MAX_SECTION_CHARS);
         }
-        if lines.len() > cap {
-            shown = &lines[..cap];
-            truncated = true;
-        }
+
+        let mut shown_count = 0usize;
+        let mut shown_chars = 0usize;
         let prefix = "  ┆ ";
         let prefix_w = UnicodeWidthStr::width(prefix);
         let avail = width.saturating_sub(prefix_w).max(1);
-        for line in shown {
-            for chunk in wrap_plain_line(line, avail) {
+        for line in lines {
+            if shown_count >= cap_lines {
+                truncated = true;
+                truncated_reason = Some("lines");
+                break;
+            }
+            let line_chars = UnicodeWidthStr::width(line.as_str());
+            if full && shown_chars.saturating_add(line_chars) > cap_chars {
+                truncated = true;
+                truncated_reason = Some("chars");
+                break;
+            }
+            shown_count = shown_count.saturating_add(1);
+            shown_chars = shown_chars.saturating_add(line_chars);
+
+            let mut chunks = wrap_plain_line(line, avail);
+            if full && chunks.len() > HARD_MAX_WRAP_CHUNKS_PER_LINE {
+                let omitted = chunks.len().saturating_sub(HARD_MAX_WRAP_CHUNKS_PER_LINE);
+                chunks.truncate(HARD_MAX_WRAP_CHUNKS_PER_LINE);
+                if let Some(last) = chunks.last_mut() {
+                    *last = truncate_to_width(&format!("{last} ... (+{omitted} wraps)"), avail);
+                }
+            }
+            for chunk in chunks {
                 out.push(Line::from(vec![
                     Span::styled(prefix.to_string(), pipe_style),
                     Span::styled(chunk, content_style),
@@ -1229,7 +1494,13 @@ fn render_tool_detail_lines(
         }
         if truncated {
             let note = if full {
-                format!("... [truncated: {} lines]", lines.len().saturating_sub(cap))
+                match truncated_reason {
+                    Some("chars") => format!("... [truncated: >{cap_chars} chars (display guard)]"),
+                    _ => format!(
+                        "... [truncated: {} lines (display guard)]",
+                        lines.len().saturating_sub(shown_count)
+                    ),
+                }
             } else {
                 format!("... [截断 {} 行]", lines.len().saturating_sub(max_lines))
             };
@@ -1242,10 +1513,10 @@ fn render_tool_detail_lines(
         }
     };
 
-    let out_cap = if full { usize::MAX } else { OUTPUT_MAX_LINES };
-    let meta_cap = if full { usize::MAX } else { META_MAX_LINES };
-    push_section("output", &output_lines, out_cap);
-    push_section("meta", &meta_lines, meta_cap);
+    let out_cap = if full { DETAIL_OUTPUT_MAX_LINES } else { OUTPUT_MAX_LINES };
+    let meta_cap = if full { DETAIL_META_MAX_LINES } else { META_MAX_LINES };
+    push_section("output", &output_lines, out_cap, HARD_MAX_SECTION_CHARS);
+    push_section("meta", &meta_lines, meta_cap, HARD_MAX_SECTION_CHARS / 2);
     out
 }
 
@@ -1610,12 +1881,12 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
 
     // 左侧：系统状态（优先显示“沟通”）。
     let (status_icon, status_text) = match pulse_dir {
-        Some(PulseDir::MainToDog) => ("", "Linking Main → Memory"),
-        Some(PulseDir::DogToMain) => ("", "Linking Memory → Main"),
-        None if main_active && dog_active => ("", "Both active"),
-        None if main_active => ("", "Main active"),
-        None if dog_active => ("", "Memory active"),
-        None => ("", "Ready"),
+        Some(PulseDir::MainToDog) => ("", "萤 → 记忆 同步"),
+        Some(PulseDir::DogToMain) => ("", "记忆 → 萤 同步"),
+        None if main_active && dog_active => ("", "双核·Working"),
+        None if main_active => ("", "萤·Working"),
+        None if dog_active => ("", "记忆·Working"),
+        None => ("", "就绪"),
     };
     let left_line = Line::from(vec![
         Span::styled(
@@ -2224,6 +2495,7 @@ pub struct ChatRenderCache {
     per_msg: Vec<Option<Vec<Line<'static>>>>,
     tool_key: Vec<Option<u8>>,
     scramble: Vec<Option<ScrambleState>>,
+    plan_reveal: Vec<Option<PlanRevealState>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2239,6 +2511,12 @@ struct ScrambleState {
     segments: Vec<ScrambleSegment>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PlanRevealState {
+    last_total_lines: usize,
+    born_tick: usize,
+}
+
 impl ChatRenderCache {
     pub fn new() -> Self {
         Self {
@@ -2246,6 +2524,7 @@ impl ChatRenderCache {
             per_msg: Vec::new(),
             tool_key: Vec::new(),
             scramble: Vec::new(),
+            plan_reveal: Vec::new(),
         }
     }
 
@@ -2259,11 +2538,15 @@ impl ChatRenderCache {
             self.per_msg.clear();
             self.tool_key.clear();
             self.scramble.clear();
+            self.plan_reveal.clear();
         }
         // 终端缩放/重排时（width 变化）不要清空 scramble：否则历史消息会“重新播放乱码动画”。
         // scramble 与换行宽度无关，只与消息增量变化有关；保留它能显著降低缩放时的干扰与卡顿。
         if self.scramble.len() > msg_len {
             self.scramble.truncate(msg_len);
+        }
+        if self.plan_reveal.len() > msg_len {
+            self.plan_reveal.truncate(msg_len);
         }
         if self.per_msg.len() < msg_len {
             self.per_msg.resize_with(msg_len, || None);
@@ -2273,6 +2556,9 @@ impl ChatRenderCache {
         }
         if self.scramble.len() < msg_len {
             self.scramble.resize_with(msg_len, || None);
+        }
+        if self.plan_reveal.len() < msg_len {
+            self.plan_reveal.resize_with(msg_len, || None);
         }
     }
 
@@ -2395,6 +2681,60 @@ impl ChatRenderCache {
             out.push_str(&scramble_tail(tick));
         }
         Some(out)
+    }
+
+    fn update_plan_reveal_state(&mut self, idx: usize, text: &str, tick: usize, active: bool) {
+        const LINES_PER_FRAME: usize = 6;
+        let total = text.lines().count().max(1);
+        let slot = self.plan_reveal.get_mut(idx);
+        let Some(slot) = slot else {
+            return;
+        };
+        let state = slot.get_or_insert_with(Default::default);
+        // 历史消息：不触发动画，避免重绘/滚动时反复“打字机”。
+        if state.last_total_lines == 0 && !active {
+            state.last_total_lines = total;
+            state.born_tick = 0;
+            return;
+        }
+        if total != state.last_total_lines {
+            state.last_total_lines = total;
+            state.born_tick = tick;
+        }
+        // 如果已经是“历史完成态”，保持 born_tick=0，表示不需要动画。
+        if !active && state.born_tick == 0 {
+            state.last_total_lines = total;
+        }
+        // 动画完成：收敛为 born_tick=0，避免每帧都被视为“仍在动画中”。
+        if active && state.born_tick > 0 {
+            let frames = tick.saturating_sub(state.born_tick).saturating_add(1);
+            if frames.saturating_mul(LINES_PER_FRAME) >= total {
+                state.born_tick = 0;
+            }
+        }
+    }
+
+    fn plan_reveal_text(&self, idx: usize, text: &str, tick: usize, active: bool) -> Option<String> {
+        const LINES_PER_FRAME: usize = 6; // 快速“打字机”，避免突现
+        let state = self.plan_reveal.get(idx).and_then(|s| s.as_ref())?;
+        // born_tick=0 表示无需动画
+        if state.born_tick == 0 || !active {
+            return None;
+        }
+        let total = text.lines().count().max(1);
+        let frames = tick.saturating_sub(state.born_tick).saturating_add(1);
+        let shown = (frames * LINES_PER_FRAME).min(total);
+        if shown >= total {
+            return None;
+        }
+        let mut out: Vec<&str> = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            if i >= shown {
+                break;
+            }
+            out.push(line);
+        }
+        Some(out.join("\n"))
     }
 }
 
@@ -2670,6 +3010,83 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
 
             // 简约态：工具仅显示为一行（工具类型 + brief），避免占满屏幕。
             if !show_details {
+                // plan：特殊渲染为“开始工作/结束汇报”区块，降低视觉疲劳。
+                if tool_raw.eq_ignore_ascii_case("plan") {
+                    let line_idx = out.len();
+                    let status = extract_tool_status_token(&msg.text);
+                    let status_lower = status
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    let mut running = matches!(
+                        status_lower.as_str(),
+                        "parsing" | "preview" | "running" | "in_progress" | "processing"
+                    );
+
+                    let phase = extract_tool_kv_token(&msg.text, "phase")
+                        .unwrap_or_else(|| "start".to_string())
+                        .to_ascii_lowercase();
+                    let is_end = matches!(phase.as_str(), "end" | "done" | "finish" | "report");
+
+                    let (output_lines, _meta_lines) = extract_tool_sections(&msg.text);
+                    let mut body_raw = output_lines.join("\n");
+                    if running {
+                        // tool stub 阶段的 "..." 占位不显示为正文：只展示分隔线即可。
+                        let t = body_raw.trim();
+                        if t == "..." || t.is_empty() {
+                            body_raw.clear();
+                        }
+                    }
+                    // 兜底：有些工具结果没有写入 meta 的“状态:running”，但 output 仍是 stub 的 "..."。
+                    // 这种情况下也应视为 running，避免先画框架再补正文造成跳动感。
+                    if !running
+                        && status_lower.trim().is_empty()
+                        && msg_idx + 1 >= core.history.len()
+                        && matches!(body_raw.trim(), "" | "...")
+                    {
+                        running = true;
+                        body_raw.clear();
+                    }
+
+                    let formatted_raw = format_plan_display(&body_raw, is_end);
+                    let plan_active =
+                        streaming_enabled && (running || msg_idx + 1 >= core.history.len());
+                    if streaming_enabled {
+                        render_cache.update_plan_reveal_state(msg_idx, &formatted_raw, tick, plan_active);
+                    }
+                    let revealed = if streaming_enabled {
+                        render_cache.plan_reveal_text(msg_idx, &formatted_raw, tick, plan_active)
+                    } else {
+                        None
+                    };
+                    let body_display = revealed.as_deref().unwrap_or(formatted_raw.as_str());
+                    let animated_plan = revealed.is_some();
+
+                    let lines = build_plan_panel_lines(theme, width, is_end, running, body_display, tick);
+
+                    if reveal_idx != Some(msg_idx) && !animated_plan && !running {
+                        if let Some(slot) = render_cache.per_msg.get_mut(msg_idx) {
+                            *slot = Some(lines.clone());
+                        }
+                        if let Some(slot) = render_cache.tool_key.get_mut(msg_idx) {
+                            *slot = Some(cache_key);
+                        }
+                    }
+
+                    out.extend(lines);
+                    msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
+                    if selected {
+                        for idx in line_idx..out.len() {
+                            if let Some(l) = out.get_mut(idx) {
+                                highlight_line(l, theme);
+                            }
+                        }
+                    }
+                    push_blank_line(&mut out);
+                    continue;
+                }
+
                 let mind = extract_tool_mind(&msg.text);
                 let dot = if mind == Some("dog") { "○" } else { "●" };
                 let brief = extract_tool_explain(&msg.text)
@@ -2761,7 +3178,8 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                                 Span::styled(chunk.clone(), cmd_style),
                             ]));
                         }
-                        if idx >= 3 {
+                        // 命令展示最多两行：尽量“一眼扫过”，避免挤压屏幕。
+                        if idx >= 1 {
                             break;
                         }
                     }

@@ -18,6 +18,19 @@ const ADB_SERIAL: &str = "127.0.0.1:5555";
 const OUTPUT_MAX_CHARS: usize = 20_000;
 const OUTPUT_MAX_LINES: usize = 400;
 const READ_MAX_BYTES: usize = 200_000;
+const READ_FULL_MAX_BYTES: usize = 300_000;
+const READ_FULL_MAX_LINES: usize = 20_000;
+const READ_PEEK_HEAD_LINES: usize = 30;
+const READ_PEEK_TAIL_LINES: usize = 10;
+const READ_PEEK_TOKEN_BUDGET: usize = 10_000;
+const READ_RANGE_TOKEN_BUDGET: usize = 20_000;
+const READ_FULL_TOKEN_BUDGET: usize = 20_000;
+const READ_MAX_LINE_CHARS: usize = 2000;
+const READ_RANGE_MAX_LINES: usize = 1000;
+const READ_SCAN_MAX_BYTES: usize = 20_000_000;
+// read_file 的 raw 输出预算：避免被全局 20k chars 二次截断导致“读不够用”。
+const READ_TOOL_RAW_MAX_LINES: usize = 1400;
+const READ_TOOL_RAW_MAX_CHARS: usize = 80_000;
 const READ_MAX_LINES_CAP: usize = 1200;
 const SEARCH_DEFAULT_MAX_MATCHES: usize = 200;
 const SEARCH_MAX_MATCHES_CAP: usize = 1000;
@@ -80,6 +93,9 @@ fn pick_search_output_limits(call: &ToolCall) -> (usize, usize) {
 fn tool_output_limits_for_history(call: &ToolCall) -> (usize, usize) {
     if call.tool == "search" {
         return pick_search_output_limits(call);
+    }
+    if call.tool == "read_file" {
+        return (READ_TOOL_RAW_MAX_LINES, READ_TOOL_RAW_MAX_CHARS);
     }
     (TOOL_OUTPUT_RAW_MAX_LINES, TOOL_OUTPUT_RAW_MAX_CHARS)
 }
@@ -191,6 +207,9 @@ pub struct ToolCall {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    // read_file：显式全量阅读（仅对小文件允许）
+    #[serde(default)]
+    pub full: Option<bool>,
 
     // search 强化（可选）：命中上下文片段 + glob 过滤
     #[serde(default)]
@@ -431,6 +450,11 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                     .as_u64()
                     .or_else(|| val.as_str().and_then(|x| x.trim().parse::<u64>().ok()));
             }
+            "full" => {
+                call.full = val
+                    .as_bool()
+                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+            }
             "output_level" | "out_level" | "level" | "output" => {
                 call.output_level = s;
             }
@@ -604,6 +628,55 @@ fn apply_mind_msg_defaults(call: &mut ToolCall, raw_tool: &str) {
 
 fn parse_search_keywords(raw: &str) -> Vec<String> {
     parse_list_tokens(raw, SEARCH_MAX_KEYWORDS)
+}
+
+fn extract_search_inline_ctx_marker(raw_pattern: &str) -> (String, Option<usize>, bool) {
+    // 允许在 pattern 字符串里写快捷控制：
+    // - ctx / context：开启上下文（使用默认行数）
+    // - ctx:20 / ctx=20 / ctx:+20 / ctx:-20 / ctx:±20：开启上下文并设置行数
+    //
+    // 轻量容错：识别后会从 pattern 里剔除该标记，避免误匹配。
+    let s = raw_pattern.trim();
+    if s.is_empty() {
+        return (String::new(), None, false);
+    }
+    let mut enabled = false;
+    let mut lines: Option<usize> = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for tok in s.split_whitespace() {
+        let lower = tok.trim().to_ascii_lowercase();
+        if lower == "ctx" || lower == "context" {
+            enabled = true;
+            continue;
+        }
+        if let Some(rest) = lower.strip_prefix("ctx:").or_else(|| lower.strip_prefix("ctx=")) {
+            enabled = true;
+            let rest = rest.trim();
+            let rest = rest.strip_prefix('±').unwrap_or(rest);
+            let rest = rest.strip_prefix('+').unwrap_or(rest);
+            let rest = rest.strip_prefix('-').unwrap_or(rest);
+            if let Ok(n) = rest.parse::<usize>() {
+                lines = Some(n);
+            }
+            continue;
+        }
+        if let Some(rest) = lower
+            .strip_prefix("context:")
+            .or_else(|| lower.strip_prefix("context="))
+        {
+            enabled = true;
+            let rest = rest.trim();
+            let rest = rest.strip_prefix('±').unwrap_or(rest);
+            let rest = rest.strip_prefix('+').unwrap_or(rest);
+            let rest = rest.strip_prefix('-').unwrap_or(rest);
+            if let Ok(n) = rest.parse::<usize>() {
+                lines = Some(n);
+            }
+            continue;
+        }
+        kept.push(tok);
+    }
+    (kept.join(" ").trim().to_string(), lines, enabled)
 }
 
 fn normalize_search_pattern(raw_pattern: &str) -> (String, Vec<String>) {
@@ -1325,6 +1398,9 @@ fn tool_usage(tool: &str) -> &'static str {
         "termux_api" => {
             r#"{"tool":"termux_api","input":"termux-battery-status","brief":"读取电池状态"}"#
         }
+        "plan" | "work" => {
+            r#"{"tool":"plan","section":"start","input":"修复 PTY 键位冲突","time":"~5min","content":"1) 复现问题\n2) 修改映射\n3) 跑测试验证","brief":"开始工作"}"#
+        }
         "list_dir" => r#"{"tool":"list_dir","path":".","brief":"列出目录"}"#,
         "stat_file" => r#"{"tool":"stat_file","path":"Cargo.toml","brief":"查看文件信息"}"#,
         "read_file" => {
@@ -1368,20 +1444,61 @@ fn tool_usage(tool: &str) -> &'static str {
 fn tool_format_error(tool: &str, reason: &str) -> ToolOutcome {
     let usage = tool_usage(tool);
     ToolOutcome {
-        user_message: format!("格式错误：{reason}\n正确格式：{usage}"),
-        log_lines: vec![],
+        // 只把“简短原因”展示给用户；具体用法放进 meta 供模型自愈，避免 UI 被大段 JSON 占满。
+        user_message: format!("格式错误：{reason}"),
+        log_lines: vec!["状态:fail".to_string(), format!("usage:{usage}")],
+    }
+}
+
+fn ensure_outcome_status(outcome: &mut ToolOutcome) {
+    if outcome
+        .log_lines
+        .iter()
+        .any(|l| l.trim_start().starts_with("状态:"))
+    {
+        return;
+    }
+    let msg = outcome.user_message.trim();
+    let fail = msg.contains("格式错误")
+        || msg.contains("未知工具")
+        || msg.contains("工具执行失败")
+        || msg.contains("执行失败")
+        || msg.contains("操作失败")
+        || msg.contains("缺少")
+        || msg.contains("需要")
+        || msg.contains("不存在")
+        || msg.contains("无法")
+        || msg.contains("失败")
+        || msg.contains("错误")
+        || msg.contains("denied")
+        || msg.contains("not found")
+        || msg.contains("No such file");
+    if fail {
+        outcome.log_lines.insert(0, "状态:fail".to_string());
+    } else {
+        outcome.log_lines.insert(0, "状态:0".to_string());
     }
 }
 
 fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
     let tool = call.tool.as_str();
-    if call.brief.as_deref().unwrap_or("").trim().is_empty() {
+    // 大多数工具必须提供 brief（审计/可视化用途）；但纯 UI 的 plan/work 允许省略。
+    if !matches!(tool, "plan" | "work") && call.brief.as_deref().unwrap_or("").trim().is_empty() {
         return Err(tool_format_error(tool, "缺少 brief"));
     }
     match tool {
         "bash" | "adb" | "termux_api" => {
             if call.input.trim().is_empty() {
                 return Err(tool_format_error(tool, "缺少 input"));
+            }
+        }
+        "work" | "plan" => {
+            // 纯 UI 工具：允许空 input，但至少要有一些内容能渲染。
+            let input = call.input.trim();
+            let content = call.content.as_deref().unwrap_or("").trim();
+            let time = call.time.as_deref().unwrap_or("").trim();
+            if input.is_empty() && content.is_empty() && time.is_empty() {
+                return Err(tool_format_error(tool, "缺少 input/content/time（至少提供其一）"));
             }
         }
         "list_dir" | "stat_file" | "read_file" => {
@@ -1493,7 +1610,7 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
         _ => {
             return Err(tool_format_error(
                 tool,
-                "未知工具（可用：bash/adb/termux_api/list_dir/stat_file/read_file/write_file/search/edit_file/apply_patch/memory_check/memory_read/memory_edit/memory_add/system_config/skills_mcp）",
+                "未知工具（可用：bash/adb/termux_api/plan/list_dir/stat_file/read_file/write_file/search/edit_file/apply_patch/memory_check/memory_read/memory_edit/memory_add/system_config/skills_mcp）",
             ));
         }
     }
@@ -1584,12 +1701,15 @@ pub fn tool_requires_confirmation(call: &ToolCall) -> Option<String> {
 
 pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     if let Err(outcome) = validate_tool_call(call) {
+        let mut outcome = outcome;
+        ensure_outcome_status(&mut outcome);
         return Ok(outcome);
     }
     match call.tool.as_str() {
         "bash" => run_bash(call),
         "adb" => run_adb(call),
         "termux_api" => run_termux_api(call),
+        "work" | "plan" => run_work(call),
         "read_file" => run_read_file(call),
         "write_file" => run_write_file(call),
         "list_dir" => run_list_dir(call),
@@ -1606,7 +1726,7 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         "skills_mcp" => run_skills_mcp(call),
         other => Ok(ToolOutcome {
             user_message: format!("未知工具：{other}"),
-            log_lines: vec![],
+            log_lines: vec!["状态:fail".to_string()],
         }),
     }
 }
@@ -1623,6 +1743,8 @@ pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutco
     for _ in 0..retries.max(1) {
         match handle_tool_call(call) {
             Ok(outcome) => {
+                let mut outcome = outcome;
+                ensure_outcome_status(&mut outcome);
                 if outcome_is_timeout(&outcome) {
                     last = Some(outcome);
                     continue;
@@ -1632,15 +1754,17 @@ pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutco
             Err(e) => {
                 last = Some(ToolOutcome {
                     user_message: format!("工具执行失败：{e:#}"),
-                    log_lines: vec![],
+                    log_lines: vec!["状态:fail".to_string()],
                 });
             }
         }
     }
-    last.unwrap_or_else(|| ToolOutcome {
+    let mut out = last.unwrap_or_else(|| ToolOutcome {
         user_message: "工具执行失败".to_string(),
-        log_lines: vec![],
-    })
+        log_lines: vec!["状态:fail".to_string()],
+    });
+    ensure_outcome_status(&mut out);
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -2152,6 +2276,79 @@ fn run_termux_api(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     ))
 }
 
+fn run_work(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
+    // 这是一个“纯 UI 工具”：用于在聊天区显示“开始工作/工作结束”的目标与汇报区块。
+    // 不执行任何命令、无副作用。
+    let started = Instant::now();
+    let phase_raw = call.section.as_deref().unwrap_or("start").trim().to_ascii_lowercase();
+    let phase = if matches!(phase_raw.as_str(), "end" | "done" | "finish" | "stop" | "report") {
+        "end"
+    } else {
+        "start"
+    };
+
+    let input = call.input.trim();
+    let content = call.content.as_deref().unwrap_or("").trim();
+    let time = call.time.as_deref().unwrap_or("").trim();
+
+    let mut body = String::new();
+    let has_structured = {
+        let lower = content.to_ascii_lowercase();
+        lower.contains("target:") || lower.contains("steps:") || lower.contains("time:")
+    };
+
+    if has_structured && !content.is_empty() {
+        body.push_str(content);
+    } else if phase == "start" {
+        let target = if !input.is_empty() {
+            input
+        } else if !content.is_empty() {
+            content
+        } else {
+            call.brief.as_deref().unwrap_or("").trim()
+        };
+        if !target.is_empty() {
+            body.push_str(&format!("Target: {target}\n"));
+        }
+        if !content.is_empty() && content != target {
+            body.push_str("Steps:\n");
+            for (idx, line) in content.lines().enumerate() {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                body.push_str(&format!("  {}. {}\n", idx.saturating_add(1), t));
+            }
+        }
+        if !time.is_empty() {
+            body.push_str(&format!("Time: {time}\n"));
+        }
+    } else {
+        // end/report
+        if !input.is_empty() {
+            body.push_str(input);
+            body.push('\n');
+        }
+        if !content.is_empty() {
+            body.push_str(content);
+            body.push('\n');
+        }
+        if !time.is_empty() {
+            body.push_str(&format!("Time: {time}\n"));
+        }
+    }
+
+    let body = body.trim_end().to_string();
+    Ok(ToolOutcome {
+        user_message: if body.is_empty() { "(empty)".to_string() } else { body },
+        log_lines: vec![format!(
+            "状态:0 | 耗时:{}ms | phase:{}",
+            started.elapsed().as_millis(),
+            phase
+        )],
+    })
+}
+
 fn count_text_lines(text: &str) -> usize {
     text.lines().count()
 }
@@ -2287,136 +2484,378 @@ fn find_files_by_name_with_timeout(
 }
 
 fn run_read_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
+    #[derive(Clone, Copy)]
+    enum ReadMode {
+        Peek,
+        Range,
+        Full,
+    }
+
+    fn estimate_tokens_for_text(text: &str) -> usize {
+        let mut ascii = 0usize;
+        let mut non_ascii = 0usize;
+        for ch in text.chars() {
+            if ch.is_ascii() {
+                ascii = ascii.saturating_add(1);
+            } else {
+                non_ascii = non_ascii.saturating_add(1);
+            }
+        }
+        non_ascii.saturating_add(ascii.saturating_add(3) / 4)
+    }
+
+    fn trim_line_for_read(raw: &str) -> (String, bool) {
+        let clean = sanitize_search_line(raw.trim_end_matches(['\n', '\r']));
+        let chars = clean.chars().count();
+        if chars <= READ_MAX_LINE_CHARS {
+            return (clean, false);
+        }
+        let mut out: String = clean.chars().take(READ_MAX_LINE_CHARS).collect();
+        out.push_str(" …");
+        (out, true)
+    }
+
+    fn count_file_lines_limited(path: &str, max_bytes: usize) -> (usize, bool) {
+        let Ok(file) = fs::File::open(path) else {
+            return (0, false);
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut bytes = 0usize;
+        let mut lines = 0usize;
+        loop {
+            buf.clear();
+            let Ok(n) = reader.read_until(b'\n', &mut buf) else {
+                return (lines, false);
+            };
+            if n == 0 {
+                return (lines, true);
+            }
+            bytes = bytes.saturating_add(n);
+            lines = lines.saturating_add(1);
+            if bytes >= max_bytes {
+                return (lines, false);
+            }
+        }
+    }
+
+    fn read_head_lines(path: &str, max_lines: usize) -> anyhow::Result<(Vec<(usize, String)>, bool)> {
+        let file = fs::File::open(path).with_context(|| format!("读取文件失败：{path}"))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut out: Vec<(usize, String)> = Vec::new();
+        let mut truncated = false;
+        let mut line_no = 0usize;
+        while out.len() < max_lines {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf).context("读取文件内容失败")?;
+            if n == 0 {
+                break;
+            }
+            line_no = line_no.saturating_add(1);
+            let line = String::from_utf8_lossy(&buf);
+            let (t, was_trunc) = trim_line_for_read(&line);
+            if was_trunc {
+                truncated = true;
+            }
+            out.push((line_no, t));
+        }
+        Ok((out, truncated))
+    }
+
+    fn read_tail_lines(
+        path: &str,
+        total_bytes: usize,
+        tail_lines: usize,
+    ) -> anyhow::Result<(Vec<String>, bool, bool)> {
+        let mut file = fs::File::open(path).with_context(|| format!("读取文件失败：{path}"))?;
+        let mut truncated_by_bytes = false;
+        if total_bytes > READ_MAX_BYTES {
+            truncated_by_bytes = true;
+            let offset = total_bytes.saturating_sub(READ_MAX_BYTES) as u64;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .context("尾部读取 seek 失败")?;
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        std::io::Read::take(&mut file, READ_MAX_BYTES as u64)
+            .read_to_end(&mut buf)
+            .context("读取文件内容失败")?;
+        let text = String::from_utf8_lossy(&buf);
+        let mut lines: Vec<&str> = text.lines().collect();
+        if lines.len() > tail_lines {
+            lines = lines[lines.len().saturating_sub(tail_lines)..].to_vec();
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut truncated_line = false;
+        for line in lines {
+            let (t, was_trunc) = trim_line_for_read(line);
+            if was_trunc {
+                truncated_line = true;
+            }
+            out.push(t);
+        }
+        Ok((out, truncated_by_bytes, truncated_line))
+    }
+
     let path = pick_path(call)?;
     let started = Instant::now();
+    let head_mode = call.head.unwrap_or(false) && !call.tail.unwrap_or(false);
     let tail_mode = call.tail.unwrap_or(false);
-    let head_mode = call.head.unwrap_or(false) && !tail_mode;
+    let full_requested = call.full.unwrap_or(false);
+    let range_requested =
+        head_mode || tail_mode || call.start_line.is_some() || call.max_lines.is_some();
 
-    let mut file = fs::File::open(&path).with_context(|| format!("读取文件失败：{path}"))?;
-    let total_bytes = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-    let mut truncated_by_bytes = false;
-    if tail_mode && total_bytes > READ_MAX_BYTES {
-        truncated_by_bytes = true;
-        let offset = total_bytes.saturating_sub(READ_MAX_BYTES) as u64;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .context("尾部读取 seek 失败")?;
-    }
+    let meta0 = fs::metadata(&path).with_context(|| format!("读取文件失败：{path}"))?;
+    let total_bytes = meta0.len() as usize;
+    let modified = meta0.modified().ok();
+    let modified_ms = modified
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    let is_binary = is_probably_binary_file(Path::new(&path));
 
-    let mut buf: Vec<u8> = Vec::new();
-    std::io::Read::take(&mut file, READ_MAX_BYTES as u64)
-        .read_to_end(&mut buf)
-        .context("读取文件内容失败")?;
-    let elapsed = started.elapsed();
-
-    if !tail_mode {
-        truncated_by_bytes = total_bytes.max(buf.len()) > READ_MAX_BYTES;
-    }
-    let mut total_lines: Option<usize> = None;
-    let mut total_chars: Option<usize> = None;
-    let mut is_binary = false;
-    let mut body = match String::from_utf8(buf.clone()) {
-        Ok(s) => {
-            if !truncated_by_bytes {
-                total_lines = Some(s.lines().count());
-                total_chars = Some(s.chars().count());
-            }
-            s
-        }
-        Err(_) => {
-            is_binary = true;
-            let hex = bytes_preview_hex(&buf, 256);
-            format!(
-                "(非 UTF-8 文本，大小 {} 字节)\n前 256 字节(hex):\n{}",
-                buf.len(),
-                hex
-            )
-        }
+    let mut mode = if range_requested {
+        ReadMode::Range
+    } else if full_requested {
+        ReadMode::Full
+    } else {
+        ReadMode::Peek
     };
-    let mut line_count = body.lines().count();
-    let mut char_count = body.chars().count();
-    if !is_binary {
-        let max_lines = call
-            .max_lines
-            .unwrap_or(TOOL_OUTPUT_MAX_LINES)
-            .clamp(1, READ_MAX_LINES_CAP);
-        if tail_mode {
-            let lines: Vec<&str> = body.lines().collect();
-            let total = lines.len();
-            if total > max_lines {
-                let start_idx = total.saturating_sub(max_lines);
-                body = lines[start_idx..].join("\n");
-            }
-            let mut note = if truncated_by_bytes {
-                format!(
-                    "\n\n[仅展示末尾 {max_lines} 行（尾部读取，行号未知；尾部截取 {READ_MAX_BYTES} bytes）]"
-                )
-            } else {
-                format!("\n\n[仅展示末尾 {max_lines} 行，共 {total} 行]")
-            };
-            if truncated_by_bytes {
-                note.push_str("；可能缺少更早内容");
-            }
-            body.push_str(&note);
-            line_count = body.lines().count();
-            char_count = body.chars().count();
+
+    let mut full_note: Option<String> = None;
+    if full_requested && range_requested {
+        full_note = Some("ignored: range 参数已提供（按 range 处理）".to_string());
+    }
+    if matches!(mode, ReadMode::Full) && total_bytes > READ_FULL_MAX_BYTES {
+        // full 仅允许小文件；大文件降级为 Peek（并给出更丰富 meta 信息）。
+        full_note = Some(format!("denied: full 仅允许 <= {READ_FULL_MAX_BYTES} bytes"));
+        mode = ReadMode::Peek;
+    }
+
+    let token_budget = match mode {
+        ReadMode::Peek => READ_PEEK_TOKEN_BUDGET,
+        ReadMode::Range => READ_RANGE_TOKEN_BUDGET,
+        ReadMode::Full => READ_FULL_TOKEN_BUDGET,
+    };
+
+    // 额外的“读文件信息”：最多扫 2MB 估算行数，避免对超大文件全扫卡住。
+    let (total_lines_est, total_lines_complete) = if total_bytes <= 2_000_000 {
+        count_file_lines_limited(&path, 2_000_000)
+    } else {
+        (0, false)
+    };
+
+    let mut out_lines: Vec<String> = Vec::new();
+    out_lines.push(format!("File: {}", shorten_path(&path)));
+    out_lines.push(format!("Size: {total_bytes} bytes"));
+    if let Some(ms) = modified_ms {
+        out_lines.push(format!("MTime(ms): {ms}"));
+    }
+    if total_lines_est > 0 {
+        if total_lines_complete {
+            out_lines.push(format!("Total lines: {total_lines_est}"));
         } else {
-            let needs_slice = head_mode || call.start_line.is_some() || call.max_lines.is_some();
-            if needs_slice {
-                let start = call.start_line.unwrap_or(1).max(1);
-                let lines: Vec<&str> = body.lines().collect();
-                let total = lines.len();
-                if start > total {
-                    body = format!("起始行超出范围：start_line={start}，总行数={total}");
-                } else {
-                    let start_idx = start.saturating_sub(1);
-                    let end_idx = (start_idx + max_lines).min(total);
-                    let slice = lines[start_idx..end_idx].join("\n");
-                    let mut note =
-                        format!("\n\n[仅展示第 {}-{} 行，共 {} 行]", start, end_idx, total);
-                    if truncated_by_bytes {
-                        note.push_str("；原文件已按字节截断");
-                    }
-                    body = format!("{slice}{note}");
+            out_lines.push(format!("Total lines(estimated): >= {total_lines_est}"));
+        }
+    }
+    out_lines.push(format!("Binary: {}", if is_binary { "true" } else { "false" }));
+    if full_requested {
+        if let Some(note) = full_note.as_deref() {
+            out_lines.push(format!("Full requested: true ({note})"));
+        } else {
+            out_lines.push("Full requested: true".to_string());
+        }
+    }
+    out_lines.push("---".to_string());
+
+    let mut partial = false;
+    let mut partial_reason: Option<&'static str> = None;
+    let mut truncated_line = false;
+    let mut shown_start: Option<usize> = None;
+    let mut shown_end: Option<usize> = None;
+
+    if is_binary {
+        out_lines.push("(binary file: content omitted)".to_string());
+        partial = true;
+        partial_reason = Some("binary");
+    } else if matches!(mode, ReadMode::Peek) {
+        let (head, head_trunc) = read_head_lines(&path, READ_PEEK_HEAD_LINES)?;
+        let (tail, tail_trunc_bytes, tail_trunc_line) =
+            read_tail_lines(&path, total_bytes, READ_PEEK_TAIL_LINES)?;
+        truncated_line = head_trunc || tail_trunc_line;
+        let _tail_window_limited = tail_trunc_bytes;
+
+        out_lines.push(format!("(peek) head {READ_PEEK_HEAD_LINES} lines:"));
+        for (ln, text) in head {
+            out_lines.push(format!("{ln} | {text}"));
+        }
+        out_lines.push("...".to_string());
+        out_lines.push(format!("(peek) tail {READ_PEEK_TAIL_LINES} lines:"));
+        for text in tail {
+            out_lines.push(text);
+        }
+        partial = true;
+        partial_reason = Some("peek");
+    } else {
+        // Range / Full（小文件 full 也走这里）：按行流式扫描，支持 start_line/max_lines。
+        let mut start_line = if tail_mode {
+            0usize
+        } else if matches!(mode, ReadMode::Full) || head_mode {
+            1usize
+        } else {
+            call.start_line.unwrap_or(1).max(1)
+        };
+        let mut max_lines = call.max_lines.unwrap_or(200).max(1);
+        if matches!(mode, ReadMode::Full) {
+            start_line = 1;
+            max_lines = call
+                .max_lines
+                .unwrap_or(READ_FULL_MAX_LINES)
+                .max(1)
+                .min(READ_FULL_MAX_LINES);
+        } else {
+            max_lines = max_lines.min(READ_RANGE_MAX_LINES);
+        }
+
+        if tail_mode {
+            let (tail, tail_trunc_bytes, tail_trunc_line) =
+                read_tail_lines(&path, total_bytes, max_lines)?;
+            truncated_line = tail_trunc_line;
+            if tail_trunc_bytes {
+                partial = true;
+                partial_reason = Some("tail_bytes_window");
+            }
+            out_lines.push(format!("(tail) last {max_lines} lines (line numbers unknown):"));
+            for text in tail {
+                out_lines.push(text);
+            }
+        } else {
+            let file = fs::File::open(&path).with_context(|| format!("读取文件失败：{path}"))?;
+            let mut reader = std::io::BufReader::new(file);
+            let mut buf: Vec<u8> = Vec::new();
+            let mut bytes_scanned = 0usize;
+            let mut line_no = 0usize;
+            let mut collected = 0usize;
+            let width = (start_line + max_lines).to_string().len().max(3);
+            while collected < max_lines {
+                buf.clear();
+                let n = reader.read_until(b'\n', &mut buf).context("读取文件内容失败")?;
+                if n == 0 {
+                    break;
                 }
-                line_count = body.lines().count();
-                char_count = body.chars().count();
-            } else if truncated_by_bytes {
-                body.push_str(&format!("\n\n[仅展示前 {READ_MAX_BYTES} 字节]"));
-                line_count = body.lines().count();
-                char_count = body.chars().count();
+                bytes_scanned = bytes_scanned.saturating_add(n);
+                line_no = line_no.saturating_add(1);
+                if bytes_scanned >= READ_SCAN_MAX_BYTES && line_no < start_line {
+                    partial = true;
+                    partial_reason = Some("scan_bytes_cap");
+                    break;
+                }
+                if line_no < start_line {
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&buf);
+                let (t, was_trunc) = trim_line_for_read(&line);
+                if was_trunc {
+                    truncated_line = true;
+                }
+                shown_start.get_or_insert(line_no);
+                shown_end = Some(line_no);
+                out_lines.push(format!("{:>width$} | {}", line_no, t, width = width));
+                collected = collected.saturating_add(1);
+            }
+            if line_no >= start_line && collected >= max_lines {
+                // 触发了 max_lines 上限：仅当文件确实还有更多内容时才算 partial，避免“刚好读完整文件”的误判。
+                buf.clear();
+                let more = reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0;
+                if more {
+                    partial = true;
+                    partial_reason = Some("max_lines_cap");
+                }
             }
         }
-    } else if truncated_by_bytes {
-        body.push_str(&format!("\n\n[仅展示 {READ_MAX_BYTES} 字节]"));
-        line_count = body.lines().count();
-        char_count = body.chars().count();
+    }
+
+    // 预算裁剪：token budget + char budget 双兜底（并明确 partial）。
+    let mut budget_tokens_used = 0usize;
+    let mut budget_chars_used = 0usize;
+    let mut clipped: Vec<String> = Vec::new();
+    for line in out_lines {
+        let line_chars = line.chars().count();
+        let line_tokens = estimate_tokens_for_text(&line);
+        if !clipped.is_empty() {
+            // newline cost
+            budget_chars_used = budget_chars_used.saturating_add(1);
+        }
+        if budget_tokens_used.saturating_add(line_tokens) > token_budget
+            || budget_chars_used.saturating_add(line_chars) > READ_TOOL_RAW_MAX_CHARS
+            || clipped.len().saturating_add(1) > READ_TOOL_RAW_MAX_LINES
+        {
+            partial = true;
+            partial_reason = Some("token_budget");
+            break;
+        }
+        budget_tokens_used = budget_tokens_used.saturating_add(line_tokens);
+        budget_chars_used = budget_chars_used.saturating_add(line_chars);
+        clipped.push(line);
+    }
+
+    if partial {
+        let reason = partial_reason.unwrap_or("partial");
+        clipped.push("---".to_string());
+        clipped.push(format!(
+            "[partial:true reason:{reason} | token_budget:{token_budget} | est_tokens:{budget_tokens_used}]"
+        ));
+        if let (Some(a), Some(b)) = (shown_start, shown_end) {
+            clipped.push(format!("[window: lines {a}-{b}]"));
+        }
+        if truncated_line {
+            clipped.push(format!("[note: some lines were truncated to {READ_MAX_LINE_CHARS} chars]"));
+        }
+    }
+
+    let elapsed = started.elapsed();
+    let body = clipped.join("\n").trim_end().to_string();
+    let line_count = body.lines().count();
+    let char_count = body.chars().count();
+
+    let mode_label = match mode {
+        ReadMode::Peek => "peek",
+        ReadMode::Range => "range",
+        ReadMode::Full => "full",
+    };
+    let mut meta = format!(
+        "状态:0 | 耗时:{}ms | path:{} | mode:{mode_label} | bytes:{total_bytes} | lines:{} | chars:{}",
+        elapsed.as_millis(),
+        shorten_path(&path),
+        line_count,
+        char_count
+    );
+    if total_lines_est > 0 {
+        if total_lines_complete {
+            meta.push_str(&format!(" | total_lines:{total_lines_est}"));
+        } else {
+            meta.push_str(&format!(" | total_lines:>={total_lines_est}"));
+        }
+    }
+    if partial {
+        meta.push_str(" | partial:true");
+        if let Some(r) = partial_reason {
+            meta.push_str(&format!(" | reason:{r}"));
+        }
+    }
+    if is_binary {
+        meta.push_str(" | binary:true");
+    }
+    if truncated_line {
+        meta.push_str(" | line_truncated:true");
+    }
+    meta.push_str(&format!(" | est_tokens:{budget_tokens_used}"));
+    if let Some(note) = full_note.as_deref() {
+        meta.push_str(&format!(" | full_note:{note}"));
     }
 
     Ok(ToolOutcome {
-        user_message: truncate_command_output(body),
-        log_lines: vec![{
-            let mut meta = format!(
-                "状态:0 | 耗时:{}ms | path:{} | lines:{} | chars:{} | bytes:{}",
-                elapsed.as_millis(),
-                shorten_path(&path),
-                line_count,
-                char_count,
-                total_bytes.max(buf.len())
-            );
-            if let Some(total) = total_lines {
-                meta.push_str(&format!(" | total_lines:{total}"));
-            }
-            if let Some(total) = total_chars {
-                meta.push_str(&format!(" | total_chars:{total}"));
-            }
-            if truncated_by_bytes {
-                meta.push_str(" | partial:true");
-            }
-            if is_binary {
-                meta.push_str(" | binary:true");
-            }
-            meta
-        }],
+        user_message: body,
+        log_lines: vec![meta],
     })
 }
 
@@ -2591,6 +3030,17 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         }
     }
 
+    // 允许在 pattern 内联 ctx 标记（仅当未显式传 context* 字段时生效）
+    let inline_ctx_allowed = call.context.is_none()
+        && call.context_lines.is_none()
+        && call.context_files.is_none()
+        && call.context_hits_per_file.is_none();
+    let (pattern2, inline_ctx_lines, inline_ctx_enabled) =
+        extract_search_inline_ctx_marker(&pattern);
+    if inline_ctx_allowed && (inline_ctx_enabled || inline_ctx_lines.is_some()) {
+        pattern = pattern2;
+    }
+
     let (pattern_effective, keywords) = normalize_search_pattern(&pattern);
     if !Path::new(&root).exists() {
         return Ok(ToolOutcome {
@@ -2598,10 +3048,13 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             log_lines: vec![],
         });
     }
-    let want_context = call.context.unwrap_or(false)
+    let mut want_context = call.context.unwrap_or(false)
         || call.context_lines.is_some()
         || call.context_files.is_some()
         || call.context_hits_per_file.is_some();
+    if inline_ctx_allowed {
+        want_context = want_context || inline_ctx_enabled || inline_ctx_lines.is_some();
+    }
     let max_matches = call
         .count
         .unwrap_or(SEARCH_DEFAULT_MAX_MATCHES)
@@ -2700,6 +3153,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     if want_context {
         let context_lines = call
             .context_lines
+            .or(inline_ctx_lines)
             .unwrap_or(SEARCH_CONTEXT_DEFAULT_LINES)
             .clamp(1, SEARCH_CONTEXT_MAX_LINES);
         let context_files = call
@@ -2760,6 +3214,11 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         rg_args.push("--glob".to_string());
         rg_args.push(format!("!**/{d}/**"));
     }
+    // 默认排除常见二进制/数据库文件：避免输出乱码、抖动与无意义 token 消耗。
+    for g in ["!**/*.db", "!**/*.sqlite", "!**/*.sqlite3"] {
+        rg_args.push("--glob".to_string());
+        rg_args.push(g.to_string());
+    }
     for d in extra_exclude_dirs.iter() {
         rg_args.push("--glob".to_string());
         rg_args.push(format!("!**/{d}/**"));
@@ -2778,6 +3237,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 
     let mut grep_args: Vec<String> = vec![
         "-RIn".to_string(),
+        "-I".to_string(),
         "--binary-files=without-match".to_string(),
         "-m".to_string(),
         max_matches.to_string(),
@@ -2785,6 +3245,10 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     for d in SEARCH_EXCLUDE_DIRS {
         grep_args.push("--exclude-dir".to_string());
         grep_args.push((*d).to_string());
+    }
+    for g in ["*.db", "*.sqlite", "*.sqlite3"] {
+        grep_args.push("--exclude".to_string());
+        grep_args.push(g.to_string());
     }
     for d in extra_exclude_dirs.iter() {
         grep_args.push("--exclude-dir".to_string());
@@ -3067,6 +3531,7 @@ fn build_context_pack(
     picked.truncate(context_files);
 
     let mut skipped_large = 0usize;
+    let mut skipped_binary = 0usize;
     let mut skipped_unreadable = 0usize;
     let mut blocks: Vec<String> = Vec::new();
 
@@ -3091,6 +3556,7 @@ fn build_context_pack(
             continue;
         }
         if is_probably_binary_file(&path) {
+            skipped_binary = skipped_binary.saturating_add(1);
             blocks.push(format!("=== {shown} ===\n(跳过：二进制文件)"));
             continue;
         }
@@ -3174,6 +3640,9 @@ fn build_context_pack(
     }
     if skipped_large > 0 {
         notes.push(format!("(跳过过大文件: {skipped_large})"));
+    }
+    if skipped_binary > 0 {
+        notes.push(format!("(跳过二进制文件: {skipped_binary})"));
     }
     if skipped_unreadable > 0 {
         notes.push(format!("(跳过不可读文件: {skipped_unreadable})"));
@@ -3450,6 +3919,15 @@ fn run_search_keywords_and(
         notes.push(format!(
             "【扫描上限】已扫描 {SEARCH_MAX_FILES_SCAN} 个文件后提前终止（结果可能不完整）。"
         ));
+    }
+    if stats.skipped_large > 0 {
+        notes.push(format!("(跳过过大文件: {})", stats.skipped_large));
+    }
+    if stats.skipped_binary > 0 {
+        notes.push(format!("(跳过二进制文件: {})", stats.skipped_binary));
+    }
+    if stats.skipped_unreadable > 0 {
+        notes.push(format!("(跳过不可读文件: {})", stats.skipped_unreadable));
     }
     if !notes.is_empty() {
         body = format!("{}\n{}", notes.join("\n"), body.trim_end());
@@ -5274,6 +5752,7 @@ fn pick_write_fields(call: &ToolCall) -> anyhow::Result<(String, String)> {
     Err(anyhow!("write_file 需要 path 与 content"))
 }
 
+#[allow(dead_code)]
 fn bytes_preview_hex(bytes: &[u8], limit: usize) -> String {
     let len = bytes.len().min(limit);
     let mut out = String::new();
@@ -5346,9 +5825,13 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
                 if call.tail.unwrap_or(false) {
                     display = format!("{display} tail:{max_lines}");
                 } else if call.head.unwrap_or(false) && call.start_line.is_none() {
-                    display = format!("{display} 1-{max_lines}");
+                    display = format!("{display} head:{max_lines}");
                 } else if let Some(range) = format_line_range(call.start_line, call.max_lines) {
-                    display = format!("{display} {range}");
+                    display = format!("{display} lines:{range}");
+                } else if call.full.unwrap_or(false) {
+                    display = format!("{display} full");
+                } else {
+                    display = format!("{display} peek");
                 }
             }
             build_preview(&display, limit)
@@ -5376,33 +5859,45 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
             }
         }
         "search" => {
-            let pattern = call.pattern.as_deref().unwrap_or(call.input.trim());
-            let root = call.root.as_deref().or(call.path.as_deref()).unwrap_or(".");
-            let label = if call.file.unwrap_or(false) {
-                "file"
+            let raw_pattern = call.pattern.as_deref().unwrap_or(call.input.trim());
+            let (pattern2, inline_ctx_lines, inline_ctx_enabled) =
+                extract_search_inline_ctx_marker(raw_pattern);
+            let pattern = if pattern2.trim().is_empty() {
+                raw_pattern.to_string()
             } else {
-                "pattern"
+                pattern2
             };
-            let keywords = parse_search_keywords(pattern);
-            let pattern = match keywords.len() {
-                0 => pattern.to_string(),
-                1 => keywords[0].clone(),
-                _ => format!("\"{}\"", keywords.join(", ")),
+            let root = call.root.as_deref().or(call.path.as_deref()).unwrap_or(".");
+            let keywords = parse_search_keywords(&pattern);
+            let kw_display = if keywords.is_empty() {
+                build_preview(&pattern, 180)
+            } else if keywords.len() <= 6 {
+                keywords.join(" ")
+            } else {
+                format!("{} … +{}", keywords[..6].join(" "), keywords.len().saturating_sub(6))
             };
             let ctx = call.context.unwrap_or(false)
                 || call.context_lines.is_some()
                 || call.context_files.is_some()
-                || call.context_hits_per_file.is_some();
+                || call.context_hits_per_file.is_some()
+                || inline_ctx_enabled
+                || inline_ctx_lines.is_some();
             let mut extra = String::new();
             if ctx {
                 let n = call
                     .context_lines
+                    .or(inline_ctx_lines)
                     .unwrap_or(SEARCH_CONTEXT_DEFAULT_LINES)
                     .clamp(1, SEARCH_CONTEXT_MAX_LINES);
                 extra = format!(" ctx:±{n}");
             }
+            let prefix = if call.file.unwrap_or(false) {
+                "file:"
+            } else {
+                ""
+            };
             build_preview(
-                &format!("{label}={pattern}{extra} in {}", display_tool_path(root)),
+                &format!("{prefix}{kw_display}{extra} in {}", display_tool_path(root)),
                 limit,
             )
         }
@@ -5507,7 +6002,8 @@ pub fn tool_display_label(tool: &str) -> String {
         "bash" => "BASH",
         "adb" => "Shell",
         "termux_api" => "Termux",
-        "read_file" => "Read",
+        "plan" | "work" => "Plan",
+        "read_file" => "READ",
         "write_file" => "Write",
         "list_dir" => "List",
         "stat_file" => "Info",

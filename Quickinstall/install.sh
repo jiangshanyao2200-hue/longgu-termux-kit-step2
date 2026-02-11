@@ -245,10 +245,23 @@ for src in "$QUICK_ROOT"/deploy/startboot/*; do
   [ -f "$src" ] || continue
   base="$(basename "$src")"
   mode=0755
-  if [ "$base" = "_render.sh" ]; then
-    mode=0644
-  fi
   install_file "$src" "$AITERMUX_HOME/startboot/$base" "$mode"
+done
+
+log "清理多余开屏动画脚本"
+for dst in "$AITERMUX_HOME"/startboot/*; do
+  [ -e "$dst" ] || continue
+  [ -f "$dst" ] || continue
+  base="$(basename "$dst")"
+  case "$base" in
+    [1-9].sh|10.sh|11.sh)
+      ;;
+    *)
+      backup_file "$dst"
+      log "删除：$dst（非标准动画脚本）"
+      run_cmd rm -f "$dst"
+      ;;
+  esac
 done
 
 log "写入 zsh 自动启动段"

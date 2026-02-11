@@ -1,15 +1,18 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-source "${SCRIPT_DIR}/_render.sh"
+aitermux_anim_print_frame() {
+  local frame="${1-}"
+  printf '%s' "$frame"
+  printf '\033[0m\033[J'
+}
 
 # AITermux boot animation #2 (重做版)：
 #   AI 数据大爆炸（3D 能量粒子 + 冲击波 + 数据流）→ “涌现智能”（连接/聚合）→ 组装成 AI\n'termux。
 
 DURATION="${DURATION:-2.2}"
 HOLD="${HOLD:-0.9}"
-FPS="${FPS:-30}"
+FPS="${FPS:-12}"
 SPEED="${SPEED:-1.0}"
 COLOR="${COLOR:-1}"
 ALTSCR="${ALTSCR:-1}"
@@ -82,7 +85,7 @@ printf "\033[?7l"
 printf "\033[H\033[2J"
 
 DELIM=$'\x1e'
-dt="$(awk -v fps="${FPS}" 'BEGIN{fps=int(fps+0); if(fps<12) fps=12; if(fps>60) fps=60; printf "%.6f", 1.0/fps }')"
+dt="$(awk -v fps="${FPS}" 'BEGIN{fps=int(fps+0); if(fps<8) fps=8; if(fps>30) fps=30; printf "%.6f", 1.0/fps }')"
 have_tty=0
 if { exec 4</dev/tty; } 2>/dev/null; then
   have_tty=1
@@ -392,7 +395,7 @@ BEGIN{
   pi=3.141592653589793
   srand(1) # 画面尽量确定性，减少“闪烁随机”
 
-  fps=int(FPS+0); if(fps<12) fps=12; if(fps>60) fps=60
+  fps=int(FPS+0); if(fps<8) fps=8; if(fps>30) fps=30
   dt=1.0/fps
   frames=int((DUR+0)*fps+0.5); if(frames<1) frames=1
   holdFrames=int((HOLD+0)*fps+0.5); if(holdFrames<0) holdFrames=0

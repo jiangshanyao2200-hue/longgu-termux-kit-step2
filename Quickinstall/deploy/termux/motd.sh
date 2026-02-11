@@ -4,6 +4,9 @@ set +e
 [ "${AITERMUX_MOTD_DISABLE:-0}" = "1" ] && exit 0
 tty >/dev/null 2>&1 || exit 0
 
+PREFIX="/data/data/com.termux/files/usr"
+export PATH="$PREFIX/bin:/system/bin:/system/xbin:${PATH:-}"
+
 ROOT_DIR="${AITERMUX_HOME:-$HOME/AItermux}"
 START_DIR="$ROOT_DIR/startboot"
 LOG_DIR="$ROOT_DIR/logs"
@@ -11,6 +14,8 @@ BASH_BIN="/data/data/com.termux/files/usr/bin/bash"
 DEBUG="${AITERMUX_MOTD_DEBUG:-0}"
 ERR_LOG="$LOG_DIR/motd-last.err"
 META_LOG="$LOG_DIR/motd-last.meta"
+META_REASON=""
+META_WRITTEN=0
 
 mkdir -p "$LOG_DIR" >/dev/null 2>&1 || true
 [ -x "$BASH_BIN" ] || BASH_BIN="$(command -v bash 2>/dev/null || echo bash)"
@@ -39,6 +44,21 @@ if [ "$DEBUG" != "1" ]; then
   exec 2>>"$ERR_LOG"
 fi
 
+write_meta_once() {
+  [ "$META_WRITTEN" = "1" ] && return 0
+  META_WRITTEN=1
+  {
+    printf 'ts=%s\n' "$(date '+%F %T' 2>/dev/null || echo unknown)"
+    printf 'tty=%s\n' "${TTY_ID:-}"
+    printf 'reason=%s\n' "${META_REASON:-}"
+    [ -n "${anim:-}" ] && printf 'anim=%s\n' "${anim:-}"
+    [ -n "${final_size:-}" ] && printf 'size=%s\n' "${final_size:-}"
+    [ -n "${timeout_limit:-}" ] && printf 'timeout=%s\n' "${timeout_limit:-}"
+    printf 'fps=%s duration=%s hold=%s speed=%s\n' "${FPS:-}" "${DURATION:-}" "${HOLD:-}" "${SPEED:-}"
+    printf 'elapsed_ms=%s rc=%s\n' "${elapsed_ms:-0}" "${rc:-0}"
+  } >"$META_LOG" 2>/dev/null || true
+}
+
 cleanup() {
   stty sane >/dev/null 2>&1 || true
   tput cnorm >/dev/null 2>&1 || true
@@ -46,6 +66,7 @@ cleanup() {
     printf '\033[0m\033[?25h\033[?7h\033[?1049l' >/dev/tty 2>/dev/null || true
     printf '\033[H\033[2J\033[3J' >/dev/tty 2>/dev/null || true
   fi
+  write_meta_once || true
   [ -n "${RUN_FILE:-}" ] && rm -f "$RUN_FILE" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
@@ -53,18 +74,23 @@ trap cleanup EXIT INT TERM
 pick_random() {
   local -a pool=()
   # 只从“动画脚本”里选：1.sh..11.sh（避免把实验脚本/辅助脚本选进去）
-  mapfile -t pool < <(
-    find "$START_DIR" -maxdepth 1 -type f -name '*.sh' -perm -111 -print 2>/dev/null \
-      | grep -E '/(10|11|[1-9])\\.sh$' \
-      | sort
-  )
+  # 仅用 bash 内建 glob/regex，避免 PATH/外部命令缺失导致“直接跳过动画”。
+  local f base
+  shopt -s nullglob
+  for f in "$START_DIR"/*.sh; do
+    base="${f##*/}"
+    [[ "$base" =~ ^(10|11|[1-9])\.sh$ ]] || continue
+    [ -x "$f" ] || continue
+    pool+=("$f")
+  done
+  shopt -u nullglob
   [ "${#pool[@]}" -gt 0 ] || return 1
   printf '%s\n' "${pool[RANDOM % ${#pool[@]}]}"
 }
 
-[ -d "$START_DIR" ] || exit 0
+[ -d "$START_DIR" ] || { META_REASON="startboot_missing"; exit 0; }
 anim="$(pick_random || true)"
-[ -n "${anim:-}" ] && [ -f "$anim" ] || exit 0
+[ -n "${anim:-}" ] && [ -f "$anim" ] || { META_REASON="no_anim"; exit 0; }
 
 args=(--altscr)
 if [ "${AITERMUX_MOTD_COLOR:-1}" = "0" ]; then
@@ -216,16 +242,7 @@ elapsed_ms=0
 if [ "$start_ns" != "0" ] && [ "$end_ns" != "0" ] 2>/dev/null; then
   elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 fi
-{
-  printf 'ts=%s\n' "$(date '+%F %T' 2>/dev/null || echo unknown)"
-  printf 'tty=%s\n' "${TTY_ID:-}"
-  printf 'anim=%s\n' "$anim"
-  if [ -n "${final_size:-}" ]; then
-    printf 'size=%s\n' "$final_size"
-  fi
-  printf 'timeout=%s\n' "$timeout_limit"
-  printf 'fps=%s duration=%s hold=%s speed=%s\n' "$FPS" "${DURATION:-script-default}" "${HOLD:-script-default}" "${SPEED:-script-default}"
-  printf 'elapsed_ms=%s rc=%s\n' "$elapsed_ms" "$rc"
-} >"$META_LOG" 2>/dev/null || true
+META_REASON="done"
+write_meta_once || true
 
 exit 0

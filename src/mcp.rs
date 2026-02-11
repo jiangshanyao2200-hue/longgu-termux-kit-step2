@@ -65,6 +65,8 @@ const TERMUX_API_CACHE_DIR: &str = "log/termux-api-cache";
 const TERMUX_API_SAVE_THRESHOLD_BYTES: usize = 600_000;
 const SEARCH_CACHE_DIR: &str = "log/search-cache";
 const SEARCH_SAVE_THRESHOLD_BYTES: usize = 400_000;
+const IMAGE_CACHE_DIR: &str = "log/image-cache";
+const IMAGE_SAVE_THRESHOLD_BYTES: usize = 250_000;
 const TOOL_OUTPUT_MAX_CHARS: usize = 12_000;
 const TOOL_OUTPUT_MAX_LINES: usize = 240;
 const TOOL_OUTPUT_RAW_MAX_CHARS: usize = 20_000;
@@ -230,6 +232,14 @@ pub struct ToolCall {
     // search 输出上限控制（可选）
     #[serde(default)]
     pub output_level: Option<String>,
+
+    // view_image
+    #[serde(default)]
+    pub open: Option<bool>,
+    #[serde(default)]
+    pub width: Option<usize>,
+    #[serde(default)]
+    pub height: Option<usize>,
 }
 
 fn parse_list_tokens(raw: &str, max: usize) -> Vec<String> {
@@ -458,6 +468,17 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "output_level" | "out_level" | "level" | "output" => {
                 call.output_level = s;
             }
+            "open" | "preview" | "launch" => {
+                call.open = val
+                    .as_bool()
+                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+            }
+            "width" | "w" => {
+                call.width = parse_usize_value(&val);
+            }
+            "height" | "h" => {
+                call.height = parse_usize_value(&val);
+            }
             "context" | "ctx" | "fast_context" => {
                 call.context = val
                     .as_bool()
@@ -552,6 +573,7 @@ fn normalize_tool_name(name: &str) -> String {
         "stat" | "info" | "file_info" => "stat_file",
         "read" | "readfile" => "read_file",
         "write" | "writefile" => "write_file",
+        "image" | "img" | "viewimg" | "viewimage" | "view_image" => "view_image",
         "grep" | "rg" | "ripgrep" => "search",
         "edit" => "edit_file",
         "patch" => "apply_patch",
@@ -1139,6 +1161,11 @@ mod tests {
         let call = parse_tool_call_payload(r#"{"tool":"ls","input":"."}"#).expect("call");
         assert_eq!(call.tool, "list_dir");
         assert_eq!(call.input, ".");
+
+        let call =
+            parse_tool_call_payload(r#"{"tool":"viewimage","path":"a.png","brief":"x"}"#).expect("call");
+        assert_eq!(call.tool, "view_image");
+        assert_eq!(call.path.as_deref(), Some("a.png"));
     }
 
     #[test]
@@ -1406,6 +1433,7 @@ fn tool_usage(tool: &str) -> &'static str {
         "read_file" => {
             r#"{"tool":"read_file","path":"src/main.rs","head":true,"max_lines":200,"brief":"读取文件开头"}"#
         }
+        "view_image" => r#"{"tool":"view_image","path":"Pictures/demo.png","open":true,"brief":"打开图片预览"}"#,
         "write_file" => {
             r#"{"tool":"write_file","path":"notes/demo.txt","content":"hello","brief":"写入文件"}"#
         }
@@ -1502,6 +1530,12 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
             }
         }
         "list_dir" | "stat_file" | "read_file" => {
+            let path = call.path.as_deref().unwrap_or(call.input.trim()).trim();
+            if path.is_empty() {
+                return Err(tool_format_error(tool, "缺少 path"));
+            }
+        }
+        "view_image" => {
             let path = call.path.as_deref().unwrap_or(call.input.trim()).trim();
             if path.is_empty() {
                 return Err(tool_format_error(tool, "缺少 path"));
@@ -1711,6 +1745,7 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         "termux_api" => run_termux_api(call),
         "work" | "plan" => run_work(call),
         "read_file" => run_read_file(call),
+        "view_image" => run_view_image(call),
         "write_file" => run_write_file(call),
         "list_dir" => run_list_dir(call),
         "stat_file" => run_stat_file(call),
@@ -2988,6 +3023,132 @@ fn run_stat_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 
     Ok(ToolOutcome {
         user_message: body,
+        log_lines: vec![format!(
+            "状态:0 | 耗时:{}ms | path:{}",
+            elapsed.as_millis(),
+            shorten_path(&path)
+        )],
+    })
+}
+
+fn run_view_image(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
+    fn has_cmd(name: &str) -> bool {
+        Command::new(name)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    let path = pick_path(call)?;
+    let started = Instant::now();
+    let meta = fs::metadata(&path).with_context(|| format!("读取文件失败：{path}"))?;
+    if !meta.is_file() {
+        return Ok(ToolOutcome {
+            user_message: "不是文件（无法预览）".to_string(),
+            log_lines: vec!["状态:fail".to_string()],
+        });
+    }
+    let size = meta.len() as usize;
+
+    let mime = Command::new("file")
+        .args(["--mime-type", "-b", &path])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let do_open = call.open.unwrap_or(false);
+    if do_open {
+        let _ = Command::new("termux-open").arg(&path).output();
+    }
+
+    let width = call.width.unwrap_or(60).clamp(20, 160);
+    let height = call.height.unwrap_or(30).clamp(10, 80);
+    let timeout_secs = call
+        .timeout_secs
+        .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000));
+    let timeout_hint = timeout_secs.or(Some(TOOL_TIMEOUT_SECS));
+
+    if has_cmd("chafa") {
+        let size_arg = format!("--size={width}x{height}");
+        let args: Vec<String> = vec![
+            "--colors=none".to_string(),
+            "--format=symbols".to_string(),
+            size_arg,
+            path.clone(),
+        ];
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let (mut cmd, timeout_used) =
+            build_command_with_optional_timeout("chafa", &args_ref, timeout_secs);
+        let out = cmd
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .output()
+            .with_context(|| format!("chafa 执行失败：{path}"))?;
+        let elapsed = started.elapsed();
+        let code = status_code(out.status.code());
+        let timed_out = timeout_used && is_timeout_status(code);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = collect_output(&stdout, &stderr);
+        let body = annotate_timeout(truncate_command_output(combined.clone()), timed_out, timeout_hint);
+        let body = annotate_nonzero_exit(body, timed_out, code);
+        let truncated_by_lines = combined.lines().count() > OUTPUT_MAX_LINES;
+        let truncated_by_chars = combined.chars().count() > OUTPUT_MAX_CHARS;
+
+        // 若 chafa 输出巨大，保存完整内容供模型检索。
+        let total_bytes = out.stdout.len().saturating_add(out.stderr.len());
+        let need_save = total_bytes > IMAGE_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+        let saved_path = if need_save {
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let pid = unsafe { libc::getpid() };
+            let path2 = format!("{IMAGE_CACHE_DIR}/view_image_{ts}_{pid}.log");
+            if try_write_shell_cache_impl(IMAGE_CACHE_DIR, &path2, &out.stdout, &out.stderr) {
+                Some(path2)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut lines = Vec::new();
+        lines.push(format!("Image: {}", shorten_path(&path)));
+        lines.push(format!("Type: {mime}"));
+        lines.push(format!("Size: {size} bytes"));
+        lines.push(format!("Open: {}", if do_open { "true" } else { "false" }));
+        lines.push("---".to_string());
+        lines.push(body);
+        let mut log_lines = vec![format!(
+            "状态:{} | exit:{code} | 耗时:{}ms | path:{}",
+            status_label(code, timed_out),
+            elapsed.as_millis(),
+            shorten_path(&path)
+        )];
+        if let Some(p) = saved_path.as_deref() {
+            log_lines.push(format!("saved:{p}"));
+        }
+        let mut user_message = lines.join("\n");
+        if let Some(p) = saved_path {
+            user_message.push_str(&format!("\n\n[saved:{p}]"));
+        }
+        return Ok(ToolOutcome { user_message, log_lines });
+    }
+
+    let elapsed = started.elapsed();
+    let mut body = String::new();
+    body.push_str(&format!("Image: {}\n", shorten_path(&path)));
+    body.push_str(&format!("Type: {mime}\n"));
+    body.push_str(&format!("Size: {size} bytes\n"));
+    body.push_str(&format!("Open: {}\n", if do_open { "true" } else { "false" }));
+    body.push_str("---\n");
+    body.push_str("(no preview: install `chafa` to render ascii preview)\n");
+
+    Ok(ToolOutcome {
+        user_message: body.trim_end().to_string(),
         log_lines: vec![format!(
             "状态:0 | 耗时:{}ms | path:{}",
             elapsed.as_millis(),
@@ -5836,6 +5997,17 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
             }
             build_preview(&display, limit)
         }
+        "view_image" => {
+            let path = call.path.as_deref().unwrap_or(call.input.trim());
+            let mut display = display_tool_path(path);
+            let width = call.width.unwrap_or(60).clamp(20, 160);
+            let height = call.height.unwrap_or(30).clamp(10, 80);
+            display = format!("{display} {width}x{height}");
+            if call.open.unwrap_or(false) {
+                display.push_str(" open");
+            }
+            build_preview(&display, limit)
+        }
         "list_dir" => {
             let path = call.path.as_deref().unwrap_or(call.input.trim());
             build_preview(&display_tool_path(path), limit)
@@ -6004,6 +6176,7 @@ pub fn tool_display_label(tool: &str) -> String {
         "termux_api" => "Termux",
         "plan" | "work" => "Plan",
         "read_file" => "READ",
+        "view_image" => "Image",
         "write_file" => "Write",
         "list_dir" => "List",
         "stat_file" => "Info",

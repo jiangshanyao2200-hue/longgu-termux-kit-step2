@@ -25,15 +25,16 @@ cleanup_old_guards() {
   [[ "$keep" =~ ^[0-9]+$ ]] || return 0
   (( keep <= 0 )) && return 0
 
-  local -a guards=()
-  shopt -s nullglob
-  guards=("$LOG_DIR"/motd-guard-*)
-  shopt -u nullglob
-
-  ((${#guards[@]} <= keep)) && return 0
-
-  # Keep newest N by mtime; remove the rest.
-  ls -1t "$LOG_DIR"/motd-guard-* 2>/dev/null | tail -n +$((keep + 1)) | xargs -r rm -f -- 2>/dev/null || true
+  # Avoid glob expansion (ARG_MAX) and handle spaces safely.
+  local seen=0 name path
+  while IFS= read -r name; do
+    [[ "$name" == motd-guard-* ]] || continue
+    path="$LOG_DIR/$name"
+    [[ -f "$path" ]] || continue
+    seen=$((seen + 1))
+    (( seen > keep )) || continue
+    rm -f -- "$path" 2>/dev/null || true
+  done < <(LC_ALL=C ls -1t -- "$LOG_DIR" 2>/dev/null || true)
 }
 
 prune_keep_newest_files() {
@@ -43,12 +44,16 @@ prune_keep_newest_files() {
   [[ "$keep" =~ ^[0-9]+$ ]] || return 0
   (( keep <= 0 )) && return 0
 
-  shopt -s nullglob
-  local -a files=("$dir"/*)
-  shopt -u nullglob
-  ((${#files[@]} <= keep)) && return 0
-
-  ls -1t "$dir"/* 2>/dev/null | tail -n +$((keep + 1)) | xargs -r rm -f -- 2>/dev/null || true
+  # List newest-first without glob expansion; remove older files.
+  local seen=0 name path
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    path="$dir/$name"
+    [[ -f "$path" ]] || continue
+    seen=$((seen + 1))
+    (( seen > keep )) || continue
+    rm -f -- "$path" 2>/dev/null || true
+  done < <(LC_ALL=C ls -1t -- "$dir" 2>/dev/null || true)
 }
 
 trim_file_tail_bytes() {

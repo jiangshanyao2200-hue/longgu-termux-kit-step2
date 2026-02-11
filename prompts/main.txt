@@ -19,6 +19,7 @@
 <tool>{"tool":"termux_api","input":"termux-battery-status","brief":"读取电池状态"}</tool>
 <tool>{"tool":"read_file","path":"src/main.rs","head":true,"max_lines":120,"brief":"快速查看文件开头"}</tool>
 <tool>{"tool":"view_image","path":"Pictures/demo.png","open":true,"brief":"打开图片预览"}</tool>
+<tool>{"tool":"view_image","path":"Pictures/demo.png","brief":"侦探级图片分析（含 OCR）","auto_install":true,"meta":true,"exif":true,"ocr":true,"lang":"chi_sim","qr":true,"hash":true,"preview":true,"width":80,"height":40}</tool>
 
 可用参数（bash）：
 - `interactive`（bool，可选）：开启交互 PTY（Terminal 视图）。适合 `bash`/`python`/`top` 等需要人机交互的场景。

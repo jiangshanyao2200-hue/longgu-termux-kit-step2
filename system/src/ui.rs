@@ -3976,22 +3976,8 @@ fn markdown_to_logical_lines(text: &str, base_style: Style) -> Vec<StyledLogical
                 Tag::Emphasis => inline.emph += 1,
                 Tag::Strong => inline.strong += 1,
                 Tag::Strikethrough => inline.strike += 1,
-                Tag::Link { dest_url, .. } => {
+                Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
                     inline.link_href = Some(dest_url.to_string());
-                }
-                Tag::Image { dest_url, .. } => {
-                    // 以“图片块”降级显示：把 alt 文本按普通文本渲染，并在结尾追加 URL。
-                    inline.link_href = Some(dest_url.to_string());
-                    ensure_prefix(
-                        &mut current,
-                        base_style,
-                        in_code_block,
-                        quote_depth,
-                        in_item,
-                        &item_prefix,
-                        &item_cont_prefix,
-                    );
-                    push_text(&mut current, "[img:", base_style.fg(Color::DarkGray));
                 }
                 Tag::CodeBlock(_) => {
                     flush_line(&mut out, &mut current);
@@ -4047,7 +4033,7 @@ fn markdown_to_logical_lines(text: &str, base_style: Style) -> Vec<StyledLogical
                 TagEnd::Emphasis => inline.emph = inline.emph.saturating_sub(1),
                 TagEnd::Strong => inline.strong = inline.strong.saturating_sub(1),
                 TagEnd::Strikethrough => inline.strike = inline.strike.saturating_sub(1),
-                TagEnd::Link => {
+                TagEnd::Link | TagEnd::Image => {
                     if let Some(href) = inline.link_href.take() {
                         ensure_prefix(
                             &mut current,
@@ -4063,35 +4049,6 @@ fn markdown_to_logical_lines(text: &str, base_style: Style) -> Vec<StyledLogical
                             &format!(" ({href})"),
                             base_style.fg(Color::DarkGray),
                         );
-                    }
-                }
-                TagEnd::Image => {
-                    if let Some(href) = inline.link_href.take() {
-                        ensure_prefix(
-                            &mut current,
-                            base_style,
-                            in_code_block,
-                            quote_depth,
-                            in_item,
-                            &item_prefix,
-                            &item_cont_prefix,
-                        );
-                        push_text(
-                            &mut current,
-                            &format!("] ({href})"),
-                            base_style.fg(Color::DarkGray),
-                        );
-                    } else {
-                        ensure_prefix(
-                            &mut current,
-                            base_style,
-                            in_code_block,
-                            quote_depth,
-                            in_item,
-                            &item_prefix,
-                            &item_cont_prefix,
-                        );
-                        push_text(&mut current, "]", base_style.fg(Color::DarkGray));
                     }
                 }
                 TagEnd::CodeBlock => {

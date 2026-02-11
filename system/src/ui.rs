@@ -3976,7 +3976,7 @@ fn markdown_to_logical_lines(text: &str, base_style: Style) -> Vec<StyledLogical
                 Tag::Emphasis => inline.emph += 1,
                 Tag::Strong => inline.strong += 1,
                 Tag::Strikethrough => inline.strike += 1,
-                Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
+                Tag::Link { dest_url, .. } => {
                     inline.link_href = Some(dest_url.to_string());
                 }
                 Tag::CodeBlock(_) => {
@@ -4033,7 +4033,7 @@ fn markdown_to_logical_lines(text: &str, base_style: Style) -> Vec<StyledLogical
                 TagEnd::Emphasis => inline.emph = inline.emph.saturating_sub(1),
                 TagEnd::Strong => inline.strong = inline.strong.saturating_sub(1),
                 TagEnd::Strikethrough => inline.strike = inline.strike.saturating_sub(1),
-                TagEnd::Link | TagEnd::Image => {
+                TagEnd::Link => {
                     if let Some(href) = inline.link_href.take() {
                         ensure_prefix(
                             &mut current,

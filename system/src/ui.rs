@@ -49,6 +49,8 @@ pub fn fill_background(f: &mut ratatui::Frame, theme: &Theme, area: Rect) {
 const MAX_CHAT_BYTES: usize = 12_000;
 const USER_SUMMARY_LINE_THRESHOLD: usize = 5;
 const USER_SUMMARY_CHAR_THRESHOLD: usize = 800;
+// 系统消息统一“浅粉”显示：不跟随心跳 pulse，避免视觉语义混淆。
+const SYSTEM_PINK: Color = Color::Rgb(255, 160, 210);
 
 fn truncate_to_width(text: &str, max_cells: usize) -> String {
     if max_cells == 0 || text.is_empty() {
@@ -204,22 +206,75 @@ fn should_compact_user_message(text: &str) -> bool {
     lines >= USER_SUMMARY_LINE_THRESHOLD || chars >= USER_SUMMARY_CHAR_THRESHOLD
 }
 
-fn summarize_user_message(text: &str, max_cells: usize) -> String {
-    let lines = text.lines().count().max(1);
-    let chars = text.chars().count();
-    let tail = format!("...总行数：{lines} 字符数：{chars}");
-    let tail_w = UnicodeWidthStr::width(tail.as_str());
-    let avail = max_cells.saturating_sub(tail_w);
-    let preview = if avail > 0 {
-        truncate_to_width(&compact_ws(text), avail)
-    } else {
-        String::new()
-    };
-    if preview.is_empty() {
-        format!("总行数：{lines} 字符数：{chars}")
-    } else {
-        format!("{preview}{tail}")
+fn render_user_preview_lines(text: &str, width: usize, expanded: bool) -> Vec<String> {
+    const MAX_LINES: usize = 3;
+    let width = width.max(1);
+    let lines_total = text.lines().count().max(1);
+    let chars_total = text.chars().count();
+    let is_paste = should_compact_user_message(text);
+
+    // paste/长文本：永远不展示原文；展开/收起只影响“信息量”（仍然不显示原文）。
+    if is_paste {
+        let collapsed = format!("粘贴内容（已隐藏）总行数：{lines_total} 字符数：{chars_total}");
+        let expanded_text = format!(
+            "粘贴内容（已隐藏原文）\n总行数：{lines_total}  字符数：{chars_total}\n（展开也不显示原文）"
+        );
+        let src = if expanded { expanded_text } else { collapsed };
+        let mut out: Vec<String> = Vec::new();
+        for line in src.lines() {
+            for wrapped in wrap_plain_line(line, width) {
+                out.push(wrapped);
+                if out.len() >= MAX_LINES {
+                    return out;
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(String::new());
+        }
+        return out;
     }
+
+    // 普通用户消息：最多显示 3 行；展开时用“最后一行”给出简短统计，仍不展示更多原文。
+    let content_max = if expanded { 2 } else { 3 };
+    let mut out: Vec<String> = Vec::new();
+    let mut truncated = false;
+    let mut produced = 0usize;
+    for raw_line in text.lines() {
+        for wrapped in wrap_plain_line(raw_line, width) {
+            if produced >= content_max {
+                truncated = true;
+                break;
+            }
+            out.push(wrapped);
+            produced += 1;
+        }
+        if produced >= content_max {
+            // 检测是否还有剩余内容
+            if raw_line != text.lines().last().unwrap_or("") {
+                truncated = true;
+            }
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    if expanded && out.len() < MAX_LINES {
+        let tail = if truncated {
+            format!("…已隐藏后续内容｜总行数：{lines_total} 字符数：{chars_total}")
+        } else {
+            format!("总行数：{lines_total} 字符数：{chars_total}")
+        };
+        for wrapped in wrap_plain_line(&tail, width) {
+            out.push(wrapped);
+            if out.len() >= MAX_LINES {
+                break;
+            }
+        }
+    }
+    out.truncate(MAX_LINES);
+    out
 }
 
 fn truncate_by_chars(text: &str, limit: usize) -> String {
@@ -615,12 +670,12 @@ fn build_plan_panel_lines(
     let header_w = UnicodeWidthStr::width(header.as_str());
     // 顶部：居左固定标题，右侧用浅色横线补齐（更稳定，不会随宽度抖动居中）。
     let mut top_spans: Vec<Span<'static>> = Vec::new();
-    top_spans.push(Span::styled(
-        truncate_to_width(&header, w),
-        label_style,
-    ));
+    top_spans.push(Span::styled(truncate_to_width(&header, w), label_style));
     if header_w < w {
-        top_spans.push(Span::styled("─".repeat(w.saturating_sub(header_w)), dim_style));
+        top_spans.push(Span::styled(
+            "─".repeat(w.saturating_sub(header_w)),
+            dim_style,
+        ));
     }
     lines.push(Line::from(top_spans));
 
@@ -741,7 +796,9 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
     let saved = extract_tool_saved_path(text);
     let status = extract_tool_status_token(text);
     let status_lower = status.as_deref().unwrap_or("").trim().to_ascii_lowercase();
-    let timed_out = status.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("timeout"))
+    let timed_out = status
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("timeout") || s.eq_ignore_ascii_case("ok_timeout"))
         || text.contains("【Timed out】")
         || text.contains("Timed out and terminated");
     let failed_line = tool_status_result_line(text);
@@ -757,8 +814,14 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
             (&["timed out", "timeout"], "Timeout"),
             (&["not found"], "Not found"),
             (&["format error", "格式错误"], "Format error"),
-            (&["缺少 brief", "缺少 input", "缺少 pattern", "缺少 path"], "Missing field"),
-            (&["root path does not exist", "根路径不存在"], "Root path not found"),
+            (
+                &["缺少 brief", "缺少 input", "缺少 pattern", "缺少 path"],
+                "Missing field",
+            ),
+            (
+                &["root path does not exist", "根路径不存在"],
+                "Root path not found",
+            ),
             (&["binary file", "二进制"], "Binary file"),
         ];
         for (needles, reason) in mapping {
@@ -889,7 +952,18 @@ fn tool_status_result_line(text: &str) -> Option<String> {
     if ok {
         None
     } else {
-        Some(format!("执行失败：{token}"))
+        // 特殊状态：不应渲染为“执行失败”，而应汇报当前情况。
+        match t.as_str() {
+            "timeout" => {
+                Some("状态：timeout（已达超时阈值；输出可能不完整，可查看 saved 日志）".to_string())
+            }
+            "adb_offline" => Some(
+                "状态：adb_offline（设备未连接/离线；可先 adb connect 或检查数据线/授权）"
+                    .to_string(),
+            ),
+            "format_error" => Some(format!("格式错误：{token}")),
+            _ => Some(format!("执行失败：{token}")),
+        }
     }
 }
 
@@ -1261,7 +1335,10 @@ fn normalize_tool_display(tool: &str, raw_cmd: &str) -> (String, String) {
         return (tool_name, normalize_memory_target(&cmd));
     }
 
-    if matches!(tool_key, "Run" | "bash" | "Bash" | "BASH" | "Shell" | "Termux") {
+    if matches!(
+        tool_key,
+        "Run" | "bash" | "Bash" | "BASH" | "Shell" | "Termux"
+    ) {
         return (tool_name, cmd);
     }
 
@@ -1474,8 +1551,7 @@ fn render_tool_detail_lines(
     let pipe_style = Style::default().fg(theme.dim).bg(theme.bg);
     let content_style = Style::default().fg(theme.fg).bg(theme.bg);
 
-    let mut push_section =
-        |title: &str, lines: &[String], max_lines: usize, max_chars: usize| {
+    let mut push_section = |title: &str, lines: &[String], max_lines: usize, max_chars: usize| {
         if lines.is_empty() {
             return;
         }
@@ -1547,8 +1623,16 @@ fn render_tool_detail_lines(
         }
     };
 
-    let out_cap = if full { DETAIL_OUTPUT_MAX_LINES } else { OUTPUT_MAX_LINES };
-    let meta_cap = if full { DETAIL_META_MAX_LINES } else { META_MAX_LINES };
+    let out_cap = if full {
+        DETAIL_OUTPUT_MAX_LINES
+    } else {
+        OUTPUT_MAX_LINES
+    };
+    let meta_cap = if full {
+        DETAIL_META_MAX_LINES
+    } else {
+        META_MAX_LINES
+    };
     push_section("output", &output_lines, out_cap, HARD_MAX_SECTION_CHARS);
     push_section("meta", &meta_lines, meta_cap, HARD_MAX_SECTION_CHARS / 2);
     out
@@ -1611,6 +1695,59 @@ pub fn draw_command_menu(
         let prefix = if is_sel { "› " } else { "  " };
         let cmd = pad_to_width(it.cmd, cmd_col_w);
         let raw = format!("{prefix}{cmd}  {}", it.desc);
+        let text = truncate_to_width(&raw, inner_w);
+        lines.push(Line::from(vec![Span::styled(text, style)]));
+    }
+
+    let p = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::NONE))
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, area);
+}
+
+#[derive(Debug, Clone)]
+pub struct OwnedMenuItem {
+    pub left: String,
+    pub right: String,
+}
+
+pub fn draw_owned_menu(
+    f: &mut ratatui::Frame,
+    theme: &Theme,
+    area: Rect,
+    items: &[OwnedMenuItem],
+    selected: usize,
+) {
+    if items.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, area);
+    let bg_block = Block::default().style(Style::default().bg(theme.bg));
+    f.render_widget(bg_block, area);
+
+    let inner_w = area.width.max(1) as usize;
+    let max_items = area.height.max(1) as usize;
+    let left_col_w = items
+        .iter()
+        .take(max_items)
+        .map(|it| UnicodeWidthStr::width(it.left.as_str()))
+        .max()
+        .unwrap_or(0);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, it) in items.iter().take(max_items).enumerate() {
+        let is_sel = i == selected;
+        let style = if is_sel {
+            Style::default()
+                .fg(theme.sel_fg)
+                .bg(theme.sel_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        };
+        let prefix = if is_sel { "› " } else { "  " };
+        let left = pad_to_width(&it.left, left_col_w);
+        let raw = format!("{prefix}{left}  {}", it.right);
         let text = truncate_to_width(&raw, inner_w);
         lines.push(Line::from(vec![Span::styled(text, style)]));
     }
@@ -1836,7 +1973,11 @@ pub fn draw_settings_status(
         SettingsFocus::Input => "输入编辑",
         SettingsFocus::Prompt => "提示词编辑",
     };
-    let display = if hint.trim().is_empty() { label } else { hint.trim() };
+    let display = if hint.trim().is_empty() {
+        label
+    } else {
+        hint.trim()
+    };
     let max_w = area.width.max(1) as usize;
     // 与聊天页的“输入状态栏”统一：左侧圆点 + 文本（偏灰），避免蓝色跑马/强对比打扰。
     let dot = "";
@@ -2146,14 +2287,14 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         if keywords.iter().any(|k| lower.starts_with(k)) {
             return true;
         }
-        matches!(mode, Mode::Generating | Mode::ExecutingTool | Mode::ApprovingTool)
+        matches!(
+            mode,
+            Mode::Generating | Mode::ExecutingTool | Mode::ApprovingTool
+        )
     }
 
     if should_animate_status_dots(&body, mode) {
-        let base = body
-            .trim_end_matches('…')
-            .trim_end_matches('.')
-            .to_string();
+        let base = body.trim_end_matches('…').trim_end_matches('.').to_string();
         // 速度偏快：手机小屏上更像“活跃指示”，但不至于闪烁刺眼。
         let phase = (tick / 6) % 3;
         let dots = match phase {
@@ -2620,6 +2761,38 @@ impl ChatRenderCache {
             .any(|s| s.as_ref().is_some_and(|st| !st.segments.is_empty()))
     }
 
+    // 将指定消息的“乱码动画”推进到尾部（相当于“立刻完成”）。
+    // 适用于：UI 临时切到 PTY 视图导致聊天未渲染，回到聊天后不应重播历史动画。
+    pub fn fast_forward_scramble_to_tail(&mut self, idx: usize, text: &str) {
+        let new_len = text.chars().count();
+        let Some(slot) = self.scramble.get_mut(idx) else {
+            return;
+        };
+        let state = slot.get_or_insert_with(Default::default);
+        state.last_len = new_len;
+        state.segments.clear();
+    }
+
+    // 将指定 plan 的“打字机”推进到尾部（立刻完成）。
+    pub fn fast_forward_plan_reveal_to_tail(&mut self, idx: usize, text: &str) {
+        let total = text.lines().count().max(1);
+        let Some(slot) = self.plan_reveal.get_mut(idx) else {
+            return;
+        };
+        let state = slot.get_or_insert_with(Default::default);
+        state.last_total_lines = total;
+        state.born_tick = 0;
+    }
+
+    // 将当前聊天中所有可动画项推进到尾部（立刻完成），确保“仅在流式尾部”才播放动画。
+    pub fn fast_forward_all_animations_to_tail(&mut self, core: &Core) {
+        for (idx, msg) in core.history.iter().enumerate() {
+            self.fast_forward_scramble_to_tail(idx, &msg.text);
+            // plan 动画只对 plan 工具消息生效；此处对所有 idx 做“完成态”兜底也无害。
+            self.fast_forward_plan_reveal_to_tail(idx, &msg.text);
+        }
+    }
+
     fn update_scramble_state(&mut self, idx: usize, text: &str, tick: usize, active: bool) {
         const MIN_DELAY_FRAMES: usize = 1;
         const CHARS_PER_FRAME: usize = 4;
@@ -2748,7 +2921,13 @@ impl ChatRenderCache {
         }
     }
 
-    fn plan_reveal_text(&self, idx: usize, text: &str, tick: usize, active: bool) -> Option<String> {
+    fn plan_reveal_text(
+        &self,
+        idx: usize,
+        text: &str,
+        tick: usize,
+        active: bool,
+    ) -> Option<String> {
         const LINES_PER_FRAME: usize = 6; // 快速“打字机”，避免突现
         let state = self.plan_reveal.get(idx).and_then(|s| s.as_ref())?;
         // born_tick=0 表示无需动画
@@ -2803,10 +2982,11 @@ fn render_message_lines(
     color: Color,
     base_style: Style,
     reveal_len: Option<usize>,
+    user_expanded: bool,
 ) -> Vec<Line<'static>> {
     let prefix = format!("{dot} ");
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-    let prefix_style = if msg.role == Role::User {
+    let prefix_style = if matches!(msg.role, Role::User | Role::System) {
         Style::default()
             .fg(color)
             .bg(theme.bg)
@@ -2814,23 +2994,72 @@ fn render_message_lines(
     } else {
         Style::default().fg(color).bg(theme.bg)
     };
-    if msg.role == Role::User && should_compact_user_message(&msg.text) {
-        let summary = summarize_user_message(&msg.text, width.saturating_sub(prefix_width));
-        let summary = if let Some(reveal_len) = reveal_len {
-            truncate_by_chars(&summary, reveal_len)
+    if msg.role == Role::User {
+        let content_width = width.saturating_sub(prefix_width).max(1);
+        let preview = render_user_preview_lines(&msg.text, content_width, user_expanded);
+        let preview = if let Some(reveal_len) = reveal_len {
+            let joined = preview.join("\n");
+            truncate_by_chars(&joined, reveal_len)
+                .lines()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         } else {
-            summary
+            preview
         };
-        return vec![Line::from(vec![
-            Span::styled(prefix, prefix_style),
-            Span::styled(summary, base_style),
-        ])];
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let mut it = preview.into_iter();
+        if let Some(first) = it.next() {
+            out.push(Line::from(vec![
+                Span::styled(prefix, prefix_style),
+                Span::styled(first, base_style),
+            ]));
+        }
+        for line in it {
+            out.push(Line::from(vec![
+                Span::styled(" ".repeat(prefix_width), Style::default().bg(theme.bg)),
+                Span::styled(line, base_style),
+            ]));
+        }
+        return out;
     }
     let display = if let Some(reveal_len) = reveal_len {
         Cow::Owned(truncate_by_chars(&msg.text, reveal_len))
     } else {
         truncate_for_ui(&msg.text)
     };
+
+    // system：统一“左对齐”的排版（避免长前缀导致正文被缩进到屏幕中间）。
+    // - 首行仅显示系统标签：`♡ · 系统信息`
+    // - 正文从下一行开始，以小缩进渲染（依然是粗体浅粉）
+    if msg.role == Role::System {
+        let label = "♡ · 系统信息";
+        let indent = "  ";
+        let indent_w = UnicodeWidthStr::width(indent);
+        let rendered =
+            render_markdown_to_lines(&display, width.saturating_sub(indent_w).max(1), base_style);
+        if rendered.is_empty() {
+            return vec![Line::from(vec![Span::styled(
+                label.to_string(),
+                prefix_style,
+            )])];
+        }
+        let mut out = Vec::new();
+        out.push(Line::from(vec![Span::styled(
+            label.to_string(),
+            prefix_style,
+        )]));
+        for line in rendered {
+            let mut spans = Vec::new();
+            spans.push(Span::styled(
+                indent.to_string(),
+                Style::default().bg(theme.bg),
+            ));
+            spans.extend(line.spans);
+            out.push(Line::from(spans));
+        }
+        return out;
+    }
+
     let rendered =
         render_markdown_to_lines(&display, width.saturating_sub(prefix_width), base_style);
     if rendered.is_empty() {
@@ -2874,6 +3103,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
         tick,
         selected_msg_idx,
         expanded_tool_idxs,
+        expanded_user_idxs,
         thinking_idx,
         expanded_thinking_idxs,
         details_mode,
@@ -3023,7 +3253,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     }),
                 };
                 let mut rendered = render_message_lines(
-                    theme, &think_msg, width, dot, dot_color, base_style, None,
+                    theme, &think_msg, width, dot, dot_color, base_style, None, false,
                 );
                 if selected {
                     if let Some(first) = rendered.get_mut(0) {
@@ -3048,11 +3278,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 if tool_raw.eq_ignore_ascii_case("plan") {
                     let line_idx = out.len();
                     let status = extract_tool_status_token(&msg.text);
-                    let status_lower = status
-                        .as_deref()
-                        .unwrap_or("")
-                        .trim()
-                        .to_ascii_lowercase();
+                    let status_lower = status.as_deref().unwrap_or("").trim().to_ascii_lowercase();
                     let mut running = matches!(
                         status_lower.as_str(),
                         "parsing" | "preview" | "running" | "in_progress" | "processing"
@@ -3087,7 +3313,12 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     let plan_active =
                         streaming_enabled && (running || msg_idx + 1 >= core.history.len());
                     if streaming_enabled {
-                        render_cache.update_plan_reveal_state(msg_idx, &formatted_raw, tick, plan_active);
+                        render_cache.update_plan_reveal_state(
+                            msg_idx,
+                            &formatted_raw,
+                            tick,
+                            plan_active,
+                        );
                     }
                     let revealed = if streaming_enabled {
                         render_cache.plan_reveal_text(msg_idx, &formatted_raw, tick, plan_active)
@@ -3097,7 +3328,8 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     let body_display = revealed.as_deref().unwrap_or(formatted_raw.as_str());
                     let animated_plan = revealed.is_some();
 
-                    let lines = build_plan_panel_lines(theme, width, is_end, running, body_display, tick);
+                    let lines =
+                        build_plan_panel_lines(theme, width, is_end, running, body_display, tick);
 
                     if reveal_idx != Some(msg_idx) && !animated_plan && !running {
                         if let Some(slot) = render_cache.per_msg.get_mut(msg_idx) {
@@ -3158,7 +3390,10 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     for (idx, chunk) in brief_chunks.iter().enumerate() {
                         if idx == 0 {
                             lines.push(Line::from(vec![
-                                Span::styled(head.clone(), Style::default().fg(theme.fg).bg(theme.bg)),
+                                Span::styled(
+                                    head.clone(),
+                                    Style::default().fg(theme.fg).bg(theme.bg),
+                                ),
                                 Span::styled(
                                     tool_name.clone(),
                                     Style::default()
@@ -3166,7 +3401,10 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                                         .bg(theme.bg)
                                         .add_modifier(Modifier::BOLD),
                                 ),
-                                Span::styled(suffix.clone(), Style::default().fg(theme.fg).bg(theme.bg)),
+                                Span::styled(
+                                    suffix.clone(),
+                                    Style::default().fg(theme.fg).bg(theme.bg),
+                                ),
                                 Span::styled(sep, Style::default().fg(theme.dim).bg(theme.bg)),
                                 Span::styled(chunk.clone(), brief_style),
                             ]));
@@ -3201,13 +3439,19 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     for (idx, chunk) in cmd_chunks.iter().enumerate() {
                         if idx == 0 {
                             lines.push(Line::from(vec![
-                                Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                                Span::styled(
+                                    indent.clone(),
+                                    Style::default().fg(theme.dim).bg(theme.bg),
+                                ),
                                 Span::styled("↳ ", arrow_style),
                                 Span::styled(chunk.clone(), cmd_style),
                             ]));
                         } else {
                             lines.push(Line::from(vec![
-                                Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                                Span::styled(
+                                    indent.clone(),
+                                    Style::default().fg(theme.dim).bg(theme.bg),
+                                ),
                                 Span::styled("  ", Style::default().fg(theme.dim).bg(theme.bg)),
                                 Span::styled(chunk.clone(), cmd_style),
                             ]));
@@ -3234,7 +3478,10 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                             continue;
                         }
                         lines.push(Line::from(vec![
-                            Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                            Span::styled(
+                                indent.clone(),
+                                Style::default().fg(theme.dim).bg(theme.bg),
+                            ),
                             Span::styled(chunk, Style::default().fg(theme.dim).bg(theme.bg)),
                         ]));
                     }
@@ -3298,15 +3545,11 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 if chunks.len() > TARGET_WRAP_MAX_LINES
                     && TARGET_WRAP_HEAD_LINES + TARGET_WRAP_TAIL_LINES < chunks.len()
                 {
-                    let omitted =
-                        chunks.len().saturating_sub(TARGET_WRAP_HEAD_LINES + TARGET_WRAP_TAIL_LINES);
+                    let omitted = chunks
+                        .len()
+                        .saturating_sub(TARGET_WRAP_HEAD_LINES + TARGET_WRAP_TAIL_LINES);
                     let mut clipped: Vec<String> = Vec::new();
-                    clipped.extend(
-                        chunks
-                            .iter()
-                            .take(TARGET_WRAP_HEAD_LINES)
-                            .cloned(),
-                    );
+                    clipped.extend(chunks.iter().take(TARGET_WRAP_HEAD_LINES).cloned());
                     clipped.push(format!("... [truncated {omitted} lines]"));
                     clipped.extend(
                         chunks
@@ -3469,19 +3712,30 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 };
                 (dot, theme.cyan)
             }
-            Role::System => {
-                ("·", theme.dim)
-            }
+            Role::System => ("♡", SYSTEM_PINK),
             Role::Tool => ("◇", theme.yellow),
         };
-        let dot_color = pulse_color.unwrap_or(color);
-        let fg_color = pulse_color.unwrap_or(match msg.role {
-            Role::User => Color::White,
-            Role::Assistant => theme.fg,
-            Role::System => theme.dim,
-            Role::Tool => theme.yellow,
-        });
+        let dot_color = if msg.role == Role::System {
+            color
+        } else {
+            pulse_color.unwrap_or(color)
+        };
+        let fg_color = if msg.role == Role::System {
+            color
+        } else {
+            pulse_color.unwrap_or(match msg.role {
+                Role::User => Color::White,
+                Role::Assistant => theme.fg,
+                Role::System => SYSTEM_PINK,
+                Role::Tool => theme.yellow,
+            })
+        };
         let base_style = if msg.role == Role::User {
+            Style::default()
+                .fg(fg_color)
+                .bg(theme.bg)
+                .add_modifier(Modifier::BOLD)
+        } else if msg.role == Role::System {
             Style::default()
                 .fg(fg_color)
                 .bg(theme.bg)
@@ -3506,6 +3760,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
         };
         let msg_ref_base: &crate::Message = decorated.as_ref().unwrap_or(msg);
         let msg_ref: &crate::Message = msg_ref_base;
+        let user_expanded = msg.role == Role::User && expanded_user_idxs.contains(&msg_idx);
 
         let mut rendered = if reveal_idx == Some(msg_idx) {
             render_message_lines(
@@ -3516,6 +3771,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 dot_color,
                 base_style,
                 Some(reveal_len),
+                user_expanded,
             )
         } else if let Some(lines) = render_cache
             .per_msg
@@ -3523,12 +3779,24 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             .and_then(|entry| entry.as_ref())
             && pulse.is_none()
             && !animated_assistant
+            && msg.role != Role::User
         {
             lines.clone()
         } else {
-            let lines =
-                render_message_lines(theme, msg_ref, width, dot, dot_color, base_style, None);
-            if !animated_assistant && let Some(slot) = render_cache.per_msg.get_mut(msg_idx) {
+            let lines = render_message_lines(
+                theme,
+                msg_ref,
+                width,
+                dot,
+                dot_color,
+                base_style,
+                None,
+                user_expanded,
+            );
+            if !animated_assistant
+                && msg.role != Role::User
+                && let Some(slot) = render_cache.per_msg.get_mut(msg_idx)
+            {
                 *slot = Some(lines.clone());
             }
             lines
@@ -3553,7 +3821,6 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
     }
 }
 
-
 pub struct BuildChatLinesArgs<'a> {
     pub theme: &'a Theme,
     pub core: &'a Core,
@@ -3565,6 +3832,7 @@ pub struct BuildChatLinesArgs<'a> {
     pub tick: usize,
     pub selected_msg_idx: Option<usize>,
     pub expanded_tool_idxs: &'a BTreeSet<usize>,
+    pub expanded_user_idxs: &'a BTreeSet<usize>,
     pub thinking_idx: Option<usize>,
     pub expanded_thinking_idxs: &'a BTreeSet<usize>,
     pub details_mode: bool,
@@ -3596,6 +3864,7 @@ mod tests {
 
         let mut cache = ChatRenderCache::new();
         let expanded_tools = BTreeSet::new();
+        let expanded_users = BTreeSet::new();
         let expanded_thinks = BTreeSet::new();
         let layout = build_chat_layout(BuildChatLinesArgs {
             theme: &theme,
@@ -3608,6 +3877,7 @@ mod tests {
             tick: 0,
             selected_msg_idx: None,
             expanded_tool_idxs: &expanded_tools,
+            expanded_user_idxs: &expanded_users,
             thinking_idx: Some(0),
             expanded_thinking_idxs: &expanded_thinks,
             // 新规则：简约模式默认隐藏已完成的思考；详情模式才回看。
@@ -3664,6 +3934,7 @@ mod tests {
 
         let mut cache = ChatRenderCache::new();
         let expanded_tools = BTreeSet::new();
+        let expanded_users = BTreeSet::new();
         let expanded_thinks = BTreeSet::new();
         let layout = build_chat_layout(BuildChatLinesArgs {
             theme: &theme,
@@ -3676,6 +3947,7 @@ mod tests {
             tick: 0,
             selected_msg_idx: None,
             expanded_tool_idxs: &expanded_tools,
+            expanded_user_idxs: &expanded_users,
             thinking_idx: None,
             expanded_thinking_idxs: &expanded_thinks,
             details_mode: false,

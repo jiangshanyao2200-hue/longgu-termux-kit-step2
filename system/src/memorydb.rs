@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use std::time::Duration;
 
 pub const DEFAULT_MEMO_DB_PATH: &str = "memory/memo.db";
 pub const DEFAULT_METAMEMO_PATH: &str = "memory/metamemo.jsonl";
@@ -84,6 +85,7 @@ impl MemoDb {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn append_datememo_content(&self, content: &str) -> Result<()> {
         let trimmed = content.trim();
         if trimmed.is_empty() {
@@ -115,11 +117,13 @@ impl MemoDb {
         Ok(row)
     }
 
+    #[allow(dead_code)]
     pub fn table_stats(&self, kind: MemoKind) -> Result<MemoStats> {
         let conn = self.connect()?;
         table_stats(&conn, kind.table())
     }
 
+    #[allow(dead_code)]
     pub fn read_by_index(
         &self,
         kind: MemoKind,
@@ -246,12 +250,60 @@ impl MemoDb {
         Ok((rows, total_hits.max(0) as usize, stats, min_date, max_date))
     }
 
+    /// 以 OR 语义拉取候选行（用于“按天聚合/多关键词”策略），返回 (date, content)。
+    /// 注意：这是低层查询，调用方需自行做按天聚合与输出预算控制。
+    pub fn fetch_entries_by_keywords_or(
+        &self,
+        kind: MemoKind,
+        keywords: &[String],
+        start: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+        limit_rows: usize,
+    ) -> Result<Vec<(String, String)>> {
+        if limit_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect()?;
+        let (mut clauses, mut params) = build_date_clause(start, end);
+        if !keywords.is_empty() {
+            let mut ors: Vec<String> = Vec::new();
+            for kw in keywords {
+                ors.push("LOWER(content) LIKE ?".to_string());
+                params.push(Value::from(format!("%{}%", kw.to_ascii_lowercase())));
+            }
+            clauses.push(format!("({})", ors.join(" OR ")));
+        }
+        let where_sql = if clauses.is_empty() {
+            "1=1".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        let mut params_with_limit = params;
+        params_with_limit.push(Value::from(limit_rows as i64));
+        let sql = format!(
+            "SELECT date, content FROM {} WHERE {} ORDER BY id LIMIT ?",
+            kind.table(),
+            where_sql
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let iter = stmt.query_map(params_from_iter(params_with_limit), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut rows = Vec::new();
+        for row in iter {
+            rows.push(row?);
+        }
+        Ok(rows)
+    }
+
     fn connect(&self) -> Result<Connection> {
         if let Some(dir) = self.db_path.parent() {
             fs::create_dir_all(dir).ok();
         }
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("打开记忆数据库失败：{}", self.db_path.display()))?;
+        // 可靠性：避免并发写入/索引迁移时短暂锁定导致工具直接失败。
+        let _ = conn.busy_timeout(Duration::from_millis(1200));
         init_schema(&conn)?;
         Ok(conn)
     }

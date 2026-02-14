@@ -72,6 +72,7 @@ const HEARTBEAT_CYCLES: u64 = 2;
 const HEARTBEAT_BANNER: &str = "♡";
 const PTY_SCROLLBACK_MAX: u16 = 3000;
 const PTY_SNAPSHOT_MAX_CHARS: usize = 8000;
+const PTY_DOUBLE_ESC_MS: u64 = 350;
 // 交互 PTY：结束时回传给模型的“可读输出”预算（防止撑爆上下文）。
 const PTY_RETURN_SCREEN_MAX_CHARS: usize = 12_000;
 const PTY_RETURN_RAW_TAIL_BYTES: u64 = 64 * 1024;
@@ -79,7 +80,7 @@ const PTY_RETURN_RAW_TAIL_MAX_CHARS: usize = 6_000;
 const PTY_RETURN_STDIN_MAX_CHARS: usize = 2_000;
 const PTY_DONE_BATCH_TOOL_MAX_CHARS: usize = 14_000;
 const PTY_DONE_BATCH_TAIL_MAX_CHARS: usize = 1_600;
-const WELCOME_SHORTCUTS: &str = "欢迎使用 Project Ying（萤）。\n\n快捷键（聊天页）：\n- ↑/↓：滚动历史（输入中也可）\n- Ctrl+↑/Ctrl+↓：输入框内多行光标上下\n- PgUp/PgDn：选择消息（输入框为空时；PTY 启用时切换焦点）\n- Home：退出选择；若 Terminal 存在则打开/隐藏\n- ←/→：展开/收起（选中消息时：思考/工具详情/用户折叠）\n- Tab：全部展开/全部收起（输入框为空时）\n- Shift+Tab：详情/简约模式\n\nTerminal（PTY）：\n- PgUp/PgDn：切换终端任务（多 PTY tab）\n- Home：返回聊天 / 再按打开终端\n- Esc：发送给终端内程序\n- （兼容）350ms 内快速连按两次 Esc：结束当前终端任务\n- Ctrl+Home：强制结束当前终端任务\n- Alt+↑：同步终端画面（快照）给 AI";
+const WELCOME_SHORTCUTS: &str = "欢迎使用 Project Ying（萤）。\n\n快捷键（聊天页）：\n- ↑/↓：滚动历史（输入中也可）\n- Ctrl+↑/Ctrl+↓：输入框多行光标上下\n- PgUp/PgDn：输入空→选消息；PTY 开→切终端 tab\n- Home：退出选择；若有 Terminal 则切显隐\n- ←/→：展开/收起（选中消息时）\n- Tab：全部展开/全部收起（输入空时）\n- Shift+Tab：详情/简约模式\n- Alt+Enter：忙时强发送入队（最低优先）\n- Alt+↑：队列（↑↓选 / Enter编辑 / Home退 / 编辑Alt+↓保存）\n\nTerminal（PTY）：\n- Home：打开/隐藏 Terminal（后台继续）\n- PgUp/PgDn：切换终端 tab\n- Esc：发给终端；Esc×2(350ms) 结束任务\n- Ctrl+Home：强制结束当前任务\n- Alt+↑：同步终端快照给 AI";
 const MODEL_RESPONSE_TIMEOUT_CAP_SECS: u64 = 7 * 60;
 // DeepSeek chat/completions 没有 tool role，且部分提供方对“最后一条消息 role”很敏感：
 // - 若最后是 assistant（或 system），可能报 400（如 Invalid consecutive assistant message）
@@ -2984,6 +2985,66 @@ fn load_pty_audit_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, Pat
     (text, err, path)
 }
 
+const DEFAULT_PTY_HELP_PROMPT: &str = "Terminal（PTY）已启动：\n- Home：打开/隐藏 Terminal 视图（后台继续运行）\n- Esc：发送给终端内程序（例如退出 vim/less）\n- （兼容）{DOUBLE_ESC_MS}ms 内快速连按两次 Esc：结束当前终端任务（终止 PTY）\n- Ctrl+Home：强制结束当前终端任务\n- PgUp/PgDn：切换不同终端任务（多 PTY tab）\n- Alt+↑：同步当前终端画面（快照）给 AI\n";
+
+fn load_pty_help_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
+    let path = resolve_config_path(&sys_cfg.pty_help_prompt_path, true);
+    let (text, err) = load_prompt_file_with_default(&path, DEFAULT_PTY_HELP_PROMPT, "PTY-HELP");
+    (text, err, path)
+}
+
+fn render_pty_help_prompt(template: &str, double_esc_ms: u64) -> String {
+    let t = template.trim();
+    let tpl = if t.is_empty() {
+        DEFAULT_PTY_HELP_PROMPT
+    } else {
+        t
+    };
+    tpl.replace("{DOUBLE_ESC_MS}", &double_esc_ms.to_string())
+}
+
+const DEFAULT_PTY_STARTED_NOTICE_PROMPT: &str = "PTY 已启动（后台运行）。\njob_id:{JOB_ID} | owner:{OWNER}\ncwd:{CWD}\ncmd:\n```sh\n{CMD}\n```\nlog:{LOG_PATH}\nstatus:{STATUS_PATH}\n\n说明：终端会继续运行，你可以继续和 AI 聊天；需要交互时按 Home 打开 Terminal 视图。\n\n提示：\n- 如需查看输出/交互：按 Home 打开 Terminal；任务结束后会自动关闭并汇总回传。\n- 如需读取日志/状态：请直接使用上方给出的 log/status 路径，不要猜文件名。\n\n{INITIAL_PREVIEW_BLOCK}\n";
+
+fn load_pty_started_notice_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
+    let path = resolve_config_path(&sys_cfg.pty_started_notice_prompt_path, true);
+    let (text, err) =
+        load_prompt_file_with_default(&path, DEFAULT_PTY_STARTED_NOTICE_PROMPT, "PTY-START");
+    (text, err, path)
+}
+
+fn render_pty_started_notice_prompt(args: PtyStartedNotice<'_>, template: &str) -> String {
+    let t = template.trim();
+    let tpl = if t.is_empty() {
+        DEFAULT_PTY_STARTED_NOTICE_PROMPT
+    } else {
+        t
+    };
+    let owner_label = if matches!(args.owner, MindKind::Sub) {
+        "dog"
+    } else {
+        "main"
+    };
+    let cmd = args.cmd.trim();
+    let cmd = if cmd.is_empty() { "(empty)" } else { cmd };
+    let initial_preview_block = if args.initial_preview.trim().is_empty() {
+        "".to_string()
+    } else {
+        format!(
+            "[初步输出]\n```text\n{}\n```",
+            args.initial_preview.trim_end()
+        )
+    };
+    tpl.replace("{OWNER}", owner_label)
+        .replace("{JOB_ID}", &args.job_id.to_string())
+        .replace("{CWD}", args.cwd_display)
+        .replace("{CMD}", &truncate_with_suffix(cmd, 2000))
+        .replace("{LOG_PATH}", args.saved_path)
+        .replace("{STATUS_PATH}", args.status_path)
+        .replace("{INITIAL_PREVIEW_BLOCK}", &initial_preview_block)
+        .trim_end()
+        .to_string()
+}
+
 fn render_pty_audit_prompt(
     template: &str,
     owner: MindKind,
@@ -5306,33 +5367,16 @@ struct PtyStartedNotice<'a> {
     initial_preview: &'a str,
 }
 
-fn build_pty_started_notice(args: PtyStartedNotice<'_>) -> String {
-    let cmd = args.cmd.trim();
-    let cmd = if cmd.is_empty() { "(empty)" } else { cmd };
-    let mut out = String::new();
-    out.push_str("PTY 已启动（后台运行）。\n");
-    out.push_str(&format!(
-        "job_id:{} | owner:{:?}\n",
-        args.job_id, args.owner
-    ));
-    out.push_str(&format!("cwd:{}\n", args.cwd_display));
-    out.push_str("cmd:\n```sh\n");
-    out.push_str(&truncate_with_suffix(cmd, 2000));
-    out.push_str("\n```\n");
-    out.push_str(&format!("log:{}\n", args.saved_path));
-    out.push_str(&format!("status:{}\n", args.status_path));
-    out.push_str(
-        "\n说明：终端会继续运行，你可以继续和 AI 聊天；需要交互时按 Home 打开 Terminal 视图。\n",
-    );
-    if !args.initial_preview.trim().is_empty() {
-        out.push_str("\n[初步输出]\n```text\n");
-        out.push_str(args.initial_preview.trim_end());
-        out.push_str("\n```\n");
-    }
-    out.trim_end().to_string()
+fn build_pty_started_notice(args: PtyStartedNotice<'_>, template: &str) -> String {
+    render_pty_started_notice_prompt(args, template)
 }
 
-fn spawn_tool_execution(call: ToolCall, owner: MindKind, tx: mpsc::Sender<AsyncEvent>) {
+fn spawn_tool_execution(
+    call: ToolCall,
+    owner: MindKind,
+    tx: mpsc::Sender<AsyncEvent>,
+    pty_started_notice_prompt_text: String,
+) {
     let _ = tx.send(AsyncEvent::ToolStreamStart {
         owner,
         call: Box::new(call.clone()),
@@ -5350,7 +5394,7 @@ fn spawn_tool_execution(call: ToolCall, owner: MindKind, tx: mpsc::Sender<AsyncE
         return;
     }
     if call.tool == "bash" && call.interactive.unwrap_or(false) {
-        spawn_interactive_bash_execution(call, owner, tx);
+        spawn_interactive_bash_execution(call, owner, tx, pty_started_notice_prompt_text);
         return;
     }
     thread::spawn(move || {
@@ -5829,7 +5873,12 @@ fn handle_send_text(
     Ok(())
 }
 
-fn spawn_interactive_bash_execution(call: ToolCall, owner: MindKind, tx: mpsc::Sender<AsyncEvent>) {
+fn spawn_interactive_bash_execution(
+    call: ToolCall,
+    owner: MindKind,
+    tx: mpsc::Sender<AsyncEvent>,
+    pty_started_notice_prompt_text: String,
+) {
     thread::spawn(move || {
         let cwd_display = std::env::current_dir()
             .ok()
@@ -6122,15 +6171,18 @@ fn spawn_interactive_bash_execution(call: ToolCall, owner: MindKind, tx: mpsc::S
                             s.retain(|ch| ch != '\u{0}');
                             truncate_with_suffix(s.trim(), 2200)
                         };
-                        let started_notice = build_pty_started_notice(PtyStartedNotice {
-                            owner,
-                            job_id,
-                            cmd: &cmd,
-                            saved_path: &saved_path,
-                            status_path: &status_path,
-                            cwd_display: &cwd_display,
-                            initial_preview: &initial_preview_text,
-                        });
+                        let started_notice = build_pty_started_notice(
+                            PtyStartedNotice {
+                                owner,
+                                job_id,
+                                cmd: &cmd,
+                                saved_path: &saved_path,
+                                status_path: &status_path,
+                                cwd_display: &cwd_display,
+                                initial_preview: &initial_preview_text,
+                            },
+                            &pty_started_notice_prompt_text,
+                        );
                         let started_outcome = ToolOutcome {
                             user_message: started_notice,
                             log_lines: vec![
@@ -6154,15 +6206,18 @@ fn spawn_interactive_bash_execution(call: ToolCall, owner: MindKind, tx: mpsc::S
                             s.retain(|ch| ch != '\u{0}');
                             truncate_with_suffix(s.trim(), 2200)
                         };
-                        let started_notice = build_pty_started_notice(PtyStartedNotice {
-                            owner,
-                            job_id,
-                            cmd: &cmd,
-                            saved_path: &saved_path,
-                            status_path: &status_path,
-                            cwd_display: &cwd_display,
-                            initial_preview: &initial_preview_text,
-                        });
+                        let started_notice = build_pty_started_notice(
+                            PtyStartedNotice {
+                                owner,
+                                job_id,
+                                cmd: &cmd,
+                                saved_path: &saved_path,
+                                status_path: &status_path,
+                                cwd_display: &cwd_display,
+                                initial_preview: &initial_preview_text,
+                            },
+                            &pty_started_notice_prompt_text,
+                        );
                         let started_outcome = ToolOutcome {
                             user_message: started_notice,
                             log_lines: vec![
@@ -6229,15 +6284,18 @@ fn spawn_interactive_bash_execution(call: ToolCall, owner: MindKind, tx: mpsc::S
                 s.retain(|ch| ch != '\u{0}');
                 truncate_with_suffix(s.trim(), 2200)
             };
-            let started_notice = build_pty_started_notice(PtyStartedNotice {
-                owner,
-                job_id,
-                cmd: &cmd,
-                saved_path: &saved_path,
-                status_path: &status_path,
-                cwd_display: &cwd_display,
-                initial_preview: &initial_preview_text,
-            });
+            let started_notice = build_pty_started_notice(
+                PtyStartedNotice {
+                    owner,
+                    job_id,
+                    cmd: &cmd,
+                    saved_path: &saved_path,
+                    status_path: &status_path,
+                    cwd_display: &cwd_display,
+                    initial_preview: &initial_preview_text,
+                },
+                &pty_started_notice_prompt_text,
+            );
             let started_outcome = ToolOutcome {
                 user_message: started_notice,
                 log_lines: vec![
@@ -6330,6 +6388,7 @@ struct TryStartNextToolArgs<'a> {
     sys_log_limit: usize,
     sys_cfg: &'a SystemConfig,
     owner: MindKind,
+    pty_started_notice_prompt_text: &'a str,
 }
 
 fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
@@ -6345,6 +6404,7 @@ fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
         sys_log_limit,
         sys_cfg,
         owner,
+        pty_started_notice_prompt_text,
     } = args;
     if matches!(*mode, Mode::ExecutingTool | Mode::ApprovingTool) {
         return true;
@@ -6366,7 +6426,7 @@ fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
         push_sys_log(sys_log, sys_log_limit, "等待工具确认");
         return true;
     }
-    spawn_tool_execution(call, owner, tx);
+    spawn_tool_execution(call, owner, tx, pty_started_notice_prompt_text.to_string());
     true
 }
 
@@ -7842,6 +7902,10 @@ fn run_loop(
         load_context_compact_prompt(&sys_cfg);
     let (pty_audit_prompt_text, pty_audit_prompt_err, _pty_audit_prompt_path) =
         load_pty_audit_prompt(&sys_cfg);
+    let (pty_help_prompt_text, pty_help_prompt_err, _pty_help_prompt_path) =
+        load_pty_help_prompt(&sys_cfg);
+    let (pty_started_notice_prompt_text, pty_started_notice_prompt_err, _pty_started_notice_path) =
+        load_pty_started_notice_prompt(&sys_cfg);
     let (fastmemo_compact_prompt_text, fastmemo_compact_prompt_err, _fastmemo_compact_prompt_path) =
         load_fastmemo_compact_prompt();
     let mut dog_state = DogState::new(dog_prompt, dog_cfg.prompt_reinject_pct);
@@ -8043,6 +8107,32 @@ fn run_loop(
             "PTY-AUDIT: 已载入提示词",
         );
     }
+    if let Some(err) = pty_help_prompt_err {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!("PTY-HELP: {err}"),
+        );
+    } else if pty_help_prompt_text.trim().is_empty() {
+        push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-HELP: 提示词为空");
+    } else {
+        push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-HELP: 已载入提示词");
+    }
+    if let Some(err) = pty_started_notice_prompt_err {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!("PTY-START: {err}"),
+        );
+    } else if pty_started_notice_prompt_text.trim().is_empty() {
+        push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-START: 提示词为空");
+    } else {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            "PTY-START: 已载入提示词",
+        );
+    }
     if let Some(err) = fastmemo_compact_prompt_err {
         push_sys_log(
             &mut sys_log,
@@ -8140,6 +8230,8 @@ fn run_loop(
     let mut send_queue_high: VecDeque<QueuedUserMessage> = VecDeque::new();
     let mut send_queue_low: VecDeque<QueuedUserMessage> = VecDeque::new();
     let mut send_queue_ui: SendQueueUiState = SendQueueUiState::Closed;
+    // 自动出队节流：避免“刚空闲就连发多条”让人类/模型都来不及反应。
+    let mut send_queue_dequeue_cooldown_until: Option<Instant> = None;
     let mut screen = Screen::Chat;
     let mut settings = SettingsState::new();
     let mut pty_tabs: Vec<PtyUiState> = Vec::new();
@@ -8234,6 +8326,8 @@ fn run_loop(
                 config: &config,
                 context_compact_prompt_text: &context_compact_prompt_text,
                 fastmemo_compact_prompt_text: &fastmemo_compact_prompt_text,
+                pty_help_prompt_text: &pty_help_prompt_text,
+                pty_started_notice_prompt_text: &pty_started_notice_prompt_text,
                 auto_fastmemo_compact: &mut auto_fastmemo_compact,
                 fastmemo_compact_inflight: &mut fastmemo_compact_inflight,
                 fastmemo_compact_edit_mask: &mut fastmemo_compact_edit_mask,
@@ -8293,9 +8387,78 @@ fn run_loop(
             };
         }
 
+        // PTY DONE（批量）回传：当一批后台终端全部结束后，统一把聚合后的 Tool result 交给模型继续处理。
+        // 优先级：工具/系统回执优先于“用户发送队列”，避免队列堆积导致回执延后。
+        // 约束：不与用户请求并发；若当前忙，则等待下一轮 tick。
+        if !pty_done_followups.is_empty()
+            && pty_tabs.is_empty()
+            && can_inject_heartbeat(
+                mode,
+                &active_request_id,
+                &pending_tools,
+                &pending_tool_confirm,
+                &active_tool_stream,
+            )
+        {
+            let owner = {
+                let front = &mut pty_done_followups[0];
+                if !front.pushed {
+                    core.push_tool(front.tool_text.clone());
+                    match front.owner {
+                        MindKind::Sub => dog_state.push_tool(&front.tool_text),
+                        _ => main_state.push_tool(&front.tool_text),
+                    }
+                    render_cache.invalidate(core.history.len().saturating_sub(1));
+                    front.pushed = true;
+                }
+                front.owner
+            };
+            let (client_ref, state_ref) = if matches!(owner, MindKind::Sub) {
+                (&dog_client, &dog_state)
+            } else {
+                (&main_client, &main_state)
+            };
+            if let Some(in_tokens) = try_start_dog_generation(TryStartDogGenerationArgs {
+                kind: owner,
+                dog_client: client_ref,
+                dog_state: state_ref,
+                extra_system: None,
+                tx: &tx,
+                config: &config,
+                mode: &mut mode,
+                active_kind: &mut active_kind,
+                sending_until: &mut sending_until,
+                sys_log: &mut sys_log,
+                sys_log_limit: config.sys_log_limit,
+                streaming_state: &mut streaming_state,
+                request_seq: &mut request_seq,
+                active_request_id: &mut active_request_id,
+                active_cancel: &mut active_cancel,
+                sse_enabled,
+            }) {
+                push_sys_log(
+                    &mut sys_log,
+                    config.sys_log_limit,
+                    "Terminal: done followup",
+                );
+                record_request_in_tokens(
+                    &mut core,
+                    &mut token_totals,
+                    &token_total_path,
+                    &context_usage,
+                    &mut active_request_in_tokens,
+                    in_tokens,
+                );
+                push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: batch ready");
+                pty_done_followups.pop_front();
+                needs_redraw = true;
+            }
+        }
+
         // 发送队列：空闲时自动出队（High 优先，Low 最低优先级）。
         // 约束：不与模型请求/工具并发；不抢占 diary/压缩流程；不与队列 UI 并发。
         if send_queue_len(&send_queue_high, &send_queue_low) > 0
+            && !send_queue_dequeue_cooldown_until.is_some_and(|t| now < t)
             && matches!(send_queue_ui, SendQueueUiState::Closed)
             && !diary_state.active()
             && !(main_state.ctx_compact_inflight || dog_state.ctx_compact_inflight)
@@ -8311,6 +8474,7 @@ fn run_loop(
                 .pop_front()
                 .or_else(|| send_queue_low.pop_front());
             if let Some(msg) = next {
+                send_queue_dequeue_cooldown_until = Some(now + Duration::from_millis(450));
                 push_sys_log(
                     &mut sys_log,
                     config.sys_log_limit,
@@ -8489,74 +8653,6 @@ fn run_loop(
                 next_heartbeat_at = now + heartbeat_interval(heartbeat_minutes_cache);
             } else {
                 next_heartbeat_at = now + heartbeat_interval(heartbeat_minutes_cache);
-            }
-        }
-
-        // PTY DONE（批量）回传：当一批后台终端全部结束后，统一把聚合后的 Tool result 交给模型继续处理。
-        // 约束：不与用户请求并发；若当前忙，则等待下一轮 tick。
-        if !pty_done_followups.is_empty()
-            && pty_tabs.is_empty()
-            && send_queue_len(&send_queue_high, &send_queue_low) == 0
-            && can_inject_heartbeat(
-                mode,
-                &active_request_id,
-                &pending_tools,
-                &pending_tool_confirm,
-                &active_tool_stream,
-            )
-        {
-            let owner = {
-                let front = &mut pty_done_followups[0];
-                if !front.pushed {
-                    core.push_tool(front.tool_text.clone());
-                    match front.owner {
-                        MindKind::Sub => dog_state.push_tool(&front.tool_text),
-                        _ => main_state.push_tool(&front.tool_text),
-                    }
-                    render_cache.invalidate(core.history.len().saturating_sub(1));
-                    front.pushed = true;
-                }
-                front.owner
-            };
-            let (client_ref, state_ref) = if matches!(owner, MindKind::Sub) {
-                (&dog_client, &dog_state)
-            } else {
-                (&main_client, &main_state)
-            };
-            if let Some(in_tokens) = try_start_dog_generation(TryStartDogGenerationArgs {
-                kind: owner,
-                dog_client: client_ref,
-                dog_state: state_ref,
-                extra_system: None,
-                tx: &tx,
-                config: &config,
-                mode: &mut mode,
-                active_kind: &mut active_kind,
-                sending_until: &mut sending_until,
-                sys_log: &mut sys_log,
-                sys_log_limit: config.sys_log_limit,
-                streaming_state: &mut streaming_state,
-                request_seq: &mut request_seq,
-                active_request_id: &mut active_request_id,
-                active_cancel: &mut active_cancel,
-                sse_enabled,
-            }) {
-                push_sys_log(
-                    &mut sys_log,
-                    config.sys_log_limit,
-                    "Terminal: done followup",
-                );
-                record_request_in_tokens(
-                    &mut core,
-                    &mut token_totals,
-                    &token_total_path,
-                    &context_usage,
-                    &mut active_request_in_tokens,
-                    in_tokens,
-                );
-                push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: batch ready");
-                pty_done_followups.pop_front();
-                needs_redraw = true;
             }
         }
 
@@ -11072,7 +11168,12 @@ fn run_loop(
                                             msg_idx,
                                             "您已选择：立即执行",
                                         );
-                                        spawn_tool_execution(call, active_kind, tx.clone());
+                                        spawn_tool_execution(
+                                            call,
+                                            active_kind,
+                                            tx.clone(),
+                                            pty_started_notice_prompt_text.clone(),
+                                        );
                                         mode = Mode::ExecutingTool;
                                     } else {
                                         update_history_text_at(
@@ -11102,6 +11203,8 @@ fn run_loop(
                                             sys_log_limit: config.sys_log_limit,
                                             sys_cfg: &sys_cfg,
                                             owner: active_kind,
+                                            pty_started_notice_prompt_text:
+                                                &pty_started_notice_prompt_text,
                                         });
                                         if !has_next && matches!(active_kind, MindKind::Sub) {
                                             if let Some(in_tokens) = try_start_dog_generation(
@@ -11683,6 +11786,8 @@ struct DrainAsyncEventsArgs<'a> {
     config: &'a AppConfig,
     context_compact_prompt_text: &'a str,
     fastmemo_compact_prompt_text: &'a str,
+    pty_help_prompt_text: &'a str,
+    pty_started_notice_prompt_text: &'a str,
     auto_fastmemo_compact: &'a mut bool,
     fastmemo_compact_inflight: &'a mut bool,
     fastmemo_compact_edit_mask: &'a mut u8,
@@ -11923,6 +12028,7 @@ struct ModelStreamEndArgs<'a> {
     config: &'a AppConfig,
     context_compact_prompt_text: &'a str,
     fastmemo_compact_prompt_text: &'a str,
+    pty_started_notice_prompt_text: &'a str,
     auto_fastmemo_compact: &'a mut bool,
     fastmemo_compact_inflight: &'a mut bool,
     fastmemo_compact_edit_mask: &'a mut u8,
@@ -11990,6 +12096,7 @@ fn handle_model_stream_end(
         config,
         context_compact_prompt_text,
         fastmemo_compact_prompt_text,
+        pty_started_notice_prompt_text,
         auto_fastmemo_compact,
         fastmemo_compact_inflight,
         fastmemo_compact_edit_mask,
@@ -12356,6 +12463,7 @@ fn handle_model_stream_end(
                 sys_log_limit,
                 sys_cfg,
                 owner: *active_kind,
+                pty_started_notice_prompt_text,
             });
         }
         if matches!(kind, MindKind::Main)
@@ -12726,6 +12834,8 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         config,
         context_compact_prompt_text,
         fastmemo_compact_prompt_text,
+        pty_help_prompt_text,
+        pty_started_notice_prompt_text,
         auto_fastmemo_compact,
         fastmemo_compact_inflight,
         fastmemo_compact_edit_mask,
@@ -12855,6 +12965,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         config,
                         context_compact_prompt_text,
                         fastmemo_compact_prompt_text,
+                        pty_started_notice_prompt_text,
                         auto_fastmemo_compact,
                         fastmemo_compact_inflight,
                         fastmemo_compact_edit_mask,
@@ -12930,19 +13041,14 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 *pty_active_idx = pty_tabs.len().saturating_sub(1);
                 // 将 PTY 快捷操作提示放进聊天界面（system role），避免用户“卡在终端里出不来”。
                 let help = if was_empty {
-                    "Terminal（PTY）已启动：\n\
-- Home：打开/隐藏 Terminal 视图（后台继续运行）\n\
-- Esc：发送给终端内程序（例如退出 vim/less）\n\
-- （兼容）350ms 内快速连按两次 Esc：结束当前终端任务（终止 PTY）\n\
-- Ctrl+Home：强制结束当前终端任务\n\
-- PgUp/PgDn：切换不同终端任务（多 PTY tab）\n\
-- Alt+↑：同步当前终端画面（快照）给 AI\n"
+                    render_pty_help_prompt(pty_help_prompt_text, PTY_DOUBLE_ESC_MS)
                 } else {
                     "Terminal（PTY）已启动新的终端任务：\n\
 - PgUp/PgDn：切换不同终端\n\
 - Home：返回聊天\n"
+                        .to_string()
                 };
-                core.push_system(help);
+                core.push_system(&help);
                 render_cache.invalidate(core.history.len().saturating_sub(1));
                 // AI 启动 PTY 时自动弹出 Terminal 视图；用户随时可按 Home 返回聊天。
                 *pty_view = true;
@@ -13362,6 +13468,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     sys_log_limit,
                     sys_cfg,
                     owner,
+                    pty_started_notice_prompt_text,
                 });
                 if !has_next && !skip_owner_resume && matches!(owner, MindKind::Sub) {
                     // fastmemo 自动压缩：工具链结束后不再让 DOG 输出正文，保持“静默维护”。
@@ -14720,6 +14827,10 @@ mod config {
         pub context_compact_prompt_path: String,
         #[serde(default = "default_pty_audit_prompt_path")]
         pub pty_audit_prompt_path: String,
+        #[serde(default = "default_pty_help_prompt_path")]
+        pub pty_help_prompt_path: String,
+        #[serde(default = "default_pty_started_notice_prompt_path")]
+        pub pty_started_notice_prompt_path: String,
         #[serde(default)]
         pub chat_target: String,
     }
@@ -14742,6 +14853,14 @@ mod config {
 
     fn default_pty_audit_prompt_path() -> String {
         "prompts/pty_audit.txt".to_string()
+    }
+
+    fn default_pty_help_prompt_path() -> String {
+        "prompts/pty_help.txt".to_string()
+    }
+
+    fn default_pty_started_notice_prompt_path() -> String {
+        "prompts/pty_started_notice.txt".to_string()
     }
 
     impl AppConfig {
@@ -14871,6 +14990,8 @@ mod config {
                 ctx_pool_max_items: default_ctx_pool_max_items(),
                 context_compact_prompt_path: default_context_compact_prompt_path(),
                 pty_audit_prompt_path: default_pty_audit_prompt_path(),
+                pty_help_prompt_path: default_pty_help_prompt_path(),
+                pty_started_notice_prompt_path: default_pty_started_notice_prompt_path(),
                 chat_target: "dog".to_string(),
             }
         }

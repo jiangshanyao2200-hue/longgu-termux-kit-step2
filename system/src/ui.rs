@@ -875,7 +875,10 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
         if timed_out {
             return Some("△ Timeout · output exported".to_string());
         }
-        if failed_line.is_some() {
+        if let Some(line) = failed_line.as_deref() {
+            if line.trim_start().starts_with("状态：") {
+                return Some("△ Output exported".to_string());
+            }
             return Some("△ Error · output exported".to_string());
         }
         return Some("△ Output exported".to_string());
@@ -890,6 +893,10 @@ fn build_tool_compact_status_line(text: &str, tick: usize) -> Option<String> {
     }
     if let Some(line) = failed_line {
         let mut reason = line.trim().to_string();
+        if let Some(rest) = reason.strip_prefix("状态：") {
+            let reason = compact_preview(rest.trim(), 46);
+            return Some(format!("△ Status: {reason}"));
+        }
         if let Some(rest) = reason.strip_prefix("执行失败：") {
             reason = rest.trim().to_string();
         }
@@ -927,7 +934,9 @@ fn extract_tool_status_token(text: &str) -> Option<String> {
     }
     for line in output_lines.iter() {
         let t = line.trim();
-        if t.contains("格式错误") || t.contains("工具执行失败") || t.contains("失败") {
+        // 约束：只有明确的 fail/格式错误才算“失败”；exit!=0 等只作为“状态/情况”汇报。
+        if t.contains("格式错误") || t.contains("工具执行失败") || t.contains("未知工具")
+        {
             return Some("fail".to_string());
         }
     }
@@ -962,7 +971,18 @@ fn tool_status_result_line(text: &str) -> Option<String> {
                     .to_string(),
             ),
             "format_error" => Some(format!("格式错误：{token}")),
-            _ => Some(format!("执行失败：{token}")),
+            "fail" | "error" | "failed" => Some(format!("执行失败：{token}")),
+            _ => {
+                if let Ok(code) = t.parse::<i64>() {
+                    if code == 0 {
+                        None
+                    } else {
+                        Some(format!("状态：exit {token}"))
+                    }
+                } else {
+                    Some(format!("状态：{token}"))
+                }
+            }
         }
     }
 }

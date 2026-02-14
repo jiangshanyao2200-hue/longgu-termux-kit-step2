@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::SystemConfig;
 use crate::mcp::ToolCall;
 
-const DEFAULT_MCP_MESSAGES_JSON: &str =
-    include_str!("../config/systemmessage/model/mcp_messages.json");
+const DEFAULT_MCP_MESSAGES_JSON: &str = include_str!("../config/prompt/mcp/mcp_messages.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

@@ -6,7 +6,7 @@
   "temperature": 0.0,
   "timeout_secs": 60,
   "max_tokens": 8000,
-  "prompt_path": "prompts/dog.txt",
+  "prompt_path": "config/prompt/agent/dog.txt",
   "prompt_reinject_pct": 80,
   "token_total_path": "memory/token_total.json"
 }

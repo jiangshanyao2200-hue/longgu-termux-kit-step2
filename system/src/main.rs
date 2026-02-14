@@ -2679,24 +2679,22 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
         cfg.ctx_pool_max_items = 10;
     }
     if cfg.context_compact_prompt_path.trim().is_empty() {
-        cfg.context_compact_prompt_path =
-            "config/systemmessage/model/context_compact.txt".to_string();
+        cfg.context_compact_prompt_path = "config/prompt/memory/context_compact.txt".to_string();
     }
     if cfg.pty_audit_prompt_path.trim().is_empty() {
-        cfg.pty_audit_prompt_path = "config/systemmessage/model/pty_audit.txt".to_string();
+        cfg.pty_audit_prompt_path = "config/prompt/mcp/pty_audit.txt".to_string();
     }
     if cfg.pty_help_prompt_path.trim().is_empty() {
-        cfg.pty_help_prompt_path = "config/systemmessage/model/pty_help.txt".to_string();
+        cfg.pty_help_prompt_path = "config/prompt/mcp/pty_help.txt".to_string();
     }
     if cfg.pty_started_notice_prompt_path.trim().is_empty() {
-        cfg.pty_started_notice_prompt_path =
-            "config/systemmessage/model/pty_started_notice.txt".to_string();
+        cfg.pty_started_notice_prompt_path = "config/prompt/mcp/pty_started_notice.txt".to_string();
     }
     if cfg.mcp_messages_path.trim().is_empty() {
-        cfg.mcp_messages_path = "config/systemmessage/model/mcp_messages.json".to_string();
+        cfg.mcp_messages_path = "config/prompt/mcp/mcp_messages.json".to_string();
     }
     if cfg.tool_messages_path.trim().is_empty() {
-        cfg.tool_messages_path = "config/systemmessage/model/tool_messages.json".to_string();
+        cfg.tool_messages_path = "config/prompt/mcp/tool_messages.json".to_string();
     }
     if cfg.welcome_shortcuts_prompt_path.trim().is_empty() {
         cfg.welcome_shortcuts_prompt_path =
@@ -3010,8 +3008,10 @@ fn load_prompt_file_with_default(
 
 fn load_context_prompts() -> (ContextPromptConfig, Vec<String>, PathBuf) {
     let defaults = ContextPromptConfig::default();
-    let main_path =
-        resolve_config_path_from_env("YING_CTX_MAIN_PROMPT_PATH", "prompts/ctxmainprompt.txt");
+    let main_path = resolve_config_path_from_env(
+        "YING_CTX_MAIN_PROMPT_PATH",
+        "config/prompt/agent/context_main.txt",
+    );
     let mut errors = Vec::new();
     let (main_prompt, err_main) =
         load_prompt_file_with_default(&main_path, &defaults.main_prompt, "CONTEXT-MAIN");
@@ -3131,7 +3131,7 @@ const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str = "系统：fastmemo 已达到阈值
 fn load_fastmemo_compact_prompt() -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path_from_env(
         "YING_FASTMEMO_COMPACT_PROMPT_PATH",
-        "config/systemmessage/model/fastmemo_compact.txt",
+        "config/prompt/memory/fastmemo_compact.txt",
     );
     let (text, err) =
         load_prompt_file_with_default(&path, DEFAULT_FASTMEMO_COMPACT_PROMPT, "FASTMEMO-COMPACT");
@@ -14987,27 +14987,27 @@ mod config {
     }
 
     fn default_context_compact_prompt_path() -> String {
-        "config/systemmessage/model/context_compact.txt".to_string()
+        "config/prompt/memory/context_compact.txt".to_string()
     }
 
     fn default_pty_audit_prompt_path() -> String {
-        "config/systemmessage/model/pty_audit.txt".to_string()
+        "config/prompt/mcp/pty_audit.txt".to_string()
     }
 
     fn default_pty_help_prompt_path() -> String {
-        "config/systemmessage/model/pty_help.txt".to_string()
+        "config/prompt/mcp/pty_help.txt".to_string()
     }
 
     fn default_pty_started_notice_prompt_path() -> String {
-        "config/systemmessage/model/pty_started_notice.txt".to_string()
+        "config/prompt/mcp/pty_started_notice.txt".to_string()
     }
 
     fn default_mcp_messages_path() -> String {
-        "config/systemmessage/model/mcp_messages.json".to_string()
+        "config/prompt/mcp/mcp_messages.json".to_string()
     }
 
     fn default_tool_messages_path() -> String {
-        "config/systemmessage/model/tool_messages.json".to_string()
+        "config/prompt/mcp/tool_messages.json".to_string()
     }
 
     fn default_welcome_shortcuts_prompt_path() -> String {
@@ -15096,7 +15096,7 @@ mod config {
                 temperature: Some(0.6),
                 timeout_secs: 60,
                 max_tokens: Some(5_000),
-                prompt_path: "prompts/dog.txt".to_string(),
+                prompt_path: "config/prompt/agent/dog.txt".to_string(),
                 prompt_reinject_pct: 80,
                 token_total_path: "memory/token_total.json".to_string(),
             }
@@ -15113,7 +15113,7 @@ mod config {
                 temperature: Some(0.6),
                 timeout_secs: 60,
                 max_tokens: Some(5_000),
-                prompt_path: "prompts/main.txt".to_string(),
+                prompt_path: "config/prompt/agent/main.txt".to_string(),
             }
         }
     }

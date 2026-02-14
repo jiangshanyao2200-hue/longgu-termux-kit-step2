@@ -6,5 +6,5 @@
   "temperature": 1.0,
   "timeout_secs": 60,
   "max_tokens": 5000,
-  "prompt_path": "prompts/main.txt"
+  "prompt_path": "config/prompt/agent/main.txt"
 }

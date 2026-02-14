@@ -7247,7 +7247,7 @@ fn run_skills_mcp(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         category
     };
     let started = Instant::now();
-    let path = Path::new("prompts/Skills index.md");
+    let path = Path::new("config/prompt/skills/index.md");
     let raw = fs::read_to_string(path)
         .with_context(|| format!("读取 skills 失败：{}", path.display()))?;
     let section =

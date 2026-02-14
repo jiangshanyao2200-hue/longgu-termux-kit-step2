@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SystemConfig;
 
-const DEFAULT_TOOL_MESSAGES_JSON: &str =
-    include_str!("../config/systemmessage/model/tool_messages.json");
+const DEFAULT_TOOL_MESSAGES_JSON: &str = include_str!("../config/prompt/mcp/tool_messages.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

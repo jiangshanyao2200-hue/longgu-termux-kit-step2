@@ -3040,7 +3040,7 @@ fn load_pty_audit_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, Pat
     (text, err, path)
 }
 
-const DEFAULT_PTY_HELP_PROMPT: &str = "Terminal（PTY）已启动：\n- Home：打开/隐藏 Terminal 视图（后台继续运行）\n- Esc：发送给终端内程序（例如退出 vim/less）\n- （兼容）{DOUBLE_ESC_MS}ms 内快速连按两次 Esc：结束当前终端任务（终止 PTY）\n- Ctrl+Home：强制结束当前终端任务\n- PgUp/PgDn：切换不同终端任务（多 PTY tab）\n- Alt+↑：同步当前终端画面（快照）给 AI\n";
+const DEFAULT_PTY_HELP_PROMPT: &str = "Terminal（PTY）已启动：\n- Home：打开/隐藏 Terminal 视图（后台继续运行）\n- Esc：发送给终端内程序（例如退出 vim/less）\n- （兼容）{DOUBLE_ESC_MS}ms 内快速连按两次 Esc：结束当前终端任务（终止 PTY）\n- PgUp/PgDn：切换不同终端任务（多 PTY tab）\n- Alt+↑：同步当前终端画面（快照）给 AI\n";
 
 fn load_pty_help_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path(&sys_cfg.pty_help_prompt_path, true);
@@ -10324,36 +10324,7 @@ fn run_loop(
                         last_esc_at = Some(now);
                     }
                     // Home：隐藏终端视图（后台继续运行）。
-                    // Ctrl+Home：强制结束当前终端任务（避免与常见 TUI 的 Esc 键冲突）。
-                    if ctrl && !alt && matches!(key.code, KeyCode::Home) {
-                        let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
-                        let killed_job_id = pty_tabs.get(active).map(|s| s.job_id);
-                        if let Some(job_id) = killed_job_id
-                            && let Some(tx_kill) = pty_handles.get(&job_id)
-                        {
-                            let _ = tx_kill.send(PtyControl::Kill);
-                        }
-                        if !pty_tabs.is_empty() {
-                            pty_tabs.remove(active);
-                        }
-                        if pty_tabs.is_empty() {
-                            pty_view = false;
-                            pty_active_idx = 0;
-                        } else {
-                            pty_active_idx = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
-                        }
-                        push_sys_log(
-                            &mut sys_log,
-                            config.sys_log_limit,
-                            format!(
-                                "Terminal: kill requested (job_id:{})",
-                                killed_job_id.unwrap_or(0)
-                            ),
-                        );
-                        last_esc_at = None;
-                        continue;
-                    }
-                    if matches!(key.code, KeyCode::Home) {
+                    if !ctrl && !alt && matches!(key.code, KeyCode::Home) {
                         pty_view = false;
                         last_esc_at = None;
                         runlog_event("INFO", "pty.ui.home", json!({"action":"hide"}));

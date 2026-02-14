@@ -2,6 +2,5 @@ Terminal（PTY）已启动：
 - Home：打开/隐藏 Terminal 视图（后台继续运行）
 - Esc：发送给终端内程序（例如退出 vim/less）
 - （兼容）{DOUBLE_ESC_MS}ms 内快速连按两次 Esc：结束当前终端任务（终止 PTY）
-- Ctrl+Home：强制结束当前终端任务
 - PgUp/PgDn：切换不同终端任务（多 PTY tab）
 - Alt+↑：同步当前终端画面（快照）给 AI

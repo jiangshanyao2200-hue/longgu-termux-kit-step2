@@ -32,7 +32,6 @@
     - `Home`：打开/隐藏 Terminal 视图（后台继续运行，不终止）
     - `Esc`：发送给终端内程序（例如退出 vim/less）
     - （兼容）350ms 内快速连按两次 `Esc`：结束当前终端任务（终止 PTY）
-    - `Ctrl+Home`：强制结束当前终端任务
     - `PgUp/PgDn`：切换终端任务（多 PTY tab，只占用无修饰键；Ctrl/Alt+PgUp/PgDn 仍透传）
     - 鼠标滚轮：回看滚动（scrollback）
     - `Alt+↑`：同步当前终端画面（快照）给 AI（生成一条 Tool result: PTY SNAPSHOT）

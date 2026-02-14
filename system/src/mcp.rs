@@ -2461,7 +2461,7 @@ fn build_shell_outcome_bash(
         let cmd_trim = cmd.trim();
         let looks_like_job_kill = cmd_trim.starts_with("kill %") || cmd_trim.contains(" kill %");
         if looks_like_job_kill && stderr.to_ascii_lowercase().contains("no such job") {
-            body.push_str("\n\n提示：bash 工具每次在独立的非交互 shell 中执行，`kill %1` 这类 job control 不生效。\n如需终止正在运行的 Terminal（PTY），请在 Terminal 视图 350ms 内快速连按两次 Esc（结束）或按 Ctrl+Home（强制结束）。");
+            body.push_str("\n\n提示：bash 工具每次在独立的非交互 shell 中执行，`kill %1` 这类 job control 不生效。\n如需终止正在运行的 Terminal（PTY），请在 Terminal 视图 350ms 内快速连按两次 Esc（结束）。");
         }
     }
     let mut status = if timed_out {

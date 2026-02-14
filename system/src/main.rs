@@ -90,8 +90,7 @@ const MODEL_RESPONSE_TIMEOUT_CAP_SECS: u64 = 7 * 60;
 // - 若最后是 assistant（或 system），可能报 400（如 Invalid consecutive assistant message）
 // 解决：仅在“发起请求快照”时，必要时追加一条“伪 user 占位”。
 // 这条文本必须清晰声明“非用户输入”，避免被模型当成用户意图。
-const DEEPSEEK_TOOL_LOOP_TICK_USER: &str =
-    "[AITERMUX_INTERNAL_TOOL_LOOP] 系统注入：非用户输入。请基于上一条 Tool result 继续当前任务。";
+// 具体文本来自 config/prompt/mcp/mcp_messages.json 的 deepseek_tool_loop_tick_user。
 
 #[cfg(unix)]
 fn set_fd_nonblocking(fd: i32, enabled: bool) {
@@ -2438,13 +2437,20 @@ mod heartbeat_reply_tests {
 mod message_normalize_tests {
     use super::*;
 
+    fn tool_loop_tick_user() -> String {
+        crate::mcp_messages::McpMessages::default().deepseek_tool_loop_tick_user
+    }
+
     #[test]
     fn merges_consecutive_assistant_messages_for_deepseek() {
+        let tick = tool_loop_tick_user();
         let mut state = DogState::new(
             String::new(),
             80,
-            DEEPSEEK_TOOL_LOOP_TICK_USER.to_string(),
-            "Tool result:\n{RESULT}".to_string(),
+            tick,
+            "Tool result:
+{RESULT}"
+                .to_string(),
         );
         state.messages.clear();
         state.used_tokens_est = 0;
@@ -2463,11 +2469,14 @@ mod message_normalize_tests {
 
     #[test]
     fn message_snapshot_normalizes_existing_consecutive_assistants() {
+        let tick = tool_loop_tick_user();
         let mut state = DogState::new(
             String::new(),
             80,
-            DEEPSEEK_TOOL_LOOP_TICK_USER.to_string(),
-            "Tool result:\n{RESULT}".to_string(),
+            tick,
+            "Tool result:
+{RESULT}"
+                .to_string(),
         );
         state.messages.clear();
         state.used_tokens_est = 0;
@@ -2488,11 +2497,14 @@ mod message_normalize_tests {
 
     #[test]
     fn tool_context_user_placeholder_is_injected_at_snapshot() {
+        let tick = tool_loop_tick_user();
         let mut state = DogState::new(
             String::new(),
             80,
-            DEEPSEEK_TOOL_LOOP_TICK_USER.to_string(),
-            "Tool result:\n{RESULT}".to_string(),
+            tick.clone(),
+            "Tool result:
+{RESULT}"
+                .to_string(),
         );
         state.messages.clear();
         state.used_tokens_est = 0;
@@ -2507,7 +2519,7 @@ mod message_normalize_tests {
         assert_eq!(snap[0].role, "assistant");
         assert!(snap[0].content.contains("Tool result:"));
         assert_eq!(snap[1].role, "user");
-        assert_eq!(snap[1].content, DEEPSEEK_TOOL_LOOP_TICK_USER);
+        assert_eq!(snap[1].content, tick);
     }
 }
 

@@ -7,40 +7,82 @@ use crate::config::SystemConfig;
 
 const DEFAULT_TOOL_MESSAGES_JSON: &str = include_str!("../config/prompt/mcp/tool_messages.json");
 
+fn default_tool_line() -> String {
+    "TOOL: {TOOL}\n".to_string()
+}
+fn default_explain_line() -> String {
+    "EXPLAIN: {BRIEF}\n".to_string()
+}
+fn default_input_line() -> String {
+    "INPUT: {INPUT}\n".to_string()
+}
+fn default_output_header() -> String {
+    "OUTPUT:\n```text\n".to_string()
+}
+fn default_output_footer() -> String {
+    "\n```\n".to_string()
+}
+fn default_meta_header() -> String {
+    "META:\n```text\n".to_string()
+}
+fn default_meta_footer() -> String {
+    "\n```\n".to_string()
+}
+fn default_no_output() -> String {
+    "(NO OUTPUT)".to_string()
+}
+fn default_unknown_tool() -> String {
+    "UNKNOWN TOOL: {TOOL}".to_string()
+}
+fn default_tool_failed() -> String {
+    "TOOL FAILED: {ERR}".to_string()
+}
+fn default_tool_failed_generic() -> String {
+    "TOOL FAILED".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct ToolMessages {
+    #[serde(default = "default_tool_line")]
     pub tool_line: String,
+    #[serde(default = "default_explain_line")]
     pub explain_line: String,
+    #[serde(default = "default_input_line")]
     pub input_line: String,
+    #[serde(default = "default_output_header")]
     pub output_header: String,
+    #[serde(default = "default_output_footer")]
     pub output_footer: String,
+    #[serde(default = "default_meta_header")]
     pub meta_header: String,
+    #[serde(default = "default_meta_footer")]
     pub meta_footer: String,
+    #[serde(default = "default_no_output")]
     pub no_output: String,
 
+    #[serde(default = "default_unknown_tool")]
     pub unknown_tool: String,
+    #[serde(default = "default_tool_failed")]
     pub tool_failed: String,
+    #[serde(default = "default_tool_failed_generic")]
     pub tool_failed_generic: String,
 }
 
 impl Default for ToolMessages {
     fn default() -> Self {
-        serde_json::from_str::<ToolMessages>(DEFAULT_TOOL_MESSAGES_JSON).unwrap_or_else(|_| {
-            ToolMessages {
-                tool_line: "TOOL: {TOOL}\n".to_string(),
-                explain_line: "EXPLAIN: {BRIEF}\n".to_string(),
-                input_line: "INPUT: {INPUT}\n".to_string(),
-                output_header: "OUTPUT:\n```text\n".to_string(),
-                output_footer: "\n```\n".to_string(),
-                meta_header: "META:\n```text\n".to_string(),
-                meta_footer: "\n```\n".to_string(),
-                no_output: "(NO OUTPUT)".to_string(),
-                unknown_tool: "UNKNOWN TOOL: {TOOL}".to_string(),
-                tool_failed: "TOOL FAILED: {ERR}".to_string(),
-                tool_failed_generic: "TOOL FAILED".to_string(),
-            }
-        })
+        ToolMessages {
+            tool_line: default_tool_line(),
+            explain_line: default_explain_line(),
+            input_line: default_input_line(),
+            output_header: default_output_header(),
+            output_footer: default_output_footer(),
+            meta_header: default_meta_header(),
+            meta_footer: default_meta_footer(),
+            no_output: default_no_output(),
+            unknown_tool: default_unknown_tool(),
+            tool_failed: default_tool_failed(),
+            tool_failed_generic: default_tool_failed_generic(),
+        }
     }
 }
 

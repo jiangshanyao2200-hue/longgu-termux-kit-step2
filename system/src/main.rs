@@ -1819,6 +1819,7 @@ impl DogClient {
         request_id: u64,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
+        trace_startup("run_loop: runlog_event");
         runlog_event(
             "INFO",
             "model.request.start",
@@ -7415,6 +7416,7 @@ fn run_native_shell(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> an
         .status();
 
     enable_raw_mode().context("enable_raw_mode failed")?;
+    trace_startup("run: raw_mode ok");
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
@@ -7438,6 +7440,21 @@ fn recover_terminal_best_effort() {
         crossterm::cursor::Show
     )
     .ok();
+}
+
+fn trace_startup(msg: &str) {
+    let path = PathBuf::from("log").join("startup_trace.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(f, "[{ts}] {msg}");
+    }
 }
 
 fn find_repo_root_from(mut dir: PathBuf) -> Option<PathBuf> {
@@ -7514,11 +7531,16 @@ impl Drop for UiGuard {
 }
 
 pub fn run() -> anyhow::Result<i32> {
+    trace_startup("run: enter");
     arm_parent_death_signal();
+    trace_startup("run: pdeath ok");
     let exit_flag = setup_exit_flag()?;
+    trace_startup("run: exit_flag ok");
     if !tty_is_alive() {
+        trace_startup("run: tty not alive (exit 0)");
         return Ok(0);
     }
+    trace_startup("run: tty ok");
 
     let mut stdout = io::stdout();
     enable_raw_mode().context("enable_raw_mode failed")?;
@@ -7527,13 +7549,17 @@ pub fn run() -> anyhow::Result<i32> {
         return Err(anyhow::anyhow!("EnterAlternateScreen failed: {e}"));
     }
 
+    trace_startup("run: alt_screen ok");
     let _ui = UiGuard;
 
+    trace_startup("run: backend");
     let backend = CrosstermBackend::new(stdout);
+    trace_startup("run: terminal new");
     let mut terminal = Terminal::new(backend)?;
     execute!(terminal.backend_mut(), Clear(ClearType::All)).ok();
     terminal.clear().ok();
 
+    trace_startup("run: entering run_loop");
     run_loop(&mut terminal, exit_flag)
 }
 
@@ -7978,12 +8004,19 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     exit_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<i32> {
+    trace_startup("run_loop: enter");
     let mut core = Core::new();
+    trace_startup("run_loop: core ok");
     let mut config = AppConfig::from_env();
+    trace_startup("run_loop: config ok");
     let (mut dog_cfg, dog_cfg_err, dog_cfg_path) = load_dog_api_config();
+    trace_startup("run_loop: dog_cfg ok");
     let (mut main_cfg, main_cfg_err, main_cfg_path) = load_main_api_config();
+    trace_startup("run_loop: main_cfg ok");
     let (mut sys_cfg, sys_cfg_err, sys_cfg_path) = load_system_config();
+    trace_startup("run_loop: sys_cfg ok");
     let (mut context_prompts, context_prompt_errs, context_prompt_path) = load_context_prompts();
+    trace_startup("run_loop: ctx_prompts ok");
     if let Some(root) = config_root_dir(&dog_cfg_path) {
         config.metamemo_path = resolve_relative_path(&config.metamemo_path, &root);
         config.datememo_path = resolve_relative_path(&config.datememo_path, &root);
@@ -7992,7 +8025,10 @@ fn run_loop(
         config.memo_db_path = resolve_relative_path(&config.memo_db_path, &root);
         let _ = std::env::set_current_dir(&root);
     }
+    trace_startup("run_loop: root resolved");
+    trace_startup("run_loop: init_run_logger");
     init_run_logger(&config.run_log_path);
+    trace_startup("run_loop: init_run_logger ok");
     runlog_event(
         "INFO",
         "app.start",
@@ -8006,14 +8042,18 @@ fn run_loop(
             "version": env!("CARGO_PKG_VERSION"),
         }),
     );
+    trace_startup("run_loop: runlog_event ok");
     // set_var 在当前 toolchain 中为 unsafe，集中处理并降低散落风险。
     unsafe {
         std::env::set_var("YING_MEMO_DB_PATH", &config.memo_db_path);
         std::env::set_var("YING_METAMEMO_PATH", &config.metamemo_path);
         std::env::set_var("YING_DATEMEMO_PATH", &config.datememo_path);
     }
+    trace_startup("run_loop: set_var ok");
     let mut memo_db: Option<MemoDb> = None;
+    trace_startup("run_loop: memo_db var ok");
     let mut memo_db_err: Option<String> = None;
+    trace_startup("run_loop: memo_db open start");
     match MemoDb::open(
         PathBuf::from(&config.memo_db_path),
         PathBuf::from(&config.metamemo_path),
@@ -14571,6 +14611,7 @@ fn try_start_dog_generation(args: TryStartDogGenerationArgs<'_>) -> Option<u64> 
 
 fn main() -> anyhow::Result<()> {
     install_crash_hook();
+    trace_startup("main: start");
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--selfcheck" || a == "selfcheck") {

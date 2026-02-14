@@ -39,6 +39,7 @@ use signal_hook::iterator::Signals;
 use unicode_width::UnicodeWidthChar;
 
 mod mcp;
+mod mcp_messages; // configurable system→model messages
 mod memorydb;
 mod ui;
 
@@ -55,6 +56,7 @@ use crate::mcp::{
     ToolCall, ToolOutcome, extract_tool_calls, format_tool_message_raw,
     handle_tool_call_with_retry, tool_requires_confirmation,
 };
+use crate::mcp_messages::McpMessages;
 use crate::memorydb::{MemoDb, MemoKind, build_memo_entry};
 
 pub use crate::commands::CommandSpec;
@@ -1400,6 +1402,7 @@ struct DogState {
     messages: Vec<ApiMessage>,
     prompt: String,
     prompt_reinject_pct: u8,
+    deepseek_tool_loop_tick_user: String,
     last_prompt_inject_user: usize,
     user_count: usize,
     used_tokens_est: usize,
@@ -1412,11 +1415,12 @@ struct DogState {
 }
 
 impl DogState {
-    fn new(prompt: String, prompt_reinject_pct: u8) -> Self {
+    fn new(prompt: String, prompt_reinject_pct: u8, deepseek_tool_loop_tick_user: String) -> Self {
         let mut s = Self {
             messages: Vec::new(),
             prompt,
             prompt_reinject_pct,
+            deepseek_tool_loop_tick_user,
             last_prompt_inject_user: 0,
             user_count: 0,
             used_tokens_est: 0,
@@ -1581,7 +1585,7 @@ impl DogState {
         if need_tick {
             out.push(ApiMessage {
                 role: "user".to_string(),
-                content: DEEPSEEK_TOOL_LOOP_TICK_USER.to_string(),
+                content: self.deepseek_tool_loop_tick_user.clone(),
             });
         }
         out
@@ -2421,7 +2425,7 @@ mod message_normalize_tests {
 
     #[test]
     fn merges_consecutive_assistant_messages_for_deepseek() {
-        let mut state = DogState::new(String::new(), 80);
+        let mut state = DogState::new(String::new(), 80, DEEPSEEK_TOOL_LOOP_TICK_USER.to_string());
         state.messages.clear();
         state.used_tokens_est = 0;
 
@@ -2439,7 +2443,7 @@ mod message_normalize_tests {
 
     #[test]
     fn message_snapshot_normalizes_existing_consecutive_assistants() {
-        let mut state = DogState::new(String::new(), 80);
+        let mut state = DogState::new(String::new(), 80, DEEPSEEK_TOOL_LOOP_TICK_USER.to_string());
         state.messages.clear();
         state.used_tokens_est = 0;
         state.messages.push(ApiMessage {
@@ -2459,7 +2463,7 @@ mod message_normalize_tests {
 
     #[test]
     fn tool_context_user_placeholder_is_injected_at_snapshot() {
-        let mut state = DogState::new(String::new(), 80);
+        let mut state = DogState::new(String::new(), 80, DEEPSEEK_TOOL_LOOP_TICK_USER.to_string());
         state.messages.clear();
         state.used_tokens_est = 0;
 
@@ -2645,7 +2649,19 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
         cfg.ctx_pool_max_items = 10;
     }
     if cfg.context_compact_prompt_path.trim().is_empty() {
-        cfg.context_compact_prompt_path = "prompts/context_compact.txt".to_string();
+        cfg.context_compact_prompt_path = "prompts/mcpprompt/context_compact.txt".to_string();
+    }
+    if cfg.pty_audit_prompt_path.trim().is_empty() {
+        cfg.pty_audit_prompt_path = "prompts/mcpprompt/pty_audit.txt".to_string();
+    }
+    if cfg.pty_help_prompt_path.trim().is_empty() {
+        cfg.pty_help_prompt_path = "prompts/mcpprompt/pty_help.txt".to_string();
+    }
+    if cfg.pty_started_notice_prompt_path.trim().is_empty() {
+        cfg.pty_started_notice_prompt_path = "prompts/mcpprompt/pty_started_notice.txt".to_string();
+    }
+    if cfg.mcp_messages_path.trim().is_empty() {
+        cfg.mcp_messages_path = "prompts/mcpprompt/messages.json".to_string();
     }
     cfg.chat_target = normalize_chat_target_value(&cfg.chat_target);
     (cfg, err, path_buf)
@@ -3076,7 +3092,7 @@ const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str = "系统：fastmemo 已达到阈值
 fn load_fastmemo_compact_prompt() -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path_from_env(
         "YING_FASTMEMO_COMPACT_PROMPT_PATH",
-        "prompts/fastmemo_compact.txt",
+        "prompts/mcpprompt/fastmemo_compact.txt",
     );
     let (text, err) =
         load_prompt_file_with_default(&path, DEFAULT_FASTMEMO_COMPACT_PROMPT, "FASTMEMO-COMPACT");
@@ -5095,17 +5111,8 @@ fn apply_settings_with_notice(args: ApplySettingsWithNoticeArgs<'_>) {
     }
 }
 
-fn tool_confirm_prompt(reason: &str, call: &ToolCall) -> String {
-    let label = crate::mcp::tool_display_label(&call.tool);
-    let cmd_raw = call.input.trim();
-    let cmd = if cmd_raw.is_empty() {
-        "(empty)".to_string()
-    } else {
-        truncate_with_suffix(cmd_raw, 2000)
-    };
-    format!(
-        "危险指令需要确认：{reason}\n[{label}]\ncmd:\n```sh\n{cmd}\n```\n输入 yes 执行 / no 拒绝"
-    )
+fn tool_confirm_prompt(mcp_messages: &McpMessages, reason: &str, call: &ToolCall) -> String {
+    crate::mcp_messages::render_tool_confirm_prompt(mcp_messages, reason, call)
 }
 
 static PTY_JOB_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -6388,6 +6395,7 @@ struct TryStartNextToolArgs<'a> {
     sys_log_limit: usize,
     sys_cfg: &'a SystemConfig,
     owner: MindKind,
+    mcp_messages: &'a McpMessages,
     pty_started_notice_prompt_text: &'a str,
 }
 
@@ -6404,6 +6412,7 @@ fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
         sys_log_limit,
         sys_cfg,
         owner,
+        mcp_messages,
         pty_started_notice_prompt_text,
     } = args;
     if matches!(*mode, Mode::ExecutingTool | Mode::ApprovingTool) {
@@ -6418,7 +6427,7 @@ fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
     if !sys_cfg.tool_full_access
         && let Some(reason) = tool_requires_confirmation(&call)
     {
-        let prompt = tool_confirm_prompt(&reason, &call);
+        let prompt = tool_confirm_prompt(mcp_messages, &reason, &call);
         let msg_idx = core.history.len();
         push_system_and_log(core, meta, context_usage, Some("tool"), &prompt);
         *pending_tool_confirm = Some((call, reason, msg_idx));
@@ -7908,9 +7917,19 @@ fn run_loop(
         load_pty_started_notice_prompt(&sys_cfg);
     let (fastmemo_compact_prompt_text, fastmemo_compact_prompt_err, _fastmemo_compact_prompt_path) =
         load_fastmemo_compact_prompt();
-    let mut dog_state = DogState::new(dog_prompt, dog_cfg.prompt_reinject_pct);
+    let (mcp_messages, mcp_messages_err, mcp_messages_path) =
+        crate::mcp_messages::load_mcp_messages(&sys_cfg);
+    let mut dog_state = DogState::new(
+        dog_prompt,
+        dog_cfg.prompt_reinject_pct,
+        mcp_messages.deepseek_tool_loop_tick_user.clone(),
+    );
     let mut main_prompt_text = main_prompt;
-    let mut main_state = DogState::new(main_prompt_text.clone(), 80);
+    let mut main_state = DogState::new(
+        main_prompt_text.clone(),
+        80,
+        mcp_messages.deepseek_tool_loop_tick_user.clone(),
+    );
     // MAIN 也可能发起工具调用（记忆/系统配置等）。若不回注工具结果，模型会反复重试同一工具。
     main_state.set_include_tool_context(true);
     dog_state.reset_context();
@@ -8152,6 +8171,19 @@ fn run_loop(
             "FASTMEMO-COMPACT: 已载入提示词",
         );
     }
+    if let Some(err) = mcp_messages_err {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!("MCP-MESSAGES: {err} ({})", mcp_messages_path.display()),
+        );
+    } else {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!("MCP-MESSAGES: 配置 {}", mcp_messages_path.display()),
+        );
+    }
     if let Some(err) = metamemo_err.take() {
         push_sys_log(
             &mut sys_log,
@@ -8328,6 +8360,7 @@ fn run_loop(
                 fastmemo_compact_prompt_text: &fastmemo_compact_prompt_text,
                 pty_help_prompt_text: &pty_help_prompt_text,
                 pty_started_notice_prompt_text: &pty_started_notice_prompt_text,
+                mcp_messages: &mcp_messages,
                 auto_fastmemo_compact: &mut auto_fastmemo_compact,
                 fastmemo_compact_inflight: &mut fastmemo_compact_inflight,
                 fastmemo_compact_edit_mask: &mut fastmemo_compact_edit_mask,
@@ -8616,9 +8649,7 @@ fn run_loop(
             // DeepSeek 对 system 消息位置/排序比较敏感（容易触发 400: Invalid consecutive assistant message）。
             // 心跳作为一次“用户事件”，用 user 消息注入到对话上下文：assistant -> user(heartbeat) -> assistant(reply)。
             let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
-            let hb_user = format!(
-                "心跳信号：{stamp} | idle\n请像正常消息一样回复（可简短）。若无需回应请只回复 [mainpass]。不要调用工具。"
-            );
+            let hb_user = crate::mcp_messages::render_heartbeat_user(&mcp_messages, &stamp);
             let _ = main_state.push_user(&hb_user, ctx_limit);
             if let Some(in_tokens) = try_start_main_heartbeat(TryStartMainHeartbeatArgs {
                 main_client: &main_client,
@@ -11203,6 +11234,7 @@ fn run_loop(
                                             sys_log_limit: config.sys_log_limit,
                                             sys_cfg: &sys_cfg,
                                             owner: active_kind,
+                                            mcp_messages: &mcp_messages,
                                             pty_started_notice_prompt_text:
                                                 &pty_started_notice_prompt_text,
                                         });
@@ -11788,6 +11820,7 @@ struct DrainAsyncEventsArgs<'a> {
     fastmemo_compact_prompt_text: &'a str,
     pty_help_prompt_text: &'a str,
     pty_started_notice_prompt_text: &'a str,
+    mcp_messages: &'a McpMessages,
     auto_fastmemo_compact: &'a mut bool,
     fastmemo_compact_inflight: &'a mut bool,
     fastmemo_compact_edit_mask: &'a mut u8,
@@ -12029,6 +12062,7 @@ struct ModelStreamEndArgs<'a> {
     context_compact_prompt_text: &'a str,
     fastmemo_compact_prompt_text: &'a str,
     pty_started_notice_prompt_text: &'a str,
+    mcp_messages: &'a McpMessages,
     auto_fastmemo_compact: &'a mut bool,
     fastmemo_compact_inflight: &'a mut bool,
     fastmemo_compact_edit_mask: &'a mut u8,
@@ -12097,6 +12131,7 @@ fn handle_model_stream_end(
         context_compact_prompt_text,
         fastmemo_compact_prompt_text,
         pty_started_notice_prompt_text,
+        mcp_messages,
         auto_fastmemo_compact,
         fastmemo_compact_inflight,
         fastmemo_compact_edit_mask,
@@ -12344,7 +12379,7 @@ fn handle_model_stream_end(
                 meta,
                 context_usage,
                 Some("tool"),
-                "检测到 plan 与其它工具同批输出：已拒绝本轮工具执行。请将 plan:start / plan:end 单独一条回复输出；执行阶段每轮只调用一个工具。",
+                mcp_messages.plan_mixed_batch_reject.as_str(),
             );
             push_sys_log(sys_log, sys_log_limit, "plan 混批：已拒绝执行");
         }
@@ -12463,6 +12498,7 @@ fn handle_model_stream_end(
                 sys_log_limit,
                 sys_cfg,
                 owner: *active_kind,
+                mcp_messages,
                 pty_started_notice_prompt_text,
             });
         }
@@ -12836,6 +12872,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         fastmemo_compact_prompt_text,
         pty_help_prompt_text,
         pty_started_notice_prompt_text,
+        mcp_messages,
         auto_fastmemo_compact,
         fastmemo_compact_inflight,
         fastmemo_compact_edit_mask,
@@ -12966,6 +13003,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         context_compact_prompt_text,
                         fastmemo_compact_prompt_text,
                         pty_started_notice_prompt_text,
+                        mcp_messages,
                         auto_fastmemo_compact,
                         fastmemo_compact_inflight,
                         fastmemo_compact_edit_mask,
@@ -13469,6 +13507,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     sys_cfg,
                     owner,
                     pty_started_notice_prompt_text,
+                    mcp_messages,
                 });
                 if !has_next && !skip_owner_resume && matches!(owner, MindKind::Sub) {
                     // fastmemo 自动压缩：工具链结束后不再让 DOG 输出正文，保持“静默维护”。
@@ -14831,6 +14870,8 @@ mod config {
         pub pty_help_prompt_path: String,
         #[serde(default = "default_pty_started_notice_prompt_path")]
         pub pty_started_notice_prompt_path: String,
+        #[serde(default = "default_mcp_messages_path")]
+        pub mcp_messages_path: String,
         #[serde(default)]
         pub chat_target: String,
     }
@@ -14848,19 +14889,23 @@ mod config {
     }
 
     fn default_context_compact_prompt_path() -> String {
-        "prompts/context_compact.txt".to_string()
+        "prompts/mcpprompt/context_compact.txt".to_string()
     }
 
     fn default_pty_audit_prompt_path() -> String {
-        "prompts/pty_audit.txt".to_string()
+        "prompts/mcpprompt/pty_audit.txt".to_string()
     }
 
     fn default_pty_help_prompt_path() -> String {
-        "prompts/pty_help.txt".to_string()
+        "prompts/mcpprompt/pty_help.txt".to_string()
     }
 
     fn default_pty_started_notice_prompt_path() -> String {
-        "prompts/pty_started_notice.txt".to_string()
+        "prompts/mcpprompt/pty_started_notice.txt".to_string()
+    }
+
+    fn default_mcp_messages_path() -> String {
+        "prompts/mcpprompt/messages.json".to_string()
     }
 
     impl AppConfig {
@@ -14992,6 +15037,7 @@ mod config {
                 pty_audit_prompt_path: default_pty_audit_prompt_path(),
                 pty_help_prompt_path: default_pty_help_prompt_path(),
                 pty_started_notice_prompt_path: default_pty_started_notice_prompt_path(),
+                mcp_messages_path: default_mcp_messages_path(),
                 chat_target: "dog".to_string(),
             }
         }

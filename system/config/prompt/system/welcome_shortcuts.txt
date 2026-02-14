@@ -15,4 +15,4 @@ Terminal（PTY）：
 - Home：打开/隐藏 Terminal（后台继续）
 - PgUp/PgDn：切换终端 tab
 - Esc：发给终端；Esc×2(350ms) 结束任务
-- Alt+↑：同步终端快照给 AI
+- Alt+↑：复制终端快照到输入框

@@ -143,7 +143,7 @@ struct PtyUiState {
     status_path: String,
     // 按用户决策：交互输入也记录并回传给 AI（含敏感信息）。
     input_log: String,
-    // 用户主动同步的快照（Alt+↑）。若存在，工具结束时优先回传该快照。
+    // 用户在终端里主动生成的快照（Alt+↑）。用于暂存到输入框；旧链路 final 回传会优先用它。
     last_user_snapshot: Option<String>,
     screen_lines: Vec<String>,
     dirty: bool,
@@ -3052,7 +3052,7 @@ fn load_pty_audit_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, Pat
     (text, err, path)
 }
 
-const DEFAULT_PTY_HELP_PROMPT: &str = "Terminal（PTY）已启动：\n- Home：打开/隐藏 Terminal 视图（后台继续运行）\n- Esc：发送给终端内程序（例如退出 vim/less）\n- （兼容）{DOUBLE_ESC_MS}ms 内快速连按两次 Esc：结束当前终端任务（终止 PTY）\n- PgUp/PgDn：切换不同终端任务（多 PTY tab）\n- Alt+↑：同步当前终端画面（快照）给 AI\n";
+const DEFAULT_PTY_HELP_PROMPT: &str = "Terminal（PTY）已启动：\n- Home：打开/隐藏 Terminal 视图（后台继续运行）\n- Esc：发送给终端内程序（例如退出 vim/less）\n- （兼容）{DOUBLE_ESC_MS}ms 内快速连按两次 Esc：结束当前终端任务（终止 PTY）\n- PgUp/PgDn：切换不同终端任务（多 PTY tab）\n- Alt+↑：复制当前终端快照到聊天输入框（由用户决定是否发送给 AI）\n";
 
 fn load_pty_help_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path(&sys_cfg.pty_help_prompt_path, true);
@@ -3070,8 +3070,7 @@ fn render_pty_help_prompt(template: &str, double_esc_ms: u64) -> String {
     tpl.replace("{DOUBLE_ESC_MS}", &double_esc_ms.to_string())
 }
 
-const DEFAULT_PTY_STARTED_NOTICE_PROMPT: &str = "PTY 已启动（后台运行）。\njob_id:{JOB_ID} | owner:{OWNER}\ncwd:{CWD}\ncmd:\n```sh\n{CMD}\n```\nlog:{LOG_PATH}\nstatus:{STATUS_PATH}\n\n说明：终端会继续运行，你可以继续和 AI 聊天；需要交互时按 Home 打开 Terminal 视图。\n\n提示：\n- 如需查看输出/交互：按 Home 打开 Terminal；任务结束后会自动关闭并汇总回传。\n- 如需读取日志/状态：请直接使用上方给出的 log/status 路径，不要猜文件名。\n\n{INITIAL_PREVIEW_BLOCK}\n";
-
+const DEFAULT_PTY_STARTED_NOTICE_PROMPT: &str = "PTY 已启动（后台运行）。\njob_id:{JOB_ID} | owner:{OWNER}\ncwd:{CWD}\ncmd:\n```sh\n{CMD}\n```\nlog:{LOG_PATH}\nstatus:{STATUS_PATH}\n\n说明：终端在运行，期间可继续对话。\n       任务结束后会自动关闭。\n       按HOME可展开查看与交互。\n\n{INITIAL_PREVIEW_BLOCK}\n";
 fn load_pty_started_notice_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path(&sys_cfg.pty_started_notice_prompt_path, true);
     let (text, err) =
@@ -4233,12 +4232,14 @@ fn drain_input_for_send(
     pending_pastes: &mut Vec<(String, String)>,
     paste_capture: &mut Option<PasteCapture>,
     command_menu_suppress: &mut bool,
+    pending_pty_snapshot: &mut Option<(u64, String)>,
 ) -> String {
     let send = materialize_pastes(input, pending_pastes);
     reset_input_buffer(input, cursor, input_chars, last_input_at);
     pending_pastes.clear();
     *paste_capture = None;
     *command_menu_suppress = false;
+    *pending_pty_snapshot = None;
     send
 }
 
@@ -8044,6 +8045,7 @@ fn run_loop(
     let mut render_cache = ui::ChatRenderCache::new();
     core.push_system(&welcome_shortcuts_prompt_text);
     let mut input = String::new();
+    let mut pending_pty_snapshot: Option<(u64, String)> = None;
     let mut cursor: usize = 0;
     let mut input_chars: usize = 0;
     let mut scroll: u16 = 0;
@@ -8454,6 +8456,11 @@ fn run_loop(
                 tool_preview_active: &mut tool_preview_active,
                 tool_preview_pending_idle: &mut tool_preview_pending_idle,
                 tool_preview_chat_idx: &mut tool_preview_chat_idx,
+                input: &mut input,
+                cursor: &mut cursor,
+                input_chars: &mut input_chars,
+                last_input_at: &mut last_input_at,
+                pending_pty_snapshot: &mut pending_pty_snapshot,
                 active_request_is_mind: &mut active_request_is_mind,
                 active_request_is_fastmemo_compact: &mut active_request_is_fastmemo_compact,
                 streaming_state: &mut streaming_state,
@@ -10330,6 +10337,20 @@ fn run_loop(
                                 "pty.ui.kill",
                                 json!({"via":"double_esc","job_id":killed_job_id.unwrap_or(0)}),
                             );
+                            if let Some((snap_job_id, snap_block)) = pending_pty_snapshot.take() {
+                                if Some(snap_job_id) == killed_job_id {
+                                    if let Some(pos) = input.find(&snap_block) {
+                                        input.replace_range(pos..pos + snap_block.len(), "");
+                                        cursor = cursor.min(input.len());
+                                        input_chars = count_chars(&input);
+                                        if input.is_empty() {
+                                            last_input_at = None;
+                                        }
+                                    }
+                                } else {
+                                    pending_pty_snapshot = Some((snap_job_id, snap_block));
+                                }
+                            }
                             last_esc_at = None;
                             continue;
                         }
@@ -10345,26 +10366,38 @@ fn run_loop(
                     if alt && !ctrl && matches!(key.code, KeyCode::Up) {
                         let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
                         if let Some(state) = pty_tabs.get_mut(active) {
-                            let snap = state.snapshot_plain();
-                            let snap = if snap.trim().is_empty() {
+                            let snap_plain = state.snapshot_plain();
+                            let snap = if snap_plain.trim().is_empty() {
                                 "(empty)".to_string()
                             } else {
-                                truncate_with_suffix(&snap, PTY_SNAPSHOT_MAX_CHARS)
+                                truncate_with_suffix(&snap_plain, PTY_SNAPSHOT_MAX_CHARS)
                             };
                             state.last_user_snapshot = Some(snap.clone());
-                            let tool_text = format!(
-                                "操作: PTY SNAPSHOT\nexplain: 用户触发同步（Alt+↑）\noutput:\n```text\n{snap}\n```\nmeta:\n```text\nscrollback:{} | saved:{} | stdin_log: omitted\n```",
-                                state.scroll, state.saved_path
-                            );
-                            core.push_tool(tool_text.clone());
-                            match state.owner {
-                                MindKind::Sub => dog_state.push_tool(&tool_text),
-                                _ => main_state.push_tool(&tool_text),
+
+                            // Alt+↑：把快照“暂存到聊天输入框”，由用户决定是否发送给 AI。
+                            // 若上一次快照仍未发送且仍在输入框中，则先移除旧快照块，避免堆叠。
+                            if let Some((_old_job_id, old_block)) = pending_pty_snapshot.take() {
+                                if let Some(pos) = input.find(&old_block) {
+                                    input.replace_range(pos..pos + old_block.len(), "");
+                                }
                             }
+
+                            let block = format!(
+                                "[PTY SNAPSHOT job_id:{}]\n```text\n{}\n```\n",
+                                state.job_id, snap
+                            );
+                            pending_pty_snapshot = Some((state.job_id, block.clone()));
+                            if !input.is_empty() && input.as_bytes().last().copied() != Some(10) {
+                                input.push(10 as char);
+                            }
+                            input.push_str(&block);
+                            cursor = input.len();
+                            input_chars = count_chars(&input);
+                            last_input_at = Some(now);
                             push_sys_log(
                                 &mut sys_log,
                                 config.sys_log_limit,
-                                "Terminal: snapshot synced",
+                                "Terminal: snapshot staged (in input)",
                             );
                         }
                         continue;
@@ -11209,6 +11242,7 @@ fn run_loop(
                                     &mut pending_pastes,
                                     &mut paste_capture,
                                     &mut command_menu_suppress,
+                                    &mut pending_pty_snapshot,
                                 );
                                 if send.trim().is_empty() {
                                     continue;
@@ -11264,6 +11298,7 @@ fn run_loop(
                                 &mut pending_pastes,
                                 &mut paste_capture,
                                 &mut command_menu_suppress,
+                                &mut pending_pty_snapshot,
                             );
 
                             if let Some(decision) = normalize_confirm_input(&send) {
@@ -11562,6 +11597,7 @@ fn run_loop(
                                 &mut pending_pastes,
                                 &mut paste_capture,
                                 &mut command_menu_suppress,
+                                &mut pending_pty_snapshot,
                             );
                             if send.trim().is_empty() {
                                 continue;
@@ -11885,6 +11921,11 @@ struct DrainAsyncEventsArgs<'a> {
     tool_preview_active: &'a mut bool,
     tool_preview_pending_idle: &'a mut bool,
     tool_preview_chat_idx: &'a mut Option<usize>,
+    input: &'a mut String,
+    cursor: &'a mut usize,
+    input_chars: &'a mut usize,
+    last_input_at: &'a mut Option<Instant>,
+    pending_pty_snapshot: &'a mut Option<(u64, String)>,
     active_request_is_mind: &'a mut bool,
     active_request_is_fastmemo_compact: &'a mut bool,
     streaming_state: &'a mut StreamingState,
@@ -12937,6 +12978,11 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         tool_preview_active,
         tool_preview_pending_idle,
         tool_preview_chat_idx,
+        input,
+        cursor,
+        input_chars,
+        last_input_at,
+        pending_pty_snapshot,
         active_request_is_mind,
         active_request_is_fastmemo_compact,
         streaming_state,
@@ -13189,6 +13235,20 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 lines,
             } => {
                 pty_handles.remove(&job_id);
+                if let Some((snap_job_id, snap_block)) = pending_pty_snapshot.take() {
+                    if snap_job_id == job_id {
+                        if let Some(pos) = input.find(&snap_block) {
+                            input.replace_range(pos..pos + snap_block.len(), "");
+                            *cursor = (*cursor).min(input.len());
+                            *input_chars = count_chars(input.as_str());
+                            if input.is_empty() {
+                                *last_input_at = None;
+                            }
+                        }
+                    } else {
+                        *pending_pty_snapshot = Some((snap_job_id, snap_block));
+                    }
+                }
                 // DONE 先“缓存聚合”，避免多 tab 结束时连发多条 Tool result。
                 let status = if timed_out {
                     // timeout 属于“结束方式”，不一定是错误：用 ok_ 前缀避免 UI 显示“执行失败：timeout”。

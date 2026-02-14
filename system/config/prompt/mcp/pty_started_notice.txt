@@ -8,10 +8,8 @@ cmd:
 log:{LOG_PATH}
 status:{STATUS_PATH}
 
-说明：终端会继续运行，你可以继续和 AI 聊天；需要交互时按 Home 打开 Terminal 视图。
-
-提示：
-- 如需查看输出/交互：按 Home 打开 Terminal；任务结束后会自动关闭并汇总回传。
-- 如需读取日志/状态：请直接使用上方给出的 log/status 路径，不要猜文件名。
+说明：终端在运行，期间可继续对话。
+       任务结束后会自动关闭。
+       按HOME可展开查看与交互。
 
 {INITIAL_PREVIEW_BLOCK}

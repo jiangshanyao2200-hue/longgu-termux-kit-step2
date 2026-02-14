@@ -7429,33 +7429,112 @@ fn run_native_shell(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> an
     }
 }
 
+fn recover_terminal_best_effort() {
+    disable_raw_mode().ok();
+    execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )
+    .ok();
+}
+
+fn find_repo_root_from(mut dir: PathBuf) -> Option<PathBuf> {
+    for _ in 0..10 {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn resolve_crash_log_path() -> PathBuf {
+    if let Ok(p) = std::env::var("YING_CRASH_LOG") {
+        return PathBuf::from(p);
+    }
+    if let Ok(dir) = std::env::current_dir() {
+        if let Some(root) = find_repo_root_from(dir) {
+            return root.join("log").join("crash.log");
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            if let Some(root) = find_repo_root_from(parent.to_path_buf()) {
+                return root.join("log").join("crash.log");
+            }
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".into());
+    PathBuf::from(home).join(".ying_crash.log")
+}
+
+fn install_crash_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        recover_terminal_best_effort();
+
+        let path = resolve_crash_log_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = writeln!(
+                f,
+                "
+=== CRASH {ts} ==="
+            );
+            let _ = writeln!(f, "panic: {info}");
+            let bt = std::backtrace::Backtrace::force_capture();
+            let _ = writeln!(
+                f,
+                "backtrace:
+{bt}"
+            );
+        }
+
+        prev(info);
+    }));
+}
+
+struct UiGuard;
+
+impl Drop for UiGuard {
+    fn drop(&mut self) {
+        recover_terminal_best_effort();
+    }
+}
+
 pub fn run() -> anyhow::Result<i32> {
     arm_parent_death_signal();
     let exit_flag = setup_exit_flag()?;
     if !tty_is_alive() {
         return Ok(0);
     }
+
     let mut stdout = io::stdout();
     enable_raw_mode().context("enable_raw_mode failed")?;
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        disable_raw_mode().ok();
+        return Err(anyhow::anyhow!("EnterAlternateScreen failed: {e}"));
+    }
+
+    let _ui = UiGuard;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     execute!(terminal.backend_mut(), Clear(ClearType::All)).ok();
     terminal.clear().ok();
 
-    let res = run_loop(&mut terminal, exit_flag);
-
-    disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )
-    .ok();
-    execute!(io::stdout(), crossterm::cursor::Show).ok();
-
-    res
+    run_loop(&mut terminal, exit_flag)
 }
 
 struct PollTimeoutArgs<'a> {
@@ -14491,6 +14570,8 @@ fn try_start_dog_generation(args: TryStartDogGenerationArgs<'_>) -> Option<u64> 
 }
 
 fn main() -> anyhow::Result<()> {
+    install_crash_hook();
+
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--selfcheck" || a == "selfcheck") {
         return run_selfcheck();
@@ -14507,7 +14588,15 @@ fn main() -> anyhow::Result<()> {
             eprintln!("[ying] 依赖 bootstrap 失败：{e:#}");
         }
     }
-    let code = run()?;
+
+    let code = match run() {
+        Ok(code) => code,
+        Err(e) => {
+            recover_terminal_best_effort();
+            eprintln!("[ying] 启动失败：{e:#}");
+            1
+        }
+    };
     std::process::exit(code);
 }
 

@@ -112,6 +112,7 @@
 
 - 2026-02-13：file manager 与 editor 必须分离（职责与协议清晰，避免无限膨胀）。
 - 2026-02-13：失败判定仅认 `状态:fail`；其余均为“情况汇报”。
+- 2026-02-15：可配置 JSON（如 `mcp_messages.json`/`tool_messages.json`）的反序列化不要放进 `Default::default()`，避免与 `#[serde(default)]` 形成递归导致栈溢出；推荐做法是“字段级默认函数 + Default 纯构造”。
 
 ## 4. 上下文压缩后的“恢复流程”（给智能体/维护者）
 

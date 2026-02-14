@@ -7,9 +7,9 @@
 - `config/prompt/agent/`
   - `main.txt`：MAIN 智能体主提示词
   - `dog.txt`：DOG（调度/压缩）提示词
-  - `context_main.txt`：主上下文提示词（ctx main prompt）
 
 - `config/prompt/memory/`
+  - `context_main.txt`：日记/主上下文模板（用于写日记等记忆任务）
   - `context_compact.txt`：上下文压缩提示词
   - `fastmemo_compact.txt`：fastmemo 压缩提示词
 

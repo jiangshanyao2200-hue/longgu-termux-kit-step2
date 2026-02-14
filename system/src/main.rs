@@ -3010,7 +3010,7 @@ fn load_context_prompts() -> (ContextPromptConfig, Vec<String>, PathBuf) {
     let defaults = ContextPromptConfig::default();
     let main_path = resolve_config_path_from_env(
         "YING_CTX_MAIN_PROMPT_PATH",
-        "config/prompt/agent/context_main.txt",
+        "config/prompt/memory/context_main.txt",
     );
     let mut errors = Vec::new();
     let (main_prompt, err_main) =

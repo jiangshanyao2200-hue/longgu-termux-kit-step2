@@ -1,7 +1,7 @@
 {
   "chat_target": "main",
   "context_compact_prompt_path": "config/prompt/memory/context_compact.txt",
-  "welcome_shortcuts_prompt_path": "config/systemmessage/ui/welcome_shortcuts.txt",
+  "welcome_shortcuts_prompt_path": "config/prompt/system/welcome_shortcuts.txt",
   "mcp_messages_path": "config/prompt/mcp/mcp_messages.json",
   "tool_messages_path": "config/prompt/mcp/tool_messages.json",
   "pty_audit_prompt_path": "config/prompt/mcp/pty_audit.txt",

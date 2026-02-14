@@ -84,7 +84,7 @@ const PTY_RETURN_STDIN_MAX_CHARS: usize = 2_000;
 const PTY_DONE_BATCH_TOOL_MAX_CHARS: usize = 14_000;
 const PTY_DONE_BATCH_TAIL_MAX_CHARS: usize = 1_600;
 const DEFAULT_WELCOME_SHORTCUTS_PROMPT: &str =
-    include_str!("../config/systemmessage/ui/welcome_shortcuts.txt");
+    include_str!("../config/prompt/system/welcome_shortcuts.txt");
 const MODEL_RESPONSE_TIMEOUT_CAP_SECS: u64 = 7 * 60;
 // DeepSeek chat/completions 没有 tool role，且部分提供方对“最后一条消息 role”很敏感：
 // - 若最后是 assistant（或 system），可能报 400（如 Invalid consecutive assistant message）
@@ -2698,7 +2698,7 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
     }
     if cfg.welcome_shortcuts_prompt_path.trim().is_empty() {
         cfg.welcome_shortcuts_prompt_path =
-            "config/systemmessage/ui/welcome_shortcuts.txt".to_string();
+            "config/prompt/system/welcome_shortcuts.txt".to_string();
     }
     cfg.chat_target = normalize_chat_target_value(&cfg.chat_target);
     (cfg, err, path_buf)
@@ -15011,7 +15011,7 @@ mod config {
     }
 
     fn default_welcome_shortcuts_prompt_path() -> String {
-        "config/systemmessage/ui/welcome_shortcuts.txt".to_string()
+        "config/prompt/system/welcome_shortcuts.txt".to_string()
     }
 
     impl AppConfig {

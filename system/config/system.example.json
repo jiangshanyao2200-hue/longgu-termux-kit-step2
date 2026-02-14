@@ -1,6 +1,11 @@
 {
   "chat_target": "main",
-  "context_compact_prompt_path": "prompts/context_compact.txt",
+  "context_compact_prompt_path": "prompts/mcpprompt/context_compact.txt",
+  "welcome_shortcuts_prompt_path": "prompts/mcpprompt/welcome_shortcuts.txt",
+  "mcp_messages_path": "prompts/mcpprompt/messages.json",
+  "pty_audit_prompt_path": "prompts/mcpprompt/pty_audit.txt",
+  "pty_help_prompt_path": "prompts/mcpprompt/pty_help.txt",
+  "pty_started_notice_prompt_path": "prompts/mcpprompt/pty_started_notice.txt",
   "context_k": 20,
   "ctx_pool_max_items": 10,
   "ctx_recent_max_tokens": 3000,

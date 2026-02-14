@@ -82,7 +82,8 @@ const PTY_RETURN_RAW_TAIL_MAX_CHARS: usize = 6_000;
 const PTY_RETURN_STDIN_MAX_CHARS: usize = 2_000;
 const PTY_DONE_BATCH_TOOL_MAX_CHARS: usize = 14_000;
 const PTY_DONE_BATCH_TAIL_MAX_CHARS: usize = 1_600;
-const WELCOME_SHORTCUTS: &str = "欢迎使用 Project Ying（萤）。\n\n快捷键（聊天页）：\n- ↑/↓：滚动历史（输入中也可）\n- Ctrl+↑/Ctrl+↓：输入框多行光标上下\n- PgUp/PgDn：输入空→选消息；PTY 开→切终端 tab\n- Home：退出选择；若有 Terminal 则切显隐\n- ←/→：展开/收起（选中消息时）\n- Tab：全部展开/全部收起（输入空时）\n- Shift+Tab：详情/简约模式\n- Alt+Enter：忙时强发送入队（最低优先）\n- Alt+↑：队列（↑↓选 / Enter编辑 / Home退 / 编辑Alt+↓保存）\n\nTerminal（PTY）：\n- Home：打开/隐藏 Terminal（后台继续）\n- PgUp/PgDn：切换终端 tab\n- Esc：发给终端；Esc×2(350ms) 结束任务\n- Ctrl+Home：强制结束当前任务\n- Alt+↑：同步终端快照给 AI";
+const DEFAULT_WELCOME_SHORTCUTS_PROMPT: &str =
+    include_str!("../prompts/mcpprompt/welcome_shortcuts.txt");
 const MODEL_RESPONSE_TIMEOUT_CAP_SECS: u64 = 7 * 60;
 // DeepSeek chat/completions 没有 tool role，且部分提供方对“最后一条消息 role”很敏感：
 // - 若最后是 assistant（或 system），可能报 400（如 Invalid consecutive assistant message）
@@ -2663,6 +2664,9 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
     if cfg.mcp_messages_path.trim().is_empty() {
         cfg.mcp_messages_path = "prompts/mcpprompt/messages.json".to_string();
     }
+    if cfg.welcome_shortcuts_prompt_path.trim().is_empty() {
+        cfg.welcome_shortcuts_prompt_path = "prompts/mcpprompt/welcome_shortcuts.txt".to_string();
+    }
     cfg.chat_target = normalize_chat_target_value(&cfg.chat_target);
     (cfg, err, path_buf)
 }
@@ -3096,6 +3100,18 @@ fn load_fastmemo_compact_prompt() -> (String, Option<String>, PathBuf) {
     );
     let (text, err) =
         load_prompt_file_with_default(&path, DEFAULT_FASTMEMO_COMPACT_PROMPT, "FASTMEMO-COMPACT");
+    (text, err, path)
+}
+
+const DEFAULT_WELCOME_SHORTCUTS_PROMPT_LABEL: &str = "WELCOME";
+
+fn load_welcome_shortcuts_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
+    let path = resolve_config_path(&sys_cfg.welcome_shortcuts_prompt_path, true);
+    let (text, err) = load_prompt_file_with_default(
+        &path,
+        DEFAULT_WELCOME_SHORTCUTS_PROMPT,
+        DEFAULT_WELCOME_SHORTCUTS_PROMPT_LABEL,
+    );
     (text, err, path)
 }
 
@@ -7917,6 +7933,12 @@ fn run_loop(
         load_pty_started_notice_prompt(&sys_cfg);
     let (fastmemo_compact_prompt_text, fastmemo_compact_prompt_err, _fastmemo_compact_prompt_path) =
         load_fastmemo_compact_prompt();
+    let (
+        welcome_shortcuts_prompt_text,
+        welcome_shortcuts_prompt_err,
+        welcome_shortcuts_prompt_path,
+    ) = load_welcome_shortcuts_prompt(&sys_cfg);
+
     let (mcp_messages, mcp_messages_err, mcp_messages_path) =
         crate::mcp_messages::load_mcp_messages(&sys_cfg);
     let mut dog_state = DogState::new(
@@ -7968,7 +7990,7 @@ fn run_loop(
     let main_client_err = main_client_result.err().map(|e| e.to_string());
     let theme = ui::Theme::from_env();
     let mut render_cache = ui::ChatRenderCache::new();
-    core.push_system(WELCOME_SHORTCUTS);
+    core.push_system(&welcome_shortcuts_prompt_text);
     let mut input = String::new();
     let mut cursor: usize = 0;
     let mut input_chars: usize = 0;
@@ -8169,6 +8191,24 @@ fn run_loop(
             &mut sys_log,
             config.sys_log_limit,
             "FASTMEMO-COMPACT: 已载入提示词",
+        );
+    }
+    if let Some(err) = welcome_shortcuts_prompt_err {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!(
+                "WELCOME: {err} ({})",
+                welcome_shortcuts_prompt_path.display()
+            ),
+        );
+    } else if welcome_shortcuts_prompt_text.trim().is_empty() {
+        push_sys_log(&mut sys_log, config.sys_log_limit, "WELCOME: 提示词为空");
+    } else {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!("WELCOME: 配置 {}", welcome_shortcuts_prompt_path.display()),
         );
     }
     if let Some(err) = mcp_messages_err {
@@ -14872,6 +14912,8 @@ mod config {
         pub pty_started_notice_prompt_path: String,
         #[serde(default = "default_mcp_messages_path")]
         pub mcp_messages_path: String,
+        #[serde(default = "default_welcome_shortcuts_prompt_path")]
+        pub welcome_shortcuts_prompt_path: String,
         #[serde(default)]
         pub chat_target: String,
     }
@@ -14906,6 +14948,10 @@ mod config {
 
     fn default_mcp_messages_path() -> String {
         "prompts/mcpprompt/messages.json".to_string()
+    }
+
+    fn default_welcome_shortcuts_prompt_path() -> String {
+        "prompts/mcpprompt/welcome_shortcuts.txt".to_string()
     }
 
     impl AppConfig {
@@ -15038,6 +15084,7 @@ mod config {
                 pty_help_prompt_path: default_pty_help_prompt_path(),
                 pty_started_notice_prompt_path: default_pty_started_notice_prompt_path(),
                 mcp_messages_path: default_mcp_messages_path(),
+                welcome_shortcuts_prompt_path: default_welcome_shortcuts_prompt_path(),
                 chat_target: "dog".to_string(),
             }
         }

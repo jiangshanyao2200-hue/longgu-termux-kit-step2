@@ -29,17 +29,17 @@ impl Default for ToolMessages {
     fn default() -> Self {
         serde_json::from_str::<ToolMessages>(DEFAULT_TOOL_MESSAGES_JSON).unwrap_or_else(|_| {
             ToolMessages {
-                tool_line: "操作: {TOOL}\n".to_string(),
-                explain_line: "说明: {BRIEF}\n".to_string(),
-                input_line: "输入: {INPUT}\n".to_string(),
-                output_header: "输出:\n```text\n".to_string(),
+                tool_line: "TOOL: {TOOL}\n".to_string(),
+                explain_line: "EXPLAIN: {BRIEF}\n".to_string(),
+                input_line: "INPUT: {INPUT}\n".to_string(),
+                output_header: "OUTPUT:\n```text\n".to_string(),
                 output_footer: "\n```\n".to_string(),
-                meta_header: "元信息:\n```text\n".to_string(),
+                meta_header: "META:\n```text\n".to_string(),
                 meta_footer: "\n```\n".to_string(),
-                no_output: "(无输出)".to_string(),
-                unknown_tool: "未知工具：{TOOL}".to_string(),
-                tool_failed: "工具执行失败：{ERR}".to_string(),
-                tool_failed_generic: "工具执行失败".to_string(),
+                no_output: "(NO OUTPUT)".to_string(),
+                unknown_tool: "UNKNOWN TOOL: {TOOL}".to_string(),
+                tool_failed: "TOOL FAILED: {ERR}".to_string(),
+                tool_failed_generic: "TOOL FAILED".to_string(),
             }
         })
     }

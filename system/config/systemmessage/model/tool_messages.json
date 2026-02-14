@@ -1,14 +1,14 @@
 {
-  "tool_line": "操作: {TOOL}\\n",
-  "explain_line": "说明: {BRIEF}\\n",
-  "input_line": "输入: {INPUT}\\n",
-  "output_header": "输出:\\n```text\\n",
+  "tool_line": "TOOL: {TOOL}\\n",
+  "explain_line": "EXPLAIN: {BRIEF}\\n",
+  "input_line": "INPUT: {INPUT}\\n",
+  "output_header": "OUTPUT:\\n```text\\n",
   "output_footer": "\\n```\\n",
-  "meta_header": "元信息:\\n```text\\n",
+  "meta_header": "META:\\n```text\\n",
   "meta_footer": "\\n```\\n",
-  "no_output": "(无输出)",
+  "no_output": "(NO OUTPUT)",
 
-  "unknown_tool": "未知工具：{TOOL}",
-  "tool_failed": "工具执行失败：{ERR}",
-  "tool_failed_generic": "工具执行失败"
+  "unknown_tool": "UNKNOWN TOOL: {TOOL}",
+  "tool_failed": "TOOL FAILED: {ERR}",
+  "tool_failed_generic": "TOOL FAILED"
 }

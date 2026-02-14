@@ -1572,10 +1572,14 @@ fn format_tool_message_with_limits(
     meta_max_lines: usize,
     meta_max_chars: usize,
 ) -> String {
+    let msgs = crate::tool_messages::tool_messages();
     let mut msg = String::new();
     let label = tool_display_label(&call.tool);
     if !label.is_empty() {
-        msg.push_str(&format!("操作: {label}\n"));
+        msg.push_str(&crate::tool_messages::render_tool_template(
+            &msgs.tool_line,
+            &[("TOOL", &label)],
+        ));
     }
     let mut input_preview = describe_tool_input(call, 400);
     if let Some((add, del, unit)) = extract_delta_from_log(&outcome.log_lines)
@@ -1597,14 +1601,20 @@ fn format_tool_message_with_limits(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        msg.push_str(&format!("explain: {brief}\n"));
+        msg.push_str(&crate::tool_messages::render_tool_template(
+            &msgs.explain_line,
+            &[("BRIEF", brief)],
+        ));
     }
     if !input_preview.is_empty() {
-        msg.push_str(&format!("input: {input_preview}\n"));
+        msg.push_str(&crate::tool_messages::render_tool_template(
+            &msgs.input_line,
+            &[("INPUT", &input_preview)],
+        ));
     }
-    msg.push_str("output:\n```text\n");
+    msg.push_str(&msgs.output_header);
     let output = if outcome.user_message.trim().is_empty() {
-        "(no output)".to_string()
+        msgs.no_output.clone()
     } else {
         truncate_tool_payload(
             outcome.user_message.trim_end(),
@@ -1613,13 +1623,13 @@ fn format_tool_message_with_limits(
         )
     };
     msg.push_str(&output);
-    msg.push_str("\n```\n");
+    msg.push_str(&msgs.output_footer);
     if !outcome.log_lines.is_empty() {
-        msg.push_str("meta:\n```text\n");
+        msg.push_str(&msgs.meta_header);
         let meta_join = outcome.log_lines.join("\n");
         let meta = truncate_tool_payload(meta_join.trim_end(), meta_max_lines, meta_max_chars);
         msg.push_str(&meta);
-        msg.push_str("\n```\n");
+        msg.push_str(&msgs.meta_footer);
     }
     msg.trim_end().to_string()
 }
@@ -2085,10 +2095,16 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         "mind_msg" => run_mind_msg(call),
         "system_config" => run_system_config(call),
         "skills_mcp" => run_skills_mcp(call),
-        other => Ok(ToolOutcome {
-            user_message: format!("未知工具：{other}"),
-            log_lines: vec!["状态:fail".to_string()],
-        }),
+        other => {
+            let msgs = crate::tool_messages::tool_messages();
+            Ok(ToolOutcome {
+                user_message: crate::tool_messages::render_tool_template(
+                    &msgs.unknown_tool,
+                    &[("TOOL", other)],
+                ),
+                log_lines: vec!["状态:fail".to_string()],
+            })
+        }
     }
 }
 
@@ -2130,14 +2146,23 @@ pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutco
             }
             Err(e) => {
                 last = Some(ToolOutcome {
-                    user_message: format!("工具执行失败：{e:#}"),
+                    user_message: {
+                        let err = format!("{e:#}");
+                        let msgs = crate::tool_messages::tool_messages();
+                        crate::tool_messages::render_tool_template(
+                            &msgs.tool_failed,
+                            &[("ERR", &err)],
+                        )
+                    },
                     log_lines: vec!["状态:fail".to_string()],
                 });
             }
         }
     }
     let mut out = last.unwrap_or_else(|| ToolOutcome {
-        user_message: "工具执行失败".to_string(),
+        user_message: crate::tool_messages::tool_messages()
+            .tool_failed_generic
+            .clone(),
         log_lines: vec!["状态:fail".to_string()],
     });
     ensure_outcome_status(&mut out);

@@ -22,7 +22,7 @@
 
 ## 定时审计（已实现）
 - 每 5 分钟触发一次（空闲门控：不与用户请求/工具并发）。
-- 注入模板：`AItermux/system/prompts/mcpprompt/pty_audit.txt`
+- 注入模板：`AItermux/system/config/systemmessage/model/pty_audit.txt`
 - 模板内容会指明 `status/log` 路径，模型用 `read_file` 查看并简短回复即可。
 
 ## 发送队列（已实现）

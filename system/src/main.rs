@@ -41,6 +41,7 @@ use unicode_width::UnicodeWidthChar;
 mod mcp;
 mod mcp_messages; // configurable system→model messages
 mod memorydb;
+mod tool_messages;
 mod ui;
 
 use crate::commands::filter_commands_for_input;
@@ -83,7 +84,7 @@ const PTY_RETURN_STDIN_MAX_CHARS: usize = 2_000;
 const PTY_DONE_BATCH_TOOL_MAX_CHARS: usize = 14_000;
 const PTY_DONE_BATCH_TAIL_MAX_CHARS: usize = 1_600;
 const DEFAULT_WELCOME_SHORTCUTS_PROMPT: &str =
-    include_str!("../prompts/mcpprompt/welcome_shortcuts.txt");
+    include_str!("../config/systemmessage/ui/welcome_shortcuts.txt");
 const MODEL_RESPONSE_TIMEOUT_CAP_SECS: u64 = 7 * 60;
 // DeepSeek chat/completions 没有 tool role，且部分提供方对“最后一条消息 role”很敏感：
 // - 若最后是 assistant（或 system），可能报 400（如 Invalid consecutive assistant message）
@@ -1404,6 +1405,7 @@ struct DogState {
     prompt: String,
     prompt_reinject_pct: u8,
     deepseek_tool_loop_tick_user: String,
+    tool_result_assistant_template: String,
     last_prompt_inject_user: usize,
     user_count: usize,
     used_tokens_est: usize,
@@ -1416,12 +1418,18 @@ struct DogState {
 }
 
 impl DogState {
-    fn new(prompt: String, prompt_reinject_pct: u8, deepseek_tool_loop_tick_user: String) -> Self {
+    fn new(
+        prompt: String,
+        prompt_reinject_pct: u8,
+        deepseek_tool_loop_tick_user: String,
+        tool_result_assistant_template: String,
+    ) -> Self {
         let mut s = Self {
             messages: Vec::new(),
             prompt,
             prompt_reinject_pct,
             deepseek_tool_loop_tick_user,
+            tool_result_assistant_template,
             last_prompt_inject_user: 0,
             user_count: 0,
             used_tokens_est: 0,
@@ -1534,7 +1542,13 @@ impl DogState {
         }
         // DeepSeek chat/completions 没有 tool role：用 assistant 承载 tool 结果。
         // “伪 user 占位”只在 message_snapshot() 里按需追加，避免污染历史与 token 预算。
-        self.push_message("assistant", format!("Tool result:\n{clean}"));
+        self.push_message(
+            "assistant",
+            crate::mcp_messages::render_template(
+                &self.tool_result_assistant_template,
+                &[("RESULT", clean)],
+            ),
+        );
     }
 
     fn set_last_usage_total(&mut self, tokens: u64) {
@@ -2426,7 +2440,12 @@ mod message_normalize_tests {
 
     #[test]
     fn merges_consecutive_assistant_messages_for_deepseek() {
-        let mut state = DogState::new(String::new(), 80, DEEPSEEK_TOOL_LOOP_TICK_USER.to_string());
+        let mut state = DogState::new(
+            String::new(),
+            80,
+            DEEPSEEK_TOOL_LOOP_TICK_USER.to_string(),
+            "Tool result:\n{RESULT}".to_string(),
+        );
         state.messages.clear();
         state.used_tokens_est = 0;
 
@@ -2444,7 +2463,12 @@ mod message_normalize_tests {
 
     #[test]
     fn message_snapshot_normalizes_existing_consecutive_assistants() {
-        let mut state = DogState::new(String::new(), 80, DEEPSEEK_TOOL_LOOP_TICK_USER.to_string());
+        let mut state = DogState::new(
+            String::new(),
+            80,
+            DEEPSEEK_TOOL_LOOP_TICK_USER.to_string(),
+            "Tool result:\n{RESULT}".to_string(),
+        );
         state.messages.clear();
         state.used_tokens_est = 0;
         state.messages.push(ApiMessage {
@@ -2464,7 +2488,12 @@ mod message_normalize_tests {
 
     #[test]
     fn tool_context_user_placeholder_is_injected_at_snapshot() {
-        let mut state = DogState::new(String::new(), 80, DEEPSEEK_TOOL_LOOP_TICK_USER.to_string());
+        let mut state = DogState::new(
+            String::new(),
+            80,
+            DEEPSEEK_TOOL_LOOP_TICK_USER.to_string(),
+            "Tool result:\n{RESULT}".to_string(),
+        );
         state.messages.clear();
         state.used_tokens_est = 0;
 
@@ -2650,22 +2679,28 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
         cfg.ctx_pool_max_items = 10;
     }
     if cfg.context_compact_prompt_path.trim().is_empty() {
-        cfg.context_compact_prompt_path = "prompts/mcpprompt/context_compact.txt".to_string();
+        cfg.context_compact_prompt_path =
+            "config/systemmessage/model/context_compact.txt".to_string();
     }
     if cfg.pty_audit_prompt_path.trim().is_empty() {
-        cfg.pty_audit_prompt_path = "prompts/mcpprompt/pty_audit.txt".to_string();
+        cfg.pty_audit_prompt_path = "config/systemmessage/model/pty_audit.txt".to_string();
     }
     if cfg.pty_help_prompt_path.trim().is_empty() {
-        cfg.pty_help_prompt_path = "prompts/mcpprompt/pty_help.txt".to_string();
+        cfg.pty_help_prompt_path = "config/systemmessage/model/pty_help.txt".to_string();
     }
     if cfg.pty_started_notice_prompt_path.trim().is_empty() {
-        cfg.pty_started_notice_prompt_path = "prompts/mcpprompt/pty_started_notice.txt".to_string();
+        cfg.pty_started_notice_prompt_path =
+            "config/systemmessage/model/pty_started_notice.txt".to_string();
     }
     if cfg.mcp_messages_path.trim().is_empty() {
-        cfg.mcp_messages_path = "prompts/mcpprompt/messages.json".to_string();
+        cfg.mcp_messages_path = "config/systemmessage/model/mcp_messages.json".to_string();
+    }
+    if cfg.tool_messages_path.trim().is_empty() {
+        cfg.tool_messages_path = "config/systemmessage/model/tool_messages.json".to_string();
     }
     if cfg.welcome_shortcuts_prompt_path.trim().is_empty() {
-        cfg.welcome_shortcuts_prompt_path = "prompts/mcpprompt/welcome_shortcuts.txt".to_string();
+        cfg.welcome_shortcuts_prompt_path =
+            "config/systemmessage/ui/welcome_shortcuts.txt".to_string();
     }
     cfg.chat_target = normalize_chat_target_value(&cfg.chat_target);
     (cfg, err, path_buf)
@@ -3096,7 +3131,7 @@ const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str = "系统：fastmemo 已达到阈值
 fn load_fastmemo_compact_prompt() -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path_from_env(
         "YING_FASTMEMO_COMPACT_PROMPT_PATH",
-        "prompts/mcpprompt/fastmemo_compact.txt",
+        "config/systemmessage/model/fastmemo_compact.txt",
     );
     let (text, err) =
         load_prompt_file_with_default(&path, DEFAULT_FASTMEMO_COMPACT_PROMPT, "FASTMEMO-COMPACT");
@@ -7938,19 +7973,24 @@ fn run_loop(
         welcome_shortcuts_prompt_err,
         welcome_shortcuts_prompt_path,
     ) = load_welcome_shortcuts_prompt(&sys_cfg);
-
     let (mcp_messages, mcp_messages_err, mcp_messages_path) =
         crate::mcp_messages::load_mcp_messages(&sys_cfg);
+
+    let (tool_messages, tool_messages_err, tool_messages_path) =
+        crate::tool_messages::load_tool_messages(&sys_cfg);
+    crate::tool_messages::set_tool_messages(tool_messages);
     let mut dog_state = DogState::new(
         dog_prompt,
         dog_cfg.prompt_reinject_pct,
         mcp_messages.deepseek_tool_loop_tick_user.clone(),
+        mcp_messages.tool_result_assistant.clone(),
     );
     let mut main_prompt_text = main_prompt;
     let mut main_state = DogState::new(
         main_prompt_text.clone(),
         80,
         mcp_messages.deepseek_tool_loop_tick_user.clone(),
+        mcp_messages.tool_result_assistant.clone(),
     );
     // MAIN 也可能发起工具调用（记忆/系统配置等）。若不回注工具结果，模型会反复重试同一工具。
     main_state.set_include_tool_context(true);
@@ -8222,6 +8262,20 @@ fn run_loop(
             &mut sys_log,
             config.sys_log_limit,
             format!("MCP-MESSAGES: 配置 {}", mcp_messages_path.display()),
+        );
+    }
+
+    if let Some(err) = tool_messages_err {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!("TOOL-MESSAGES: {err} ({})", tool_messages_path.display()),
+        );
+    } else {
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!("TOOL-MESSAGES: 配置 {}", tool_messages_path.display()),
         );
     }
     if let Some(err) = metamemo_err.take() {
@@ -14912,6 +14966,8 @@ mod config {
         pub pty_started_notice_prompt_path: String,
         #[serde(default = "default_mcp_messages_path")]
         pub mcp_messages_path: String,
+        #[serde(default = "default_tool_messages_path")]
+        pub tool_messages_path: String,
         #[serde(default = "default_welcome_shortcuts_prompt_path")]
         pub welcome_shortcuts_prompt_path: String,
         #[serde(default)]
@@ -14931,27 +14987,31 @@ mod config {
     }
 
     fn default_context_compact_prompt_path() -> String {
-        "prompts/mcpprompt/context_compact.txt".to_string()
+        "config/systemmessage/model/context_compact.txt".to_string()
     }
 
     fn default_pty_audit_prompt_path() -> String {
-        "prompts/mcpprompt/pty_audit.txt".to_string()
+        "config/systemmessage/model/pty_audit.txt".to_string()
     }
 
     fn default_pty_help_prompt_path() -> String {
-        "prompts/mcpprompt/pty_help.txt".to_string()
+        "config/systemmessage/model/pty_help.txt".to_string()
     }
 
     fn default_pty_started_notice_prompt_path() -> String {
-        "prompts/mcpprompt/pty_started_notice.txt".to_string()
+        "config/systemmessage/model/pty_started_notice.txt".to_string()
     }
 
     fn default_mcp_messages_path() -> String {
-        "prompts/mcpprompt/messages.json".to_string()
+        "config/systemmessage/model/mcp_messages.json".to_string()
+    }
+
+    fn default_tool_messages_path() -> String {
+        "config/systemmessage/model/tool_messages.json".to_string()
     }
 
     fn default_welcome_shortcuts_prompt_path() -> String {
-        "prompts/mcpprompt/welcome_shortcuts.txt".to_string()
+        "config/systemmessage/ui/welcome_shortcuts.txt".to_string()
     }
 
     impl AppConfig {
@@ -15084,6 +15144,7 @@ mod config {
                 pty_help_prompt_path: default_pty_help_prompt_path(),
                 pty_started_notice_prompt_path: default_pty_started_notice_prompt_path(),
                 mcp_messages_path: default_mcp_messages_path(),
+                tool_messages_path: default_tool_messages_path(),
                 welcome_shortcuts_prompt_path: default_welcome_shortcuts_prompt_path(),
                 chat_target: "dog".to_string(),
             }

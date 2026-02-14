@@ -1,0 +1,14 @@
+{
+  "tool_line": "操作: {TOOL}\\n",
+  "explain_line": "说明: {BRIEF}\\n",
+  "input_line": "输入: {INPUT}\\n",
+  "output_header": "输出:\\n```text\\n",
+  "output_footer": "\\n```\\n",
+  "meta_header": "元信息:\\n```text\\n",
+  "meta_footer": "\\n```\\n",
+  "no_output": "(无输出)",
+
+  "unknown_tool": "未知工具：{TOOL}",
+  "tool_failed": "工具执行失败：{ERR}",
+  "tool_failed_generic": "工具执行失败"
+}

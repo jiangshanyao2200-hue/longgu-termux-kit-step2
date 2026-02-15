@@ -1130,9 +1130,6 @@ fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
         let l = line.trim_start();
         (l.starts_with("● Ran CMD") || l.starts_with("○ Ran CMD"))
             || (l.starts_with("● Tool result") || l.starts_with("○ Tool result"))
-            || (l.starts_with("● tool") || l.starts_with("○ tool"))
-            || l.starts_with("Tool result:")
-            || l.starts_with("TOOL:")
     }
 
     fn is_continuation(line: &str) -> bool {
@@ -12232,20 +12229,6 @@ fn handle_model_stream_chunk(args: ModelStreamChunkArgs<'_>, content: &str, reas
         streaming_state.text = strip_thinking_stream(&streaming_state.raw_text);
     } else {
         streaming_state.text.clone_from(&streaming_state.raw_text);
-    }
-    // 防御：部分模型会把系统工具块“原样复述”到正文里（例如以 `Tool result:` / `● Tool result` 开头）。
-    // 这类内容会误导用户（看起来像系统输出），并污染后续工具解析；流式阶段先过滤显示，最终结束阶段会再统一提取。
-    if streaming_state.text.contains("Tool result:")
-        || streaming_state.text.contains("● Tool result")
-        || streaming_state.text.contains("○ Tool result")
-        || streaming_state.text.contains("● Ran CMD")
-        || streaming_state.text.contains("○ Ran CMD")
-        || streaming_state.text.contains("● tool")
-        || streaming_state.text.contains("○ tool")
-        || streaming_state.text.contains("TOOL:")
-    {
-        let (cleaned, _blocks) = extract_internal_tool_echo_blocks(&streaming_state.text);
-        streaming_state.text = cleaned;
     }
 
     if sse_enabled {

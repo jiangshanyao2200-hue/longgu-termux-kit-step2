@@ -206,20 +206,97 @@ fn should_compact_user_message(text: &str) -> bool {
     lines >= USER_SUMMARY_LINE_THRESHOLD || chars >= USER_SUMMARY_CHAR_THRESHOLD
 }
 
-fn render_user_preview_lines(text: &str, width: usize, expanded: bool) -> Vec<String> {
+const USER_PASTE_MARKER_BEGIN: &str = "[[AITERMUX_PASTE_BEGIN|";
+const USER_PASTE_MARKER_END: &str = "[[AITERMUX_PASTE_END|";
+
+#[derive(Debug, Clone)]
+struct UserPasteBlock {
+    id: String,
+    saved: String,
+    lines: usize,
+    chars: usize,
+    content: String,
+}
+
+fn split_user_paste_blocks(text: &str) -> (String, Vec<UserPasteBlock>) {
+    let mut base_lines: Vec<String> = Vec::new();
+    let mut blocks: Vec<UserPasteBlock> = Vec::new();
+    let mut cur: Option<UserPasteBlock> = None;
+
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r');
+        if cur.is_none() {
+            if let Some(rest) = line.strip_prefix(USER_PASTE_MARKER_BEGIN) {
+                if let Some(meta) = rest.strip_suffix("]]") {
+                    let mut id = String::new();
+                    let mut saved = String::new();
+                    let mut lines_n: usize = 0;
+                    let mut chars_n: usize = 0;
+                    for part in meta.split('|') {
+                        let (k, v) = part.split_once('=').unwrap_or((part, ""));
+                        match k.trim() {
+                            "id" => id = v.trim().to_string(),
+                            "saved" => saved = v.trim().to_string(),
+                            "lines" => lines_n = v.trim().parse().unwrap_or(0),
+                            "chars" => chars_n = v.trim().parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                    if !id.is_empty() {
+                        cur = Some(UserPasteBlock {
+                            id,
+                            saved,
+                            lines: lines_n,
+                            chars: chars_n,
+                            content: String::new(),
+                        });
+                        continue;
+                    }
+                }
+            }
+            base_lines.push(line.to_string());
+            continue;
+        }
+
+        // in paste block
+        let Some(mut block) = cur.take() else {
+            base_lines.push(line.to_string());
+            continue;
+        };
+        let end_marker = format!("{USER_PASTE_MARKER_END}id={}]]", block.id);
+        if line.trim() == end_marker {
+            blocks.push(block);
+            continue;
+        }
+        if !block.content.is_empty() {
+            block.content.push('\n');
+        }
+        block.content.push_str(line);
+        cur = Some(block);
+    }
+    // 未闭合的块：当作普通文本回退（避免“永远消失”）。
+    if let Some(block) = cur {
+        base_lines.push(format!(
+            "{USER_PASTE_MARKER_BEGIN}id={}|lines={}|chars={}|saved={}]]",
+            block.id, block.lines, block.chars, block.saved
+        ));
+        if !block.content.is_empty() {
+            base_lines.extend(block.content.lines().map(|s| s.to_string()));
+        }
+    }
+    (base_lines.join("\n").trim_end().to_string(), blocks)
+}
+
+fn render_user_preview_lines(text: &str, width: usize) -> Vec<String> {
     const MAX_LINES: usize = 3;
     let width = width.max(1);
     let lines_total = text.lines().count().max(1);
     let chars_total = text.chars().count();
     let is_paste = should_compact_user_message(text);
 
-    // paste/长文本：永远不展示原文；展开/收起只影响“信息量”（仍然不显示原文）。
+    // paste/长文本：折叠时用一行摘要（避免把原文塞进聊天区）。
     if is_paste {
-        let collapsed = format!("粘贴内容（已隐藏）总行数：{lines_total} 字符数：{chars_total}");
-        let expanded_text = format!(
-            "粘贴内容（已隐藏原文）\n总行数：{lines_total}  字符数：{chars_total}\n（展开也不显示原文）"
-        );
-        let src = if expanded { expanded_text } else { collapsed };
+        let src = format!("[Pasted Content {chars_total} chars / {lines_total} lines]");
         let mut out: Vec<String> = Vec::new();
         for line in src.lines() {
             for wrapped in wrap_plain_line(line, width) {
@@ -235,8 +312,8 @@ fn render_user_preview_lines(text: &str, width: usize, expanded: bool) -> Vec<St
         return out;
     }
 
-    // 普通用户消息：最多显示 3 行；展开时用“最后一行”给出简短统计，仍不展示更多原文。
-    let content_max = if expanded { 2 } else { 3 };
+    // 普通用户消息：最多显示 3 行。
+    let content_max = 3;
     let mut out: Vec<String> = Vec::new();
     let mut truncated = false;
     let mut produced = 0usize;
@@ -260,16 +337,16 @@ fn render_user_preview_lines(text: &str, width: usize, expanded: bool) -> Vec<St
     if out.is_empty() {
         out.push(String::new());
     }
-    if expanded && out.len() < MAX_LINES {
-        let tail = if truncated {
-            format!("…已隐藏后续内容｜总行数：{lines_total} 字符数：{chars_total}")
-        } else {
-            format!("总行数：{lines_total} 字符数：{chars_total}")
-        };
-        for wrapped in wrap_plain_line(&tail, width) {
-            out.push(wrapped);
-            if out.len() >= MAX_LINES {
-                break;
+    if truncated && !out.is_empty() {
+        let last_idx = out.len().saturating_sub(1);
+        if !out[last_idx].ends_with('…') {
+            let w = UnicodeWidthStr::width(out[last_idx].as_str());
+            if width > 1 && w >= width {
+                let mut s = slice_by_cells(&out[last_idx], 0, width.saturating_sub(1));
+                s.push('…');
+                out[last_idx] = s;
+            } else {
+                out[last_idx].push('…');
             }
         }
     }
@@ -3113,18 +3190,57 @@ fn render_message_lines(
     };
     if msg.role == Role::User {
         let content_width = width.saturating_sub(prefix_width).max(1);
-        let preview = render_user_preview_lines(&msg.text, content_width, user_expanded);
-        let preview = if let Some(reveal_len) = reveal_len {
-            let joined = preview.join("\n");
-            truncate_by_chars(&joined, reveal_len)
-                .lines()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
+        let (base_text, paste_blocks) = split_user_paste_blocks(&msg.text);
+        let display_text = if user_expanded && !paste_blocks.is_empty() {
+            let mut out = String::new();
+            out.push_str(base_text.trim_end());
+            for b in paste_blocks {
+                if !out.trim_end().is_empty() {
+                    out.push_str("\n\n");
+                } else {
+                    out.push_str("\n");
+                }
+                let mut head = format!(
+                    "[Pasted Content {}: {} chars / {} lines]",
+                    b.id, b.chars, b.lines
+                );
+                if !b.saved.trim().is_empty() {
+                    head.push_str(&format!(" saved:{}", b.saved.trim()));
+                }
+                out.push_str(&head);
+                if !b.content.trim().is_empty() {
+                    out.push('\n');
+                    out.push_str(b.content.trim_end());
+                }
+            }
+            Cow::Owned(out)
         } else {
-            preview
+            Cow::Owned(base_text)
         };
+
+        let display_text = if let Some(reveal_len) = reveal_len {
+            Cow::Owned(truncate_by_chars(&display_text, reveal_len))
+        } else {
+            truncate_for_ui(&display_text)
+        };
+
+        let lines: Vec<String> = if user_expanded {
+            let mut out: Vec<String> = Vec::new();
+            for raw_line in display_text.lines() {
+                for wrapped in wrap_plain_line(raw_line, content_width) {
+                    out.push(wrapped);
+                }
+            }
+            if out.is_empty() {
+                out.push(String::new());
+            }
+            out
+        } else {
+            render_user_preview_lines(&display_text, content_width)
+        };
+
         let mut out: Vec<Line<'static>> = Vec::new();
-        let mut it = preview.into_iter();
+        let mut it = lines.into_iter();
         if let Some(first) = it.next() {
             out.push(Line::from(vec![
                 Span::styled(prefix, prefix_style),
@@ -4091,6 +4207,59 @@ mod tests {
             .collect::<String>()
             .to_ascii_lowercase();
         assert!(joined_no_ws.contains("outputexported"));
+    }
+
+    #[test]
+    fn user_paste_blocks_are_hidden_until_expanded() {
+        let theme = Theme::cyberpunk();
+        let text = concat!(
+            "hello\n",
+            "[Pasted Content 10 chars / 2 lines]\n\n",
+            "[[AITERMUX_PASTE_BEGIN|id=paste_1|lines=2|chars=10|saved=log/paste-cache/paste_1.txt]]\n",
+            "line1\nline2\n",
+            "[[AITERMUX_PASTE_END|id=paste_1]]\n"
+        )
+        .to_string();
+        let msg = crate::Message {
+            role: Role::User,
+            text,
+            mind: None,
+        };
+
+        let collapsed = render_message_lines(
+            &theme,
+            &msg,
+            80,
+            "○",
+            theme.cyan,
+            Style::default().fg(theme.fg).bg(theme.bg),
+            None,
+            false,
+        )
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(collapsed.contains("[Pasted Content 10 chars / 2 lines]"));
+        assert!(!collapsed.contains("line1"));
+
+        let expanded = render_message_lines(
+            &theme,
+            &msg,
+            80,
+            "○",
+            theme.cyan,
+            Style::default().fg(theme.fg).bg(theme.bg),
+            None,
+            true,
+        )
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(expanded.contains("line1"));
+        assert!(expanded.contains("line2"));
+        assert!(expanded.contains("saved:log/paste-cache/paste_1.txt"));
     }
 }
 

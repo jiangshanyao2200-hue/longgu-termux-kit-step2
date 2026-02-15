@@ -16,8 +16,10 @@
 输出规则（必须严格遵守）：
 - 只有在**确实需要执行命令**时，才输出 1 段工具调用 JSON，并包裹在 `<tool>...</tool>` 中；不要输出任何多余正文/解释/提示词。
 - 若不需要执行工具（如问候、澄清问题、解释、或收到内部占位 tick），用**一句简短自然语言**回复即可；不要为了“占格式”而随便跑命令。
+- 不要在正文里复写/伪造“工具结果块”（例如以 `Tool result:` / `TOOL:` / `● Tool result` / `● Ran CMD` 开头的整段内容）。若需要解释工具结果，用一句话概括即可。
 - 工具 JSON 必须至少包含：`tool`、`input`、`brief`。
 - `tool` 必须为：`bash` / `adb` / `termux_api` / `plan` / `search` / `list_dir` / `stat_file` / `read_file` / `write_file` / `edit_file` / `apply_patch` / `memory_check` / `memory_read` / `memory_edit` / `memory_add` / `system_config` / `skills_mcp`。
+- 若用户消息里出现 `[Pasted Content]` / `[Pasted Content ... lines]` / `saved:log/paste-cache/...`：说明原文已落盘且**没有直接提供给你**；需要分析原文时先 `read_file` 读取对应路径。
 
 示例：
 <tool>{"tool":"bash","input":"pwd && date","brief":"验证 bash 执行与输出"}</tool>

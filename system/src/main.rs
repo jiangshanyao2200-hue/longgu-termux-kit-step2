@@ -48,10 +48,9 @@ use crate::commands::filter_commands_for_input;
 use crate::config::{AppConfig, ContextPromptConfig, DogApiConfig, MainApiConfig, SystemConfig};
 use crate::input::{
     PasteCapture, PlaceholderRemove, can_accept_more, count_chars, is_paste_like_activity,
-    materialize_pastes, maybe_begin_paste_capture, maybe_finalize_paste_capture,
-    next_char_boundary, prev_char_boundary, prune_pending_pastes, snap_cursor_out_of_placeholder,
-    try_insert_char_limited, try_insert_str_limited, try_remove_paste_placeholder_at_cursor,
-    update_paste_burst,
+    maybe_begin_paste_capture, maybe_finalize_paste_capture, next_char_boundary, prev_char_boundary,
+    prune_pending_pastes, snap_cursor_out_of_placeholder, try_insert_char_limited,
+    try_insert_str_limited, try_remove_paste_placeholder_at_cursor, update_paste_burst,
 };
 use crate::mcp::{
     ToolCall, ToolOutcome, extract_tool_calls, format_tool_message_raw,
@@ -85,6 +84,9 @@ const PTY_DONE_BATCH_TOOL_MAX_CHARS: usize = 14_000;
 const PTY_DONE_BATCH_TAIL_MAX_CHARS: usize = 1_600;
 const DEFAULT_WELCOME_SHORTCUTS_PROMPT: &str =
     include_str!("../config/prompt/system/welcome_shortcuts.txt");
+const USER_PASTE_CACHE_DIR: &str = "log/paste-cache";
+const USER_PASTE_MARKER_BEGIN: &str = "[[AITERMUX_PASTE_BEGIN|";
+const USER_PASTE_MARKER_END: &str = "[[AITERMUX_PASTE_END|";
 const MODEL_RESPONSE_TIMEOUT_CAP_SECS: u64 = 7 * 60;
 // DeepSeek chat/completions 没有 tool role，且部分提供方对“最后一条消息 role”很敏感：
 // - 若最后是 assistant（或 system），可能报 400（如 Invalid consecutive assistant message）
@@ -1128,6 +1130,9 @@ fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
         let l = line.trim_start();
         (l.starts_with("● Ran CMD") || l.starts_with("○ Ran CMD"))
             || (l.starts_with("● Tool result") || l.starts_with("○ Tool result"))
+            || (l.starts_with("● tool") || l.starts_with("○ tool"))
+            || l.starts_with("Tool result:")
+            || l.starts_with("TOOL:")
     }
 
     fn is_continuation(line: &str) -> bool {
@@ -4225,6 +4230,12 @@ fn edit_buffer_insert_char(buffer: &mut String, cursor: &mut usize, ch: char) {
     *cursor = cursor.saturating_add(ch.len_utf8());
 }
 
+#[derive(Debug, Clone)]
+struct DrainedSendText {
+    ui_text: String,
+    model_text: String,
+}
+
 fn drain_input_for_send(
     input: &mut String,
     cursor: &mut usize,
@@ -4234,14 +4245,58 @@ fn drain_input_for_send(
     paste_capture: &mut Option<PasteCapture>,
     command_menu_suppress: &mut bool,
     pending_pty_snapshot: &mut Option<(u64, String)>,
-) -> String {
-    let send = materialize_pastes(input, pending_pastes);
+) -> DrainedSendText {
+    let base = input.trim_end().to_string();
+    let mut ui_text = base.clone();
+    let mut model_text = base;
+    if !pending_pastes.is_empty() {
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let pid = unsafe { libc::getpid() };
+        let _ = std::fs::create_dir_all(USER_PASTE_CACHE_DIR);
+        let mut attachments: Vec<String> = Vec::new();
+        for (i, (_ph, actual)) in pending_pastes.iter().enumerate() {
+            let id = format!("paste_{}", i.saturating_add(1));
+            let chars = count_chars(actual);
+            let lines = actual.lines().count().max(1);
+            let path = format!("{USER_PASTE_CACHE_DIR}/{id}_{ts}_{pid}.txt");
+            let saved = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, actual.as_bytes()))
+                .is_ok();
+            let saved_path = if saved { path } else { String::new() };
+
+            // UI：隐藏原文（展开时可见）
+            ui_text.push_str("\n\n");
+            ui_text.push_str(&format!(
+                "{USER_PASTE_MARKER_BEGIN}id={id}|lines={lines}|chars={chars}|saved={saved_path}]]\n"
+            ));
+            ui_text.push_str(actual.trim_end());
+            ui_text.push('\n');
+            ui_text.push_str(&format!("{USER_PASTE_MARKER_END}id={id}]]"));
+
+            // 发给模型：仅摘要+路径
+            let mut item = format!("- {id}: {chars} chars / {lines} lines");
+            if saved {
+                item.push_str(&format!(" | saved:{saved_path}"));
+            } else {
+                item.push_str(" | saved:(failed)");
+            }
+            attachments.push(item);
+        }
+        if !attachments.is_empty() {
+            model_text.push_str("\n\n[Pasted Content]\n");
+            model_text.push_str(&attachments.join("\n"));
+        }
+    }
     reset_input_buffer(input, cursor, input_chars, last_input_at);
     pending_pastes.clear();
     *paste_capture = None;
     *command_menu_suppress = false;
     *pending_pty_snapshot = None;
-    send
+    DrainedSendText { ui_text, model_text }
 }
 
 fn sync_system_toggles(sys_cfg: &SystemConfig, sse_enabled: &mut bool, chat_target: &mut MindKind) {
@@ -5196,7 +5251,8 @@ fn next_send_queue_id() -> u64 {
 struct QueuedUserMessage {
     id: u64,
     target: MindKind,
-    text: String,
+    ui_text: String,
+    model_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5262,11 +5318,13 @@ fn send_queue_update_text_id(
     if let Some((is_high, idx)) = send_queue_find_id(high, low, id) {
         if is_high {
             if let Some(m) = high.get_mut(idx) {
-                m.text = text;
+                m.ui_text = text.clone();
+                m.model_text = text;
                 return true;
             }
         } else if let Some(m) = low.get_mut(idx) {
-            m.text = text;
+            m.ui_text = text.clone();
+            m.model_text = text;
             return true;
         }
     }
@@ -5284,7 +5342,8 @@ fn send_queue_move_to_low_tail_id(
         None => return false,
     };
     if let Some(t) = updated_text {
-        msg.text = t;
+        msg.ui_text = t.clone();
+        msg.model_text = t;
     }
     low.push_back(msg);
     true
@@ -5481,7 +5540,8 @@ fn spawn_tool_execution(
 #[allow(clippy::too_many_arguments)]
 struct StartUserChatRequestArgs<'a> {
     now: Instant,
-    send_text: String,
+    ui_text: String,
+    model_text: String,
     target: MindKind,
     core: &'a mut Core,
     metamemo: &'a mut Option<MetaMemo>,
@@ -5523,7 +5583,8 @@ struct StartUserChatRequestArgs<'a> {
 fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result<()> {
     let StartUserChatRequestArgs {
         now,
-        send_text,
+        ui_text,
+        model_text,
         target,
         core,
         metamemo,
@@ -5562,8 +5623,9 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
         main_client,
     } = args;
 
-    let send_text = send_text.trim_end().to_string();
-    if send_text.trim().is_empty() {
+    let ui_text = ui_text.trim_end().to_string();
+    let model_text = model_text.trim_end().to_string();
+    if model_text.trim().is_empty() {
         return Ok(());
     }
     if let Some(pending) = pending_mind_half.take() {
@@ -5575,7 +5637,7 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
         dog_state.push_ctx_pool_item(sys_cfg, &item);
     }
 
-    core.push_user(send_text.clone());
+    core.push_user(ui_text.clone());
     thinking_text.clear();
     thinking_full_text.clear();
     *thinking_started_at = None;
@@ -5595,9 +5657,9 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
     } else {
         None
     };
-    log_memos(metamemo, context_usage, "user", user_agent, &send_text);
+    log_memos(metamemo, context_usage, "user", user_agent, &model_text);
     if matches!(target, MindKind::Main) {
-        log_contextmemo(&config.contextmemo_path, context_usage, "user", &send_text);
+        log_contextmemo(&config.contextmemo_path, context_usage, "user", &model_text);
     }
 
     defer_heartbeat(next_heartbeat_at, now);
@@ -5615,10 +5677,10 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
     }
     match target {
         MindKind::Main => {
-            let _ = main_state.push_user(&send_text, ctx_limit);
+            let _ = main_state.push_user(&model_text, ctx_limit);
         }
         MindKind::Sub => {
-            let _ = dog_state.push_user(&send_text, ctx_limit);
+            let _ = dog_state.push_user(&model_text, ctx_limit);
         }
     }
 
@@ -5631,7 +5693,7 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
             context_compact_prompt_text,
             target,
             sys_cfg,
-            &send_text,
+            &model_text,
         ))
     } else {
         None
@@ -8748,7 +8810,7 @@ fn run_loop(
                 // 队列里也允许斜杠命令：会在 idle 阶段依序执行。
                 if handle_command(HandleCommandArgs {
                     core: &mut core,
-                    raw: msg.text.trim_end(),
+                    raw: msg.model_text.trim_end(),
                     meta: &mut metamemo,
                     context_usage: &mut context_usage,
                     mode: &mut mode,
@@ -8816,7 +8878,8 @@ fn run_loop(
 
                 start_user_chat_request(StartUserChatRequestArgs {
                     now,
-                    send_text: msg.text,
+                    ui_text: msg.ui_text,
+                    model_text: msg.model_text,
                     target: msg.target,
                     core: &mut core,
                     metamemo: &mut metamemo,
@@ -9784,7 +9847,7 @@ fn run_loop(
                     let available = chunks[2].height.max(1) as usize;
                     let mut items: Vec<ui::OwnedMenuItem> = Vec::new();
                     for m in send_queue_high.iter() {
-                        let mut right = m.text.trim().replace('\n', " ⏎ ");
+                        let mut right = m.model_text.trim().replace('\n', " ⏎ ");
                         right = truncate_with_suffix(&right, 120);
                         if right.trim().is_empty() {
                             right = "(empty)".to_string();
@@ -9795,7 +9858,7 @@ fn run_loop(
                         });
                     }
                     for m in send_queue_low.iter() {
-                        let mut right = m.text.trim().replace('\n', " ⏎ ");
+                        let mut right = m.model_text.trim().replace('\n', " ⏎ ");
                         right = truncate_with_suffix(&right, 120);
                         if right.trim().is_empty() {
                             right = "(empty)".to_string();
@@ -10592,7 +10655,7 @@ fn run_loop(
                                             &mut input_chars,
                                             &mut last_input_at,
                                         );
-                                        input.push_str(&m.text);
+                                        input.push_str(&m.model_text);
                                         cursor = input.len();
                                         input_chars = count_chars(&input);
                                         last_input_at = Some(now);
@@ -11363,14 +11426,15 @@ fn run_loop(
                                     &mut command_menu_suppress,
                                     &mut pending_pty_snapshot,
                                 );
-                                if send.trim().is_empty() {
+                                if send.model_text.trim().is_empty() {
                                     continue;
                                 }
                                 let id = next_send_queue_id();
                                 send_queue_low.push_back(QueuedUserMessage {
                                     id,
                                     target: chat_target,
-                                    text: send,
+                                    ui_text: send.ui_text,
+                                    model_text: send.model_text,
                                 });
                                 push_sys_log(
                                     &mut sys_log,
@@ -11420,7 +11484,7 @@ fn run_loop(
                                 &mut pending_pty_snapshot,
                             );
 
-                            if let Some(decision) = normalize_confirm_input(&send) {
+                            if let Some(decision) = normalize_confirm_input(&send.model_text) {
                                 if let Some((call, _reason, msg_idx)) = pending_tool_confirm.take()
                                 {
                                     if decision {
@@ -11718,13 +11782,13 @@ fn run_loop(
                                 &mut command_menu_suppress,
                                 &mut pending_pty_snapshot,
                             );
-                            if send.trim().is_empty() {
+                            if send.model_text.trim().is_empty() {
                                 continue;
                             }
                             // 已移除弹窗/窗口栈：不需要“清屏关闭弹窗”的额外处理。
                             if handle_command(HandleCommandArgs {
                                 core: &mut core,
-                                raw: send.trim_end(),
+                                raw: send.model_text.trim_end(),
                                 meta: &mut metamemo,
                                 context_usage: &mut context_usage,
                                 mode: &mut mode,
@@ -11793,7 +11857,8 @@ fn run_loop(
                             let target = chat_target;
                             start_user_chat_request(StartUserChatRequestArgs {
                                 now,
-                                send_text: send,
+                                ui_text: send.ui_text,
+                                model_text: send.model_text,
                                 target,
                                 core: &mut core,
                                 metamemo: &mut metamemo,
@@ -12167,6 +12232,20 @@ fn handle_model_stream_chunk(args: ModelStreamChunkArgs<'_>, content: &str, reas
         streaming_state.text = strip_thinking_stream(&streaming_state.raw_text);
     } else {
         streaming_state.text.clone_from(&streaming_state.raw_text);
+    }
+    // 防御：部分模型会把系统工具块“原样复述”到正文里（例如以 `Tool result:` / `● Tool result` 开头）。
+    // 这类内容会误导用户（看起来像系统输出），并污染后续工具解析；流式阶段先过滤显示，最终结束阶段会再统一提取。
+    if streaming_state.text.contains("Tool result:")
+        || streaming_state.text.contains("● Tool result")
+        || streaming_state.text.contains("○ Tool result")
+        || streaming_state.text.contains("● Ran CMD")
+        || streaming_state.text.contains("○ Ran CMD")
+        || streaming_state.text.contains("● tool")
+        || streaming_state.text.contains("○ tool")
+        || streaming_state.text.contains("TOOL:")
+    {
+        let (cleaned, _blocks) = extract_internal_tool_echo_blocks(&streaming_state.text);
+        streaming_state.text = cleaned;
     }
 
     if sse_enabled {
@@ -15466,26 +15545,6 @@ mod input {
         } else {
             format!("{base} #{}", count + 1)
         }
-    }
-
-    pub(crate) fn materialize_pastes(input: &str, pending: &[(String, String)]) -> String {
-        if pending.is_empty() {
-            return input.to_string();
-        }
-        let mut out = input.to_string();
-        for _ in 0..=pending.len() {
-            let mut changed = false;
-            for (ph, actual) in pending {
-                if out.contains(ph) {
-                    out = out.replace(ph, actual);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        out
     }
 
     pub(crate) fn materialize_char_count(input: &str, pending: &[(String, String)]) -> usize {

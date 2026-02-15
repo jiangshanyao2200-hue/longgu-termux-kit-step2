@@ -1,5 +1,5 @@
 {
-  "deepseek_tool_loop_tick_user": "[AITERMUX_INTERNAL_TOOL_LOOP] 系统注入：非用户输入。请基于上一条工具输出继续当前任务。",
+  "deepseek_tool_loop_tick_user": "[AITERMUX_INTERNAL_TOOL_LOOP] 系统注入：非用户输入。若上一条工具输出明确要求你继续（例如需要下一步工具调用/总结），才继续；否则请等待用户下一条消息，不要主动轮询日志/状态或执行命令。",
   "heartbeat_user": "心跳信号：{STAMP} | idle\n请像正常消息一样回复（可简短）。若无需回应请只回复 [mainpass]。不要调用工具。",
   "plan_mixed_batch_reject": "检测到 plan 与其它工具同批输出：已拒绝本轮工具执行。请将 plan:start / plan:end 单独一条回复输出；执行阶段每轮只调用一个工具。",
   "tool_confirm_prompt": "系统：该工具需要用户确认。\n原因：{REASON}\n\n工具：{TOOL}\n调用：\n```json\n{CALL_JSON}\n```\n\n请在输入框回复 y/n（或 是/否）。",

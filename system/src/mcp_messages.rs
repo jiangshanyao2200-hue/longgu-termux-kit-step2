@@ -8,7 +8,7 @@ use crate::mcp::ToolCall;
 const DEFAULT_MCP_MESSAGES_JSON: &str = include_str!("../config/prompt/mcp/mcp_messages.json");
 
 fn default_deepseek_tool_loop_tick_user() -> String {
-    "[AITERMUX_INTERNAL_TOOL_LOOP] 系统注入：非用户输入。请基于上一条工具输出继续当前任务。"
+    "[AITERMUX_INTERNAL_TOOL_LOOP] 系统注入：非用户输入。若上一条工具输出明确要求你继续（例如需要下一步工具调用/总结），才继续；否则请等待用户下一条消息，不要主动轮询日志/状态或执行命令。"
         .to_string()
 }
 

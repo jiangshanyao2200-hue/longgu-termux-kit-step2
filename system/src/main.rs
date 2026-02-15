@@ -48,9 +48,10 @@ use crate::commands::filter_commands_for_input;
 use crate::config::{AppConfig, ContextPromptConfig, DogApiConfig, MainApiConfig, SystemConfig};
 use crate::input::{
     PasteCapture, PlaceholderRemove, can_accept_more, count_chars, is_paste_like_activity,
-    maybe_begin_paste_capture, maybe_finalize_paste_capture, next_char_boundary, prev_char_boundary,
-    prune_pending_pastes, snap_cursor_out_of_placeholder, try_insert_char_limited,
-    try_insert_str_limited, try_remove_paste_placeholder_at_cursor, update_paste_burst,
+    maybe_begin_paste_capture, maybe_finalize_paste_capture, next_char_boundary,
+    prev_char_boundary, prune_pending_pastes, snap_cursor_out_of_placeholder,
+    try_insert_char_limited, try_insert_str_limited, try_remove_paste_placeholder_at_cursor,
+    update_paste_burst,
 };
 use crate::mcp::{
     ToolCall, ToolOutcome, extract_tool_calls, format_tool_message_raw,
@@ -3980,6 +3981,25 @@ fn truncate_with_suffix(text: &str, max_chars: usize) -> String {
     out
 }
 
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let mut out = String::new();
+    for (count, ch) in text.chars().enumerate() {
+        if count >= max_chars.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
 fn truncate_tail(text: &str, max_chars: usize) -> String {
     let total = text.chars().count();
     if total <= max_chars {
@@ -4293,7 +4313,10 @@ fn drain_input_for_send(
     *paste_capture = None;
     *command_menu_suppress = false;
     *pending_pty_snapshot = None;
-    DrainedSendText { ui_text, model_text }
+    DrainedSendText {
+        ui_text,
+        model_text,
+    }
 }
 
 fn sync_system_toggles(sys_cfg: &SystemConfig, sse_enabled: &mut bool, chat_target: &mut MindKind) {
@@ -8979,83 +9002,88 @@ fn run_loop(
             }
         }
 
-        // PTY 定时审计（每 5 分钟）：以“额外系统消息”注入，让模型按需 read_file 读取 status/log。
-        // 说明：不与用户请求并发；若当前忙，则延后。
-        let pty_info = if !pty_tabs.is_empty() {
-            let idx = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
-            let state = &pty_tabs[idx];
-            Some((
-                state.owner,
-                state.job_id,
-                state.cmd.clone(),
-                state.status_path.clone(),
-                state.saved_path.clone(),
-            ))
-        } else {
-            None
-        };
-        if pty_info.is_some() && next_pty_audit_at.is_none() {
-            next_pty_audit_at = Some(now + Duration::from_secs(PTY_AUDIT_INTERVAL_SECS));
-        }
-        if pty_info.is_none() {
-            next_pty_audit_at = None;
-        }
-        if let (Some((owner, job_id, cmd, status_path, log_path)), Some(next_at)) =
-            (pty_info, next_pty_audit_at)
-            && now >= next_at
-            && send_queue_len(&send_queue_high, &send_queue_low) == 0
-            && can_inject_heartbeat(
-                mode,
-                &active_request_id,
-                &pending_tools,
-                &pending_tool_confirm,
-                &active_tool_stream,
-            )
-        {
-            let prompt = render_pty_audit_prompt(
-                &pty_audit_prompt_text,
-                owner,
-                job_id,
-                &cmd,
-                &status_path,
-                &log_path,
-            );
-            let (client_ref, state_ref) = if matches!(owner, MindKind::Sub) {
-                (&dog_client, &dog_state)
+        // PTY 自动审计（可选）：默认关闭，避免在用户未要求时触发额外的 read_file/BASH 调用造成资源浪费。
+        if sys_cfg.pty_audit_enabled {
+            // PTY 定时审计（每 5 分钟）：以“额外系统消息”注入，让模型按需 read_file 读取 status/log。
+            // 说明：不与用户请求并发；若当前忙，则延后。
+            let pty_info = if !pty_tabs.is_empty() {
+                let idx = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
+                let state = &pty_tabs[idx];
+                Some((
+                    state.owner,
+                    state.job_id,
+                    state.cmd.clone(),
+                    state.status_path.clone(),
+                    state.saved_path.clone(),
+                ))
             } else {
-                (&main_client, &main_state)
+                None
             };
-            if let Some(in_tokens) = try_start_dog_generation(TryStartDogGenerationArgs {
-                kind: owner,
-                dog_client: client_ref,
-                dog_state: state_ref,
-                extra_system: Some(prompt),
-                tx: &tx,
-                config: &config,
-                mode: &mut mode,
-                active_kind: &mut active_kind,
-                sending_until: &mut sending_until,
-                sys_log: &mut sys_log,
-                sys_log_limit: config.sys_log_limit,
-                streaming_state: &mut streaming_state,
-                request_seq: &mut request_seq,
-                active_request_id: &mut active_request_id,
-                active_cancel: &mut active_cancel,
-                sse_enabled,
-            }) {
-                push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: audit tick");
-                record_request_in_tokens(
-                    &mut core,
-                    &mut token_totals,
-                    &token_total_path,
-                    &context_usage,
-                    &mut active_request_in_tokens,
-                    in_tokens,
-                );
+            if pty_info.is_some() && next_pty_audit_at.is_none() {
                 next_pty_audit_at = Some(now + Duration::from_secs(PTY_AUDIT_INTERVAL_SECS));
-            } else if let Some(next_at) = next_pty_audit_at.as_mut() {
-                defer_pty_audit(next_at, now);
             }
+            if pty_info.is_none() {
+                next_pty_audit_at = None;
+            }
+            if let (Some((owner, job_id, cmd, status_path, log_path)), Some(next_at)) =
+                (pty_info, next_pty_audit_at)
+                && now >= next_at
+                && send_queue_len(&send_queue_high, &send_queue_low) == 0
+                && can_inject_heartbeat(
+                    mode,
+                    &active_request_id,
+                    &pending_tools,
+                    &pending_tool_confirm,
+                    &active_tool_stream,
+                )
+            {
+                let prompt = render_pty_audit_prompt(
+                    &pty_audit_prompt_text,
+                    owner,
+                    job_id,
+                    &cmd,
+                    &status_path,
+                    &log_path,
+                );
+                let (client_ref, state_ref) = if matches!(owner, MindKind::Sub) {
+                    (&dog_client, &dog_state)
+                } else {
+                    (&main_client, &main_state)
+                };
+                if let Some(in_tokens) = try_start_dog_generation(TryStartDogGenerationArgs {
+                    kind: owner,
+                    dog_client: client_ref,
+                    dog_state: state_ref,
+                    extra_system: Some(prompt),
+                    tx: &tx,
+                    config: &config,
+                    mode: &mut mode,
+                    active_kind: &mut active_kind,
+                    sending_until: &mut sending_until,
+                    sys_log: &mut sys_log,
+                    sys_log_limit: config.sys_log_limit,
+                    streaming_state: &mut streaming_state,
+                    request_seq: &mut request_seq,
+                    active_request_id: &mut active_request_id,
+                    active_cancel: &mut active_cancel,
+                    sse_enabled,
+                }) {
+                    push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: audit tick");
+                    record_request_in_tokens(
+                        &mut core,
+                        &mut token_totals,
+                        &token_total_path,
+                        &context_usage,
+                        &mut active_request_in_tokens,
+                        in_tokens,
+                    );
+                    next_pty_audit_at = Some(now + Duration::from_secs(PTY_AUDIT_INTERVAL_SECS));
+                } else if let Some(next_at) = next_pty_audit_at.as_mut() {
+                    defer_pty_audit(next_at, now);
+                }
+            }
+        } else {
+            next_pty_audit_at = None;
         }
         let menu_items = if screen == Screen::Chat
             && !command_menu_suppress
@@ -9288,11 +9316,9 @@ fn run_loop(
                 .min(total.saturating_sub(1))
                 .saturating_add(1);
             input_line = if pty_view {
-                format!(
-                    "Terminal / 运行中 · {active}/{total} · PgUp/PgDn 切换 · Home 返回聊天 · Esc 发给终端 · Esc×2 结束"
-                )
+                format!("Terminal / 运行中 · {active}/{total}")
             } else {
-                format!("Terminal / 运行中 · {total} 个任务 · Home 打开")
+                format!("Terminal / 运行中 · {total} 个任务")
             };
         }
         let queue_waiting = send_queue_len(&send_queue_high, &send_queue_low);
@@ -9606,9 +9632,9 @@ fn run_loop(
                         let title = {
                             let s = &pty_tabs[active0];
                             let cmd_clean = s.cmd.trim().replace('\n', " ⏎ ").replace('\t', " ");
-                            let cmd = truncate_with_suffix(&cmd_clean, 22);
+                            let cmd = truncate_with_ellipsis(&cmd_clean, 36);
                             format!(
-                                "-● Terminal {}/{} · job:{} · {} ●-+",
+                                "Terminal {}/{} · job:{} · {}",
                                 active0.saturating_add(1),
                                 total,
                                 s.job_id,
@@ -9626,16 +9652,16 @@ fn run_loop(
                         for s in pty_tabs.iter_mut() {
                             s.ensure_size(cols, rows);
                         }
-	                        let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
-	                        if let Some(state) = pty_tabs.get_mut(active) {
-	                            state.rebuild_cache();
-	                            let base = Style::default().fg(theme.fg).bg(theme.bg);
-	                            for l in state.screen_lines.iter() {
-	                                lines.push(Line::from(vec![Span::styled(l.clone(), base)]));
-	                            }
-	                            f.render_widget(
-	                                Paragraph::new(lines)
-	                                    .style(base)
+                        let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
+                        if let Some(state) = pty_tabs.get_mut(active) {
+                            state.rebuild_cache();
+                            let base = Style::default().fg(theme.fg).bg(theme.bg);
+                            for l in state.screen_lines.iter() {
+                                lines.push(Line::from(vec![Span::styled(l.clone(), base)]));
+                            }
+                            f.render_widget(
+                                Paragraph::new(lines)
+                                    .style(base)
                                     .block(block)
                                     .scroll((0, 0)),
                                 chunks[2],
@@ -11434,63 +11460,59 @@ fn run_loop(
                                 &mut pending_pty_snapshot,
                             );
 
-	                            if let Some(decision) = normalize_confirm_input(&send.model_text) {
-	                                if let Some((call, _reason, msg_idx)) = pending_tool_confirm.take()
-	                                {
-	                                    if decision {
-	                                        update_history_text_at(
-	                                            &mut core,
-	                                            &mut render_cache,
-	                                            msg_idx,
-	                                            "您已选择：立即执行",
-	                                        );
-	                                        push_sys_log(
-	                                            &mut sys_log,
-	                                            config.sys_log_limit,
-	                                            "工具确认：用户已允许执行",
-	                                        );
-	                                        match active_kind {
-	                                            MindKind::Sub => {
-	                                                dog_state.push_tool("工具确认：用户已允许执行")
-	                                            }
-	                                            MindKind::Main => {
-	                                                main_state.push_tool("工具确认：用户已允许执行")
-	                                            }
-	                                        }
-	                                        spawn_tool_execution(
-	                                            call,
-	                                            active_kind,
-	                                            tx.clone(),
-	                                            pty_started_notice_prompt_text.clone(),
-	                                        );
-	                                        mode = Mode::ExecutingTool;
-	                                    } else {
-	                                        update_history_text_at(
-	                                            &mut core,
-	                                            &mut render_cache,
-	                                            msg_idx,
-	                                            "您已选择：拒绝执行",
-	                                        );
-	                                        push_sys_log(
-	                                            &mut sys_log,
-	                                            config.sys_log_limit,
-	                                            "工具确认：用户拒绝执行（等待下一条指令）",
-	                                        );
-	                                        match active_kind {
-	                                            MindKind::Sub => {
-	                                                dog_state.push_tool(
-	                                                    "工具确认：用户拒绝执行，请等待下一条指令",
-	                                                )
-	                                            }
-	                                            MindKind::Main => {
-	                                                main_state.push_tool(
-	                                                    "工具确认：用户拒绝执行，请等待下一条指令",
-	                                                )
-	                                            }
-	                                        }
-	                                        mode = Mode::Idle;
-	                                        let has_next = try_start_next_tool(TryStartNextToolArgs {
-	                                            pending_tools: &mut pending_tools,
+                            if let Some(decision) = normalize_confirm_input(&send.model_text) {
+                                if let Some((call, _reason, msg_idx)) = pending_tool_confirm.take()
+                                {
+                                    if decision {
+                                        update_history_text_at(
+                                            &mut core,
+                                            &mut render_cache,
+                                            msg_idx,
+                                            "您已选择：立即执行",
+                                        );
+                                        push_sys_log(
+                                            &mut sys_log,
+                                            config.sys_log_limit,
+                                            "工具确认：用户已允许执行",
+                                        );
+                                        match active_kind {
+                                            MindKind::Sub => {
+                                                dog_state.push_tool("工具确认：用户已允许执行")
+                                            }
+                                            MindKind::Main => {
+                                                main_state.push_tool("工具确认：用户已允许执行")
+                                            }
+                                        }
+                                        spawn_tool_execution(
+                                            call,
+                                            active_kind,
+                                            tx.clone(),
+                                            pty_started_notice_prompt_text.clone(),
+                                        );
+                                        mode = Mode::ExecutingTool;
+                                    } else {
+                                        update_history_text_at(
+                                            &mut core,
+                                            &mut render_cache,
+                                            msg_idx,
+                                            "您已选择：拒绝执行",
+                                        );
+                                        push_sys_log(
+                                            &mut sys_log,
+                                            config.sys_log_limit,
+                                            "工具确认：用户拒绝执行（等待下一条指令）",
+                                        );
+                                        match active_kind {
+                                            MindKind::Sub => dog_state.push_tool(
+                                                "工具确认：用户拒绝执行，请等待下一条指令",
+                                            ),
+                                            MindKind::Main => main_state.push_tool(
+                                                "工具确认：用户拒绝执行，请等待下一条指令",
+                                            ),
+                                        }
+                                        mode = Mode::Idle;
+                                        let has_next = try_start_next_tool(TryStartNextToolArgs {
+                                            pending_tools: &mut pending_tools,
                                             pending_tool_confirm: &mut pending_tool_confirm,
                                             tx: tx.clone(),
                                             core: &mut core,
@@ -13441,7 +13463,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     format!("Terminal: finished (job_id:{job_id})"),
                 );
                 if completed < total {
-                    core.push_system(&format!("PTY {completed}/{total} DONE（已缓存）"));
+                    core.push_system(&format!("PTY {completed}/{total} DONE"));
                     render_cache.invalidate(core.history.len().saturating_sub(1));
                 } else {
                     let jobs = batch.jobs.clone();
@@ -13452,13 +13474,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         pushed: false,
                     });
                     pty_done_batches.reset(owner);
-                    if total <= 1 {
-                        core.push_system("PTY DONE（已汇总）");
-                    } else {
-                        core.push_system(&format!(
-                            "PTY {completed}/{total} DONE（已汇总，准备交给萤处理）"
-                        ));
-                    }
+                    core.push_system(&format!("PTY {completed}/{total} DONE"));
                     render_cache.invalidate(core.history.len().saturating_sub(1));
                 }
 
@@ -15181,6 +15197,8 @@ mod config {
         #[serde(default = "default_welcome_shortcuts_prompt_path")]
         pub welcome_shortcuts_prompt_path: String,
         #[serde(default)]
+        pub pty_audit_enabled: bool,
+        #[serde(default)]
         pub chat_target: String,
     }
 
@@ -15356,6 +15374,7 @@ mod config {
                 mcp_messages_path: default_mcp_messages_path(),
                 tool_messages_path: default_tool_messages_path(),
                 welcome_shortcuts_prompt_path: default_welcome_shortcuts_prompt_path(),
+                pty_audit_enabled: false,
                 chat_target: "dog".to_string(),
             }
         }

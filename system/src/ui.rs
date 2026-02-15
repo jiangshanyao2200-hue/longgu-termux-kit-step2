@@ -72,6 +72,25 @@ fn truncate_to_width(text: &str, max_cells: usize) -> String {
     out
 }
 
+fn truncate_to_width_ellipsis(text: &str, max_cells: usize) -> String {
+    if max_cells == 0 {
+        return String::new();
+    }
+    if text.is_empty() {
+        return String::new();
+    }
+    let total = UnicodeWidthStr::width(text);
+    if total <= max_cells {
+        return text.to_string();
+    }
+    if max_cells == 1 {
+        return "…".to_string();
+    }
+    let mut out = slice_by_cells(text, 0, max_cells.saturating_sub(1));
+    out.push('…');
+    out
+}
+
 fn build_settings_tab_lines(
     menu_items: &[String],
     selected: usize,
@@ -181,6 +200,54 @@ fn wrap_plain_line(text: &str, width: usize) -> Vec<String> {
         offset = offset.saturating_add(chunk_w.max(1));
     }
     out
+}
+
+fn sanitize_tool_detail_line(raw: &str) -> String {
+    // 工具输出可能包含 ANSI/控制字符/CR（进度条/重绘），直接渲染到聊天会导致“乱码/叠字/卡帧”观感。
+    // 这里只做轻量净化：去掉 CR 与 ESC，其它控制字符替换为空格。
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\t' {
+            out.push('\t');
+            continue;
+        }
+        if ch >= ' ' && ch != '\u{7f}' {
+            if ch == '\u{1b}' {
+                continue;
+            }
+            out.push(ch);
+        } else {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+fn is_tool_progress_noise_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.contains("progress") {
+        return true;
+    }
+    // 进度条常见形态：包含 [%] + 大量 .#= 等字符，渲染到聊天没有意义且容易破坏排版。
+    let mut total = 0usize;
+    let mut prog = 0usize;
+    for ch in t.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total = total.saturating_add(1);
+        if matches!(ch, '.' | '#' | '=' | '[' | ']' | '%' | ':' | '0'..='9') {
+            prog = prog.saturating_add(1);
+        }
+    }
+    total >= 20 && prog.saturating_mul(10) >= total.saturating_mul(9) && t.contains('[')
 }
 
 fn truncate_for_ui(text: &str) -> Cow<'_, str> {
@@ -1749,6 +1816,16 @@ fn render_tool_detail_lines(
         if lines.is_empty() {
             return;
         }
+        let filtered: Vec<String> = lines
+            .iter()
+            .map(|raw| sanitize_tool_detail_line(raw))
+            .map(|s| s.trim_end().to_string())
+            .filter(|s| !s.trim().is_empty())
+            .filter(|s| title != "output" || !is_tool_progress_noise_line(s))
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
         let header = format!("  {title}:");
         out.push(Line::from(vec![Span::styled(header, heading_style)]));
         let mut truncated = false;
@@ -1766,7 +1843,7 @@ fn render_tool_detail_lines(
         let prefix = "  ┆ ";
         let prefix_w = UnicodeWidthStr::width(prefix);
         let avail = width.saturating_sub(prefix_w).max(1);
-        for line in lines {
+        for line in &filtered {
             if shown_count >= cap_lines {
                 truncated = true;
                 truncated_reason = Some("lines");
@@ -1790,6 +1867,9 @@ fn render_tool_detail_lines(
                 }
             }
             for chunk in chunks {
+                if chunk.trim().is_empty() {
+                    continue;
+                }
                 out.push(Line::from(vec![
                     Span::styled(prefix.to_string(), pipe_style),
                     Span::styled(chunk, content_style),
@@ -1802,11 +1882,11 @@ fn render_tool_detail_lines(
                     Some("chars") => format!("... [truncated: >{cap_chars} chars (display guard)]"),
                     _ => format!(
                         "... [truncated: {} lines (display guard)]",
-                        lines.len().saturating_sub(shown_count)
+                        filtered.len().saturating_sub(shown_count)
                     ),
                 }
             } else {
-                format!("... [截断 {} 行]", lines.len().saturating_sub(max_lines))
+                format!("... [截断 {} 行]", filtered.len().saturating_sub(max_lines))
             };
             for chunk in wrap_plain_line(&note, avail) {
                 out.push(Line::from(vec![
@@ -3661,8 +3741,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 let avail = w.saturating_sub(indent_w).max(1);
 
                 // 第二行：command（↳ 斜体）
-                let cmd_chunks = wrap_plain_line(&target_disp, avail.saturating_sub(2).max(1));
-                if !cmd_chunks.is_empty() {
+                if !target_disp.trim().is_empty() {
                     let arrow_style = Style::default()
                         .fg(theme.dim)
                         .bg(theme.bg)
@@ -3671,30 +3750,17 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         .fg(theme.fg)
                         .bg(theme.bg)
                         .add_modifier(Modifier::ITALIC);
-                    for (idx, chunk) in cmd_chunks.iter().enumerate() {
-                        if idx == 0 {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    indent.clone(),
-                                    Style::default().fg(theme.dim).bg(theme.bg),
-                                ),
-                                Span::styled("↳ ", arrow_style),
-                                Span::styled(chunk.clone(), cmd_style),
-                            ]));
-                        } else {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    indent.clone(),
-                                    Style::default().fg(theme.dim).bg(theme.bg),
-                                ),
-                                Span::styled("  ", Style::default().fg(theme.dim).bg(theme.bg)),
-                                Span::styled(chunk.clone(), cmd_style),
-                            ]));
-                        }
-                        // 命令展示最多两行：尽量“一眼扫过”，避免挤压屏幕。
-                        if idx >= 1 {
-                            break;
-                        }
+                    let cmd_avail = avail.saturating_sub(2).max(1);
+                    let cmd = truncate_to_width_ellipsis(&target_disp, cmd_avail);
+                    if !cmd.trim().is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                indent.clone(),
+                                Style::default().fg(theme.dim).bg(theme.bg),
+                            ),
+                            Span::styled("↳ ", arrow_style),
+                            Span::styled(cmd, cmd_style),
+                        ]));
                     }
                 }
 

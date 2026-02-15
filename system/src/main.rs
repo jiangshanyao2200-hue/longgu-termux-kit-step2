@@ -1131,6 +1131,13 @@ fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
         let l = line.trim_start();
         (l.starts_with("● Ran CMD") || l.starts_with("○ Ran CMD"))
             || (l.starts_with("● Tool result") || l.starts_with("○ Tool result"))
+            // 新注入头：模型有时会误把“系统回执头”复写进正文，需剥离。
+            || l.starts_with("【工具输出（系统回执")
+            || l.starts_with("● 【工具输出（系统回执")
+            || l.starts_with("○ 【工具输出（系统回执")
+            // 兼容：模型直接复写工具块而不带前缀
+            || l.starts_with("TOOL:")
+            || l.starts_with("TOOL：")
     }
 
     fn is_continuation(line: &str) -> bool {
@@ -1143,6 +1150,16 @@ fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
             || l.starts_with("explain:")
             || l.starts_with("状态:")
             || l.starts_with("Tool result:")
+            || l.starts_with("TOOL:")
+            || l.starts_with("TOOL：")
+            || l.starts_with("EXPLAIN:")
+            || l.starts_with("EXPLAIN：")
+            || l.starts_with("INPUT:")
+            || l.starts_with("INPUT：")
+            || l.starts_with("OUTPUT:")
+            || l.starts_with("OUTPUT：")
+            || l.starts_with("META:")
+            || l.starts_with("META：")
     }
 
     let mut assistant_lines: Vec<String> = Vec::new();
@@ -1214,6 +1231,14 @@ fn wrap_tool_echo_block_as_tool_message(block: &str) -> String {
             rest
         } else if let Some(rest) = trimmed.strip_prefix("○ ") {
             rest
+        } else if let Some(rest) =
+            trimmed.strip_prefix("【工具输出（系统回执，仅供参考，不要复述）】")
+        {
+            rest.trim_start()
+        } else if let Some(rest) = trimmed.strip_prefix("【工具输出（系统回执") {
+            // 兜底：不同版本的提示词头可能略有差异，直接去掉整段前缀到行首剩余内容。
+            // 这里不做复杂匹配，避免误删；只处理“以该头开头”的行。
+            rest.trim_start()
         } else {
             line
         };
@@ -12588,10 +12613,23 @@ fn handle_model_stream_end(
             .map(|start| assistant_text[start..].trim().to_string())
             .filter(|s| !s.is_empty());
         let mut extracted: Vec<ToolCall> = Vec::new();
+        let had_tool_tags = assistant_text.contains("<tool>")
+            && assistant_text.to_ascii_lowercase().contains("</tool>");
         if let Ok((calls, cleaned)) = extract_tool_calls(&assistant_text) {
             if !calls.is_empty() {
                 extracted = calls;
                 extracted_from_assistant = true;
+            } else if had_tool_tags {
+                // 看到 <tool> 但没能解析出任何调用：通常是 JSON 字符串未正确转义（例如 input 内含未转义的 "）。
+                // 给出明确提示，便于用户定位是“模型格式错误”而非前端/Tab 导致。
+                push_system_and_log(
+                    core,
+                    meta,
+                    context_usage,
+                    Some("tool"),
+                    "工具调用格式错误：检测到 <tool>…</tool> 但未能解析执行。通常原因：JSON 中字符串未转义（例如 input 内含未转义的双引号）。建议让模型改用单引号或对 \\\" 做转义后重试。",
+                );
+                push_sys_log(sys_log, sys_log_limit, "工具 JSON 解析失败：未执行");
             }
             assistant_text = cleaned;
         }

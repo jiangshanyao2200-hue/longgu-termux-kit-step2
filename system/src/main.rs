@@ -9626,63 +9626,16 @@ fn run_loop(
                         for s in pty_tabs.iter_mut() {
                             s.ensure_size(cols, rows);
                         }
-                        let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
-                        if let Some(state) = pty_tabs.get_mut(active) {
-                            state.rebuild_cache();
-                            let base = Style::default().fg(theme.fg).bg(theme.bg);
-                            let mut cursor_pos: Option<(u16, u16)> = None;
-                            if pty_focused
-                                && state.scroll == 0
-                                && !state.parser.screen().hide_cursor()
-                            {
-                                cursor_pos = Some(state.parser.screen().cursor_position());
-                            }
-                            let cursor_style = Style::default().fg(theme.bg).bg(theme.fg);
-                            for (row_idx, l) in state.screen_lines.iter().enumerate() {
-                                let row_u16 = row_idx.min(u16::MAX as usize) as u16;
-                                let target_col = match cursor_pos {
-                                    Some((cur_row, cur_col)) if row_u16 == cur_row => {
-                                        Some(cur_col as usize)
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(target_col) = target_col {
-                                    let mut col = 0usize;
-                                    let mut hit: Option<(usize, char, usize)> = None;
-                                    for (byte_idx, ch) in l.char_indices() {
-                                        let w = ch.width().unwrap_or(0).max(1);
-                                        if col <= target_col && target_col < col + w {
-                                            hit = Some((byte_idx, ch, ch.len_utf8()));
-                                            break;
-                                        }
-                                        col = col.saturating_add(w);
-                                    }
-                                    match hit {
-                                        Some((byte_idx, ch, ch_len)) => {
-                                            let pre = l[..byte_idx].to_string();
-                                            let post_start = (byte_idx + ch_len).min(l.len());
-                                            let post = l[post_start..].to_string();
-                                            lines.push(Line::from(vec![
-                                                Span::styled(pre, base),
-                                                Span::styled(ch.to_string(), cursor_style),
-                                                Span::styled(post, base),
-                                            ]));
-                                        }
-                                        None => {
-                                            // 光标在行尾之后：渲染一个反色空格作“块光标”。
-                                            lines.push(Line::from(vec![
-                                                Span::styled(l.clone(), base),
-                                                Span::styled(" ".to_string(), cursor_style),
-                                            ]));
-                                        }
-                                    }
-                                } else {
-                                    lines.push(Line::from(vec![Span::styled(l.clone(), base)]));
-                                }
-                            }
-                            f.render_widget(
-                                Paragraph::new(lines)
-                                    .style(base)
+	                        let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
+	                        if let Some(state) = pty_tabs.get_mut(active) {
+	                            state.rebuild_cache();
+	                            let base = Style::default().fg(theme.fg).bg(theme.bg);
+	                            for l in state.screen_lines.iter() {
+	                                lines.push(Line::from(vec![Span::styled(l.clone(), base)]));
+	                            }
+	                            f.render_widget(
+	                                Paragraph::new(lines)
+	                                    .style(base)
                                     .block(block)
                                     .scroll((0, 0)),
                                 chunks[2],
@@ -11481,41 +11434,63 @@ fn run_loop(
                                 &mut pending_pty_snapshot,
                             );
 
-                            if let Some(decision) = normalize_confirm_input(&send.model_text) {
-                                if let Some((call, _reason, msg_idx)) = pending_tool_confirm.take()
-                                {
-                                    if decision {
-                                        update_history_text_at(
-                                            &mut core,
-                                            &mut render_cache,
-                                            msg_idx,
-                                            "您已选择：立即执行",
-                                        );
-                                        spawn_tool_execution(
-                                            call,
-                                            active_kind,
-                                            tx.clone(),
-                                            pty_started_notice_prompt_text.clone(),
-                                        );
-                                        mode = Mode::ExecutingTool;
-                                    } else {
-                                        update_history_text_at(
-                                            &mut core,
-                                            &mut render_cache,
-                                            msg_idx,
-                                            "您已选择：拒绝执行",
-                                        );
-                                        match active_kind {
-                                            MindKind::Sub => {
-                                                dog_state.push_tool("工具确认：用户拒绝执行")
-                                            }
-                                            MindKind::Main => {
-                                                main_state.push_tool("工具确认：用户拒绝执行")
-                                            }
-                                        }
-                                        mode = Mode::Idle;
-                                        let has_next = try_start_next_tool(TryStartNextToolArgs {
-                                            pending_tools: &mut pending_tools,
+	                            if let Some(decision) = normalize_confirm_input(&send.model_text) {
+	                                if let Some((call, _reason, msg_idx)) = pending_tool_confirm.take()
+	                                {
+	                                    if decision {
+	                                        update_history_text_at(
+	                                            &mut core,
+	                                            &mut render_cache,
+	                                            msg_idx,
+	                                            "您已选择：立即执行",
+	                                        );
+	                                        push_sys_log(
+	                                            &mut sys_log,
+	                                            config.sys_log_limit,
+	                                            "工具确认：用户已允许执行",
+	                                        );
+	                                        match active_kind {
+	                                            MindKind::Sub => {
+	                                                dog_state.push_tool("工具确认：用户已允许执行")
+	                                            }
+	                                            MindKind::Main => {
+	                                                main_state.push_tool("工具确认：用户已允许执行")
+	                                            }
+	                                        }
+	                                        spawn_tool_execution(
+	                                            call,
+	                                            active_kind,
+	                                            tx.clone(),
+	                                            pty_started_notice_prompt_text.clone(),
+	                                        );
+	                                        mode = Mode::ExecutingTool;
+	                                    } else {
+	                                        update_history_text_at(
+	                                            &mut core,
+	                                            &mut render_cache,
+	                                            msg_idx,
+	                                            "您已选择：拒绝执行",
+	                                        );
+	                                        push_sys_log(
+	                                            &mut sys_log,
+	                                            config.sys_log_limit,
+	                                            "工具确认：用户拒绝执行（等待下一条指令）",
+	                                        );
+	                                        match active_kind {
+	                                            MindKind::Sub => {
+	                                                dog_state.push_tool(
+	                                                    "工具确认：用户拒绝执行，请等待下一条指令",
+	                                                )
+	                                            }
+	                                            MindKind::Main => {
+	                                                main_state.push_tool(
+	                                                    "工具确认：用户拒绝执行，请等待下一条指令",
+	                                                )
+	                                            }
+	                                        }
+	                                        mode = Mode::Idle;
+	                                        let has_next = try_start_next_tool(TryStartNextToolArgs {
+	                                            pending_tools: &mut pending_tools,
                                             pending_tool_confirm: &mut pending_tool_confirm,
                                             tx: tx.clone(),
                                             core: &mut core,

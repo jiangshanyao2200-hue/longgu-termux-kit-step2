@@ -8,7 +8,7 @@ use crate::mcp::ToolCall;
 const DEFAULT_MCP_MESSAGES_JSON: &str = include_str!("../config/prompt/mcp/mcp_messages.json");
 
 fn default_deepseek_tool_loop_tick_user() -> String {
-    "[AITERMUX_INTERNAL_TOOL_LOOP] 系统注入：非用户输入。请基于上一条 Tool result 继续当前任务。"
+    "[AITERMUX_INTERNAL_TOOL_LOOP] 系统注入：非用户输入。请基于上一条工具输出继续当前任务。"
         .to_string()
 }
 
@@ -28,7 +28,7 @@ fn default_tool_confirm_prompt() -> String {
 }
 
 fn default_tool_result_assistant() -> String {
-    "Tool result:\n{RESULT}".to_string()
+    "【工具输出（系统回执，仅供参考，不要复述）】\n{RESULT}".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

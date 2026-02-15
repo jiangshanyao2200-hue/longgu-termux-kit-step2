@@ -429,7 +429,13 @@ fn extract_tool_detail(text: &str) -> &str {
     let mut pos = 0usize;
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("output:") || trimmed.starts_with("meta:") {
+        if trimmed
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("output:"))
+            || trimmed
+                .get(..5)
+                .is_some_and(|head| head.eq_ignore_ascii_case("meta:"))
+        {
             return &text[pos..];
         }
         pos = pos.saturating_add(line.len().saturating_add(1));
@@ -485,9 +491,11 @@ fn extract_tool_sections(text: &str) -> (Vec<String>, Vec<String>) {
 
 fn extract_tool_kv_token(text: &str, key: &str) -> Option<String> {
     let needle = format!("{key}:");
+    let needle_lower = needle.to_ascii_lowercase();
     for line in text.lines() {
         let trimmed = line.trim();
-        let Some(pos) = trimmed.find(&needle) else {
+        let lower = trimmed.to_ascii_lowercase();
+        let Some(pos) = lower.find(&needle_lower) else {
             continue;
         };
         let rest = trimmed[pos + needle.len()..].trim();
@@ -719,8 +727,11 @@ fn build_plan_panel_lines(
 fn extract_brief_value(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     for prefix in ["explain:", "brief:"] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let val = rest.trim();
+        if trimmed
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            let val = trimmed[prefix.len()..].trim();
             if !val.is_empty() {
                 return Some(val.to_string());
             }
@@ -732,8 +743,11 @@ fn extract_brief_value(line: &str) -> Option<String> {
 fn extract_brief_token(token: &str) -> Option<String> {
     let trimmed = token.trim();
     for prefix in ["explain:", "brief:"] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let val = rest.trim();
+        if trimmed
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            let val = trimmed[prefix.len()..].trim();
             if !val.is_empty() {
                 return Some(val.to_string());
             }
@@ -745,7 +759,13 @@ fn extract_brief_token(token: &str) -> Option<String> {
 fn extract_tool_explain(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("output:") || trimmed.starts_with("meta:") {
+        if trimmed
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("output:"))
+            || trimmed
+                .get(..5)
+                .is_some_and(|head| head.eq_ignore_ascii_case("meta:"))
+        {
             break;
         }
         if let Some(val) = extract_brief_value(trimmed) {
@@ -1159,7 +1179,57 @@ fn strip_thinking_marker(text: &str) -> Option<&str> {
         .map(|rest| rest.trim_start())
 }
 
+fn maybe_unescape_tool_text(text: &str) -> Cow<'_, str> {
+    // 仅对“疑似被二次转义导致换行丢失”的 tool 文本做修复：
+    // - 没有真实 '\n'
+    // - 含有 "\\n" 序列
+    // - 且看起来像工具消息（避免误伤真实输出里的 `\n` 字面量）
+    if text.contains('\n') || !text.contains("\\n") {
+        return Cow::Borrowed(text);
+    }
+    let looks_like_tool = text.starts_with("TOOL:")
+        || text.starts_with("tool:")
+        || text.starts_with("操作:")
+        || text.contains("OUTPUT:\\n```")
+        || text.contains("META:\\n```")
+        || text.contains("output:\\n```")
+        || text.contains("meta:\\n```");
+    if !looks_like_tool {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut it = text.chars().peekable();
+    while let Some(ch) = it.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match it.peek().copied() {
+            Some('n') => {
+                it.next();
+                out.push('\n');
+            }
+            Some('r') => {
+                it.next();
+                out.push('\r');
+            }
+            Some('t') => {
+                it.next();
+                out.push('\t');
+            }
+            Some('\\') => {
+                it.next();
+                out.push('\\');
+            }
+            _ => out.push(ch),
+        }
+    }
+    Cow::Owned(out)
+}
+
 fn summarize_tool_message(text: &str) -> String {
+    let text = maybe_unescape_tool_text(text);
+    let text = text.as_ref();
     let mut tool = "tool";
     let mut input = None;
     let mut raw_input = None;
@@ -1167,8 +1237,15 @@ fn summarize_tool_message(text: &str) -> String {
     let mut status = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
         if let Some(val) = trimmed.strip_prefix("[tool:") {
             let val = val.trim_end_matches(']').trim();
+            if !val.is_empty() {
+                tool = val;
+            }
+        }
+        if lower.starts_with("tool:") {
+            let val = trimmed[5..].trim();
             if !val.is_empty() {
                 tool = val;
             }
@@ -1179,8 +1256,8 @@ fn summarize_tool_message(text: &str) -> String {
                 tool = val;
             }
         }
-        if input.is_none() && line.trim_start().starts_with("input:") {
-            let val = line.trim_start().trim_start_matches("input:").trim();
+        if input.is_none() && lower.starts_with("input:") {
+            let val = trimmed[6..].trim();
             if !val.is_empty() {
                 input = Some(val.to_string());
                 raw_input = Some(val.to_string());
@@ -1258,6 +1335,26 @@ fn summarize_tool_message(text: &str) -> String {
         parts.push(compact_preview(&s, 80));
     }
     parts.join(" | ")
+}
+
+#[cfg(test)]
+mod tool_text_tests {
+    use super::{maybe_unescape_tool_text, summarize_tool_message};
+
+    #[test]
+    fn unescape_tool_text_newlines() {
+        let raw = "TOOL: BASH\\nEXPLAIN: hi\\nOUTPUT:\\n```text\\na\\n```\\n";
+        let fixed = maybe_unescape_tool_text(raw);
+        assert!(fixed.contains('\n'));
+        assert!(!fixed.contains("\\nEXPLAIN"));
+    }
+
+    #[test]
+    fn summarize_handles_uppercase_keys_and_escaped_newlines() {
+        let raw = "TOOL: BASH\\nEXPLAIN: 查看\\nINPUT: free -h\\nOUTPUT:\\n```text\\nOK\\n```\\nMETA:\\n```text\\n状态:0\\n```\\n";
+        let s = summarize_tool_message(raw);
+        assert!(s.to_ascii_lowercase().contains("tool:"));
+    }
 }
 
 fn normalize_memory_target(raw: &str) -> String {
@@ -3177,7 +3274,9 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             render_cache.update_scramble_state(msg_idx, &msg.text, tick, scramble_active);
         }
         if msg.role == Role::Tool {
-            let summary = summarize_tool_message(&msg.text);
+            let tool_text_cow = maybe_unescape_tool_text(&msg.text);
+            let tool_text = tool_text_cow.as_ref();
+            let summary = summarize_tool_message(tool_text);
             let (tool_raw, input_raw, _note) = parse_tool_summary(&summary);
             let is_think = tool_raw.eq_ignore_ascii_case("think");
             let is_mind = tool_raw.eq_ignore_ascii_case("mind");
@@ -3209,7 +3308,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
 
             if is_think {
                 let think_running =
-                    msg.text.contains("状态:running") || msg.text.contains("状态:in_progress");
+                    tool_text.contains("状态:running") || tool_text.contains("状态:in_progress");
                 let allow_history_think = (details_mode && msg_idx >= details_tail_start)
                     || expanded_thinking_idxs.contains(&msg_idx);
                 // 规则（简化）：
@@ -3224,11 +3323,11 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     }
                 }
                 // 消息块之间保持 1 行间隔：由“上一块末尾的空行”保证，这里不额外插空。
-                let mind = extract_tool_mind(&msg.text);
+                let mind = extract_tool_mind(tool_text);
                 let dot = if mind == Some("dog") { "○" } else { "●" };
                 let dot_color = theme.cyan;
                 let base_style = Style::default().fg(theme.dim).bg(theme.bg);
-                let thinking_body = render_think_output_lines(theme, &msg.text, width)
+                let thinking_body = render_think_output_lines(theme, tool_text, width)
                     .into_iter()
                     .map(|l| l.to_string())
                     .collect::<Vec<_>>()
@@ -3373,11 +3472,11 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     continue;
                 }
 
-                let mind = extract_tool_mind(&msg.text);
+                let mind = extract_tool_mind(tool_text);
                 let dot = if mind == Some("dog") { "○" } else { "●" };
-                let brief = extract_tool_explain(&msg.text)
+                let brief = extract_tool_explain(tool_text)
                     .or_else(|| {
-                        let t = msg.text.lines().next().unwrap_or("").trim();
+                        let t = tool_text.lines().next().unwrap_or("").trim();
                         (!t.is_empty()).then_some(t.to_string())
                     })
                     .unwrap_or_else(|| tool_raw.clone());
@@ -3530,7 +3629,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             }
 
             // 详情态（全局 or `→`）：展示解析后的头部 + brief + 截断后的 output/meta（用于观察与审计）。
-            let mind = extract_tool_mind(&msg.text);
+            let mind = extract_tool_mind(tool_text);
             let dot = if mind == Some("dog") { "○" } else { "●" };
             let (prefix, tool_name, suffix) = tool_compact_title_parts(&tool_raw);
             let head = format!("{dot} {prefix}");
@@ -3611,17 +3710,17 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     ]));
                 }
             }
-            if let Some(explain) = extract_tool_explain(&msg.text) {
+            if let Some(explain) = extract_tool_explain(tool_text) {
                 push_tool_explain_line(
                     &mut lines, theme, width, &explain, reveal_idx, msg_idx, reveal_len,
                 );
             }
-            if !is_mind && let Some(result) = tool_status_result_line(&msg.text) {
+            if !is_mind && let Some(result) = tool_status_result_line(tool_text) {
                 push_tool_explain_line(
                     &mut lines, theme, width, &result, reveal_idx, msg_idx, reveal_len,
                 );
             }
-            let details = render_tool_detail_lines(theme, &msg.text, width, true);
+            let details = render_tool_detail_lines(theme, tool_text, width, true);
             lines.extend(details);
 
             if reveal_idx != Some(msg_idx) {

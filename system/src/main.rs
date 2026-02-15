@@ -5428,8 +5428,8 @@ struct PtyDoneFollowup {
 
 fn format_pty_done_batch_tool_text(owner: MindKind, jobs: &[PtyDoneJob]) -> String {
     let mut out = String::new();
-    out.push_str("操作: PTY DONE (BATCH)\n");
-    out.push_str("explain: 多个后台终端任务已结束，结果已汇总。\n");
+    out.push_str("操作: PTY Done\n");
+    out.push_str("explain: 终端任务完成\n");
     out.push_str("output:\n```text\n");
     for (idx, j) in jobs.iter().enumerate() {
         out.push_str(&format!("#{}\n", idx + 1));
@@ -5446,7 +5446,7 @@ fn format_pty_done_batch_tool_text(owner: MindKind, jobs: &[PtyDoneJob]) -> Stri
         out.push_str("cmd: ");
         out.push_str(cmd_preview.trim_end());
         out.push('\n');
-        out.push_str(&format!("saved:{}\n", j.saved_path));
+        out.push_str(&format!("log:{}\n", j.saved_path));
         out.push_str(&format!("status:{}\n", j.status_path));
         if !j.tail.trim().is_empty() {
             out.push_str("tail:\n");

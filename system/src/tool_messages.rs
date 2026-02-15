@@ -120,3 +120,16 @@ pub fn render_tool_template(template: &str, pairs: &[(&str, &str)]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ToolMessages;
+
+    #[test]
+    fn can_deserialize_empty_object() {
+        let msgs: ToolMessages = serde_json::from_str("{}").expect("deserialize {}");
+        assert!(msgs.tool_line.contains("{TOOL}"));
+        assert!(msgs.input_line.contains("{INPUT}"));
+        assert!(!msgs.tool_failed_generic.trim().is_empty());
+    }
+}

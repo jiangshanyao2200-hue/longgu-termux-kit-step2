@@ -107,3 +107,16 @@ pub fn render_tool_confirm_prompt(msgs: &McpMessages, reason: &str, call: &ToolC
         ],
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::McpMessages;
+
+    #[test]
+    fn can_deserialize_empty_object() {
+        let msgs: McpMessages = serde_json::from_str("{}").expect("deserialize {}");
+        assert!(!msgs.deepseek_tool_loop_tick_user.trim().is_empty());
+        assert!(msgs.heartbeat_user.contains("{STAMP}"));
+        assert!(msgs.tool_result_assistant.contains("{RESULT}"));
+    }
+}

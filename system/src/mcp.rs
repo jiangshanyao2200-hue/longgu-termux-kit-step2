@@ -477,8 +477,53 @@ fn parse_string_list_value_max(v: &Value, max: usize) -> Option<Vec<String>> {
     }
 }
 
+fn repair_json_payload_newlines(payload: &str) -> Option<String> {
+    if !payload.contains('\n') && !payload.contains('\r') && !payload.contains('\t') {
+        return None;
+    }
+    let mut out = String::with_capacity(payload.len().saturating_add(16));
+    let mut in_str = false;
+    let mut escape = false;
+    for ch in payload.chars() {
+        if in_str {
+            if escape {
+                escape = false;
+                out.push(ch);
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    escape = true;
+                    out.push(ch);
+                }
+                '"' => {
+                    in_str = false;
+                    out.push(ch);
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c < ' ' => out.push_str(&format!("\\u{:04x}", c as u32)),
+                _ => out.push(ch),
+            }
+        } else {
+            if ch == '"' {
+                in_str = true;
+            }
+            out.push(ch);
+        }
+    }
+    Some(out)
+}
+
 fn parse_tool_call_payload(payload: &str) -> Option<ToolCall> {
-    let mut v: Value = serde_json::from_str(payload).ok()?;
+    let mut v: Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => {
+            let repaired = repair_json_payload_newlines(payload)?;
+            serde_json::from_str(&repaired).ok()?
+        }
+    };
     if let Some(args_str) = v
         .get("arguments")
         .and_then(|x| x.as_str())
@@ -1355,6 +1400,15 @@ mod tests {
                 .as_ref()
                 .is_some_and(|v| v.iter().any(|x| x == "target"))
         );
+    }
+
+    #[test]
+    fn parse_tool_call_repairs_raw_newlines_in_json_string() {
+        let payload = "{\"tool\":\"bash\",\"brief\":\"x\",\"input\":\"echo 1\necho 2\"}";
+        let call = parse_tool_call_payload(payload).expect("call");
+        assert_eq!(call.tool, "bash");
+        assert!(call.input.contains('\n'));
+        assert!(call.input.contains("echo 2"));
     }
 
     #[test]

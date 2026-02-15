@@ -11029,6 +11029,13 @@ fn run_loop(
                     // - 再按一次：展开最近 N 条（防卡顿）
                     KeyCode::Tab if input.is_empty() && !menu_open => {
                         const EXPAND_TAIL_MAX: usize = 120;
+                        // UI 交互期间可能打断“流式动画帧”节奏：先把历史动画快速推进到尾部，
+                        // 避免切换显示模式后历史消息重新播放动画/触发重排错觉。
+                        render_cache.fast_forward_all_animations_to_tail(&core);
+                        if reveal_idx.is_some() {
+                            reveal_idx = None;
+                            reveal_len = 0;
+                        }
                         if !expanded_tool_idxs.is_empty()
                             || !expanded_thinking_idxs.is_empty()
                             || !expanded_user_idxs.is_empty()
@@ -11075,6 +11082,11 @@ fn run_loop(
                             continue;
                         }
                         last_details_toggle_at = Some(now);
+                        render_cache.fast_forward_all_animations_to_tail(&core);
+                        if reveal_idx.is_some() {
+                            reveal_idx = None;
+                            reveal_len = 0;
+                        }
                         details_mode = !details_mode;
                         render_cache.invalidate_all();
                         if details_mode {

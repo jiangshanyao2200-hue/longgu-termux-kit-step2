@@ -3071,6 +3071,7 @@ impl ChatRenderCache {
         const MIN_DELAY_FRAMES: usize = 1;
         const CHARS_PER_FRAME: usize = 4;
         const NOISE_FRAMES: usize = 2;
+        const INIT_TAIL_MAX_CHARS: usize = 80;
         let new_len = text.chars().count();
 
         let slot = self.scramble.get_mut(idx);
@@ -3086,8 +3087,15 @@ impl ChatRenderCache {
             return;
         }
         if state.last_len == 0 && state.segments.is_empty() && active && new_len > 0 {
+            // 兜底：当 UI 缓存被重置/重排（例如切换显示模式）后，活跃输出可能“从头再播一遍”。
+            // 这里仅对“初次活跃且内容已很长”的情况做 tail-only 动画，避免整段重播干扰。
+            let start = if new_len > INIT_TAIL_MAX_CHARS {
+                new_len.saturating_sub(INIT_TAIL_MAX_CHARS)
+            } else {
+                0
+            };
             state.segments.push(ScrambleSegment {
-                start: 0,
+                start,
                 end: new_len,
                 born_tick: tick,
             });

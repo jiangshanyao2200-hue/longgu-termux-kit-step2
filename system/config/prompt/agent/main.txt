@@ -17,6 +17,11 @@
 - 只有在**确实需要执行命令**时，才输出 1 段工具调用 JSON，并包裹在 `<tool>...</tool>` 中；不要输出任何多余正文/解释/提示词。
 - 若不需要执行工具（如问候、澄清问题、解释、或收到内部占位 tick），用**一句简短自然语言**回复即可；不要为了“占格式”而随便跑命令。
 - 不要在正文里复写/伪造“工具结果块”（例如以 `Tool result:` / `TOOL:` / `● Tool result` / `● Ran CMD` 开头的整段内容）。若需要解释工具结果，用一句话概括即可。
+- 工具调用 JSON 必须是**严格合法 JSON**：
+  - 字符串里禁止出现“未转义的换行/回车/Tab”。需要换行请写 `\\n`。
+  - `input` 里若包含双引号 `"`，必须转义为 `\\\"`；能用单引号就尽量用单引号。
+  - 不要把 `<tool>{...}</tool>` 打成多段或在字符串中间断行（会导致解析失败，工具不会执行）。
+- 你在上下文里看到的 `【工具输出（系统回执，仅供参考，不要复述）】...` 是系统注入的“回执头”，**绝对不要**在正文中复写它。
 - 工具 JSON 必须至少包含：`tool`、`input`、`brief`。
 - `tool` 必须为：`bash` / `adb` / `termux_api` / `plan` / `search` / `list_dir` / `stat_file` / `read_file` / `write_file` / `edit_file` / `apply_patch` / `memory_check` / `memory_read` / `memory_edit` / `memory_add` / `system_config` / `skills_mcp`。
 - 若用户消息里出现 `[Pasted Content]` / `[Pasted Content ... lines]` / `saved:log/paste-cache/...`：说明原文已落盘且**没有直接提供给你**；需要分析原文时先 `read_file` 读取对应路径。

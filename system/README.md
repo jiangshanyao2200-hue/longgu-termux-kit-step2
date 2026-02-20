@@ -146,16 +146,16 @@ bash install.sh --quiet
 
 项目运行时默认读取以下配置文件：
 
-· config/dog_api.json
-· config/main_api.json
-· config/system.json
+· config/dogAPI.json
+· config/mainAPI.json
+· config/System.json
 
 仓库默认提供一套用于联调/演示的测试 key（已做限额）。如需使用自己的 key，可用示例文件覆盖后再填写：
 
 ```bash
-cp -n config/dog_api.example.json  config/dog_api.json
-cp -n config/main_api.example.json config/main_api.json
-cp -n config/system.example.json   config/system.json
+cp -n config/example/dogAPI.example.json  config/dogAPI.json
+cp -n config/example/mainAPI.example.json config/mainAPI.json
+cp -n config/example/System.example.json  config/System.json
 ```
 
 ---
@@ -174,9 +174,10 @@ cp -n config/system.example.json   config/system.json
 ```
 .
 ├── config/                 # 配置文件目录
-│   ├── dog_api.example.json
-│   ├── main_api.example.json
-│   └── system.example.json
+│   └── example
+│       ├── dogAPI.example.json
+│       ├── mainAPI.example.json
+│       └── System.example.json
 ├── scripts/               # 脚本目录
 │   ├── bootstrap.sh
 │   ├── bootstrap-termux.sh

@@ -33,7 +33,7 @@
     - ✅ `<tool>{"tool":"bash","input":"echo ok","brief":"测试"}</tool>`
     - ❌ `<tool>{\\\"tool\\\":\\\"bash\\\",...}</tool>`
   - 不要把 `<tool>{...}</tool>` 打成多段或在字符串中间断行（会导致解析失败，工具不会执行）。
-- 你在上下文里看到的 `【工具输出（系统回执，仅供参考，不要复述）】...` 是系统注入的“回执头”，**绝对不要**在正文中复写它。
+- 你在上下文里看到的 `[sys:工具回执（对应上一轮assistant工具调用）]...` 是系统注入的“回执头”，**绝对不要**在正文中复写它。
 - 分析用户目标，先计划，再执行，完成后终止，避免重复执行
 - 工具调用必须输出 JSON，并包裹在 <tool>...</tool> 中。
 - `brief` 必须是非常极简可爱一句话的目的。
@@ -55,14 +55,14 @@
 - stat_file：已合并到 list_dir（兼容保留）。
   示例：{"tool":"stat_file","path":"Cargo.toml","brief":"我确认一下文件状态"}
 - read_file：读取文件片段（建议分段）。
-  示例：{"tool":"read_file","path":"src/main.rs","start_line":1,"max_lines":120,"brief":"我来读入口逻辑"}
+  示例：{"tool":"read_file","path":"src/core.rs","start_line":1,"max_lines":120,"brief":"我来读入口逻辑"}
   - 若上游文本出现 `[Pasted Content]` 且包含 `saved:log/paste-cache/...`：先 `read_file` 读取该路径再分析，不要假设你已看到原文。
 - write_file：写入/创建文件（会覆盖）。
   示例：{"tool":"write_file","path":"notes/demo.txt","content":"hello","brief":"我来写入演示内容"}
 - edit_file：小范围替换。
-  示例：{"tool":"edit_file","path":"src/main.rs","find":"old","replace":"new","count":1,"brief":"我来替换片段"}
+  示例：{"tool":"edit_file","path":"src/core.rs","find":"old","replace":"new","count":1,"brief":"我来替换片段"}
 - apply_patch：应用 unified diff。
-  示例：{"tool":"apply_patch","patch":"--- a/src/main.rs\n+++ b/src/main.rs\n@@\n- old\n+ new\n","strict":false,"brief":"我来应用补丁"}
+  示例：{"tool":"apply_patch","patch":"--- a/src/core.rs\n+++ b/src/core.rs\n@@\n- old\n+ new\n","strict":false,"brief":"我来应用补丁"}
 - bash：执行 bash 命令。
   示例：{"tool":"bash","input":"ls -la","brief":"查看目录"}
   可选参数：{"interactive":true,"timeout_secs":60,"timeout_ms":5000}
@@ -102,5 +102,5 @@ skills_mcp 用法示例：
 如需详细工具用法，请调用 skills_mcp 获取对应类别的完整说明。
 
 内部协议（必须遵守）：
-- 你可能会在对话中看到一条 user 消息：`[AITERMUX_INTERNAL_TOOL_LOOP] ...`。这是系统占位（非用户输入）：若上一条工具输出未明确要求继续，请等待用户下一条消息，不要主动轮询日志/状态或执行命令。
+- 你可能会在对话中看到一条 user 消息：`[sys:轮询占位]`。这是系统占位（非用户输入）：若上一条工具输出未明确要求继续，请等待用户下一条消息，不要主动轮询日志/状态或执行命令。
   这不是用户输入，只是系统用于“工具链继续/轮询”的结构占位。不要把它当成用户意图或新需求。

@@ -39,13 +39,162 @@ use signal_hook::iterator::Signals;
 use unicode_width::UnicodeWidthChar;
 
 mod mcp;
-mod mcp_messages; // configurable system→model messages
-mod memorydb;
-mod tool_messages;
+mod memory;
 mod ui;
+mod api;
+
+mod messages {
+    use crate::mcp::ToolCall;
+    fn default_heartbeat_user() -> String {
+        "[sys:心跳]{STAMP} | idle\n请像正常消息一样回复（可简短）。若无需回应请只回复 [mainpass]。不要调用工具。"
+            .to_string()
+    }
+
+    fn default_plan_mixed_batch_reject() -> String {
+        "[sys:计划]检测到 plan 与其它工具同批输出：已拒绝本轮工具执行。请将 plan:start / plan:end 单独一条回复输出；执行阶段每轮只调用一个工具。"
+            .to_string()
+    }
+
+    fn default_tool_confirm_prompt() -> String {
+        "[sys:工具确认]需要确认执行：{TOOL}\n原因：{REASON}\n\n请求：\n```text\n{INPUT_PREVIEW}\n```\n\n回复：y/n（或 是/否）。"
+            .to_string()
+    }
+
+    fn default_tool_confirm_user_allowed() -> String {
+        "[sys:工具确认]用户允许执行".to_string()
+    }
+
+    fn default_tool_confirm_user_denied() -> String {
+        "[sys:工具确认]用户拒绝执行".to_string()
+    }
+
+    fn default_tool_result_assistant() -> String {
+        "[sys:工具回执（对应上一轮assistant工具调用）]\n{RESULT}".to_string()
+    }
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct McpMessages {
+        pub(crate) heartbeat_user: String,
+        pub(crate) plan_mixed_batch_reject: String,
+        pub(crate) tool_confirm_prompt: String,
+        pub(crate) tool_confirm_user_allowed: String,
+        pub(crate) tool_confirm_user_denied: String,
+        pub(crate) tool_result_assistant: String,
+    }
+
+    impl Default for McpMessages {
+        fn default() -> Self {
+            Self {
+                heartbeat_user: default_heartbeat_user(),
+                plan_mixed_batch_reject: default_plan_mixed_batch_reject(),
+                tool_confirm_prompt: default_tool_confirm_prompt(),
+                tool_confirm_user_allowed: default_tool_confirm_user_allowed(),
+                tool_confirm_user_denied: default_tool_confirm_user_denied(),
+                tool_result_assistant: default_tool_result_assistant(),
+            }
+        }
+    }
+
+	    fn default_pty_started_model_note() -> String {
+	        // 默认不向模型注入“PTY 启动提示”：避免触发模型继续连发工具/PTY。
+	        // 启动阶段只需 UI 展示；模型应等待 PTY Done 或 PTY 审计 tick。
+	        String::new()
+	    }
+
+	    fn default_pty_done_auto_report_prompt() -> String {
+	        "[sys:PTYDone]结果就绪（{JOBS} 个任务）。请基于上一条 PTY Done 回执，用 3-8 行简要汇报（exit/耗时/关键输出）；不要调用工具/不要启动新的 PTY；如需用户继续操作，请提问并等待用户下一条消息。"
+	            .to_string()
+	    }
+
+	    fn default_pty_audit_prompt() -> String {
+	        "[sys:PTY审计]后台 PTY 仍在运行（已到审计间隔）。\nowner:{OWNER} | running_total:{RUNNING_TOTAL} | running_owner:{RUNNING_OWNER}\nactive_job:{JOB_ID}\ncmd:{CMD}\nstatus:{STATUS_PATH}\nlog:{LOG_PATH}\n\n[status_tail]\n```text\n{STATUS_TAIL}\n```\n\n[log_tail]\n```text\n{LOG_TAIL}\n```\n\n请只用 2-5 行回答：是否需要用户介入/是否继续等待/是否建议终止；不要调用工具。"
+	            .to_string()
+	    }
+
+	    #[derive(Debug, Clone)]
+	    pub(crate) struct PtyMessages {
+	        pub(crate) pty_started_model_note: String,
+	        pub(crate) pty_done_auto_report_prompt: String,
+	        pub(crate) pty_audit_prompt: String,
+	    }
+
+	    impl Default for PtyMessages {
+	        fn default() -> Self {
+	            Self {
+	                pty_started_model_note: default_pty_started_model_note(),
+	                pty_done_auto_report_prompt: default_pty_done_auto_report_prompt(),
+	                pty_audit_prompt: default_pty_audit_prompt(),
+	            }
+	        }
+	    }
+
+    pub(crate) fn render_template(template: &str, pairs: &[(&str, &str)]) -> String {
+        let mut out = template.to_string();
+        for (k, v) in pairs {
+            out = out.replace(&format!("{{{k}}}"), v);
+        }
+        out
+    }
+
+    pub(crate) fn render_heartbeat_user(msgs: &McpMessages, stamp: &str) -> String {
+        render_template(&msgs.heartbeat_user, &[("STAMP", stamp)])
+    }
+
+    pub(crate) fn render_tool_confirm_prompt(
+        msgs: &McpMessages,
+        reason: &str,
+        call: &ToolCall,
+    ) -> String {
+        let tool_label = crate::mcp::tool_display_label(&call.tool);
+        let brief_raw = call.brief.as_deref().unwrap_or("").trim();
+        let mut brief = crate::truncate_with_ellipsis(brief_raw, 90);
+        if brief.trim().is_empty() {
+            brief = "（无）".to_string();
+        }
+        let mut reason_preview = reason.replace('\n', " ");
+        reason_preview = reason_preview
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        reason_preview = crate::truncate_with_ellipsis(&reason_preview, 140);
+        let mut input_preview = call.input.replace('\n', " ");
+        input_preview = input_preview
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        input_preview = crate::truncate_with_ellipsis(&input_preview, 180);
+        if input_preview.trim().is_empty() {
+            input_preview = "（空）".to_string();
+        }
+
+        // 兼容旧模板（如仍引用 {CALL_JSON}）：只提供极简一行摘要，避免超行/超长。
+        let call_json = serde_json::json!({
+            "tool": call.tool.as_str(),
+            "brief": brief,
+            "input": crate::truncate_with_ellipsis(&call.input, 240),
+        });
+        let mut call_json =
+            serde_json::to_string(&call_json).unwrap_or_else(|_| "{}".to_string());
+        call_json = crate::truncate_with_ellipsis(&call_json, 900);
+
+        render_template(
+            &msgs.tool_confirm_prompt,
+            &[
+                ("REASON", &reason_preview),
+                ("TOOL", &tool_label),
+                ("CALL_JSON", &call_json),
+                ("BRIEF", &brief),
+                ("INPUT_PREVIEW", &input_preview),
+            ],
+        )
+    }
+}
 
 use crate::commands::filter_commands_for_input;
-use crate::config::{AppConfig, ContextPromptConfig, DogApiConfig, MainApiConfig, SystemConfig};
+use crate::config::{
+    ApiProviderProfile, ApiProviderProfiles, AppConfig, ContextPromptConfig, DogApiConfig,
+    MainApiConfig, SystemConfig,
+};
 use crate::input::{
     PasteCapture, PlaceholderRemove, can_accept_more, count_chars, is_paste_like_activity,
     maybe_begin_paste_capture, maybe_finalize_paste_capture, next_char_boundary,
@@ -54,17 +203,17 @@ use crate::input::{
     update_paste_burst,
 };
 use crate::mcp::{
-    ToolCall, ToolOutcome, extract_tool_calls, format_tool_message_raw,
-    handle_tool_call_with_retry, tool_requires_confirmation,
+    ToolCall, ToolOutcome, extract_tool_calls, format_tool_message_for_model,
+    format_tool_message_raw, handle_tool_call_with_retry, tool_requires_confirmation,
 };
-use crate::mcp_messages::McpMessages;
-use crate::memorydb::{MemoDb, MemoKind, build_memo_entry};
+use crate::messages::{McpMessages, PtyMessages};
+use crate::memory::{MemoDb, MemoKind, build_memo_entry};
 
 pub use crate::commands::CommandSpec;
-use crate::types::THINKING_MARKER;
 pub use crate::types::{
     ContextLine, Core, Message, MindKind, Mode, PulseDir, Role, Screen, SettingsFocus,
 };
+use crate::types::{THINK_TOOL_MARKER, THINKING_MARKER};
 
 const TOOL_STREAM_PREVIEW_MAX: usize = 8000;
 const TOOL_CALLS_MAX_PER_ASSISTANT_MSG: usize = 3;
@@ -83,17 +232,18 @@ const PTY_RETURN_RAW_TAIL_MAX_CHARS: usize = 6_000;
 const PTY_RETURN_STDIN_MAX_CHARS: usize = 2_000;
 const PTY_DONE_BATCH_TOOL_MAX_CHARS: usize = 14_000;
 const PTY_DONE_BATCH_TAIL_MAX_CHARS: usize = 1_600;
-const DEFAULT_WELCOME_SHORTCUTS_PROMPT: &str =
-    include_str!("../config/prompt/system/welcome_shortcuts.txt");
+const DEFAULT_WELCOME_SHORTCUTS_PROMPT: &str = include_str!("../prompt/Systemwelcome.txt");
 const USER_PASTE_CACHE_DIR: &str = "log/paste-cache";
 const USER_PASTE_MARKER_BEGIN: &str = "[[AITERMUX_PASTE_BEGIN|";
 const USER_PASTE_MARKER_END: &str = "[[AITERMUX_PASTE_END|";
+const USER_PTY_SNAPSHOT_MARKER_BEGIN: &str = "[[AITERMUX_PTY_SNAPSHOT_BEGIN|";
+const USER_PTY_SNAPSHOT_MARKER_END: &str = "[[AITERMUX_PTY_SNAPSHOT_END|";
+const USER_PTY_SNAPSHOT_PLACEHOLDER: &str = "〔PTY,Terminal快照〕";
+const MODEL_NOTE_PREFIX: &str = "[[AITERMUX_MODEL_NOTE]]";
 const MODEL_RESPONSE_TIMEOUT_CAP_SECS: u64 = 7 * 60;
-// DeepSeek chat/completions 没有 tool role，且部分提供方对“最后一条消息 role”很敏感：
-// - 若最后是 assistant（或 system），可能报 400（如 Invalid consecutive assistant message）
-// 解决：仅在“发起请求快照”时，必要时追加一条“伪 user 占位”。
-// 这条文本必须清晰声明“非用户输入”，避免被模型当成用户意图。
-// 具体文本来自 config/prompt/mcp/mcp_messages.json 的 deepseek_tool_loop_tick_user。
+// DeepSeek chat/completions 没有 tool role。
+// 当前策略：工具回执统一以 system 角色入历史，发送请求时不再临时注入伪 user 占位，
+// 保持“历史上下文 == 实际请求上下文”。
 
 #[cfg(unix)]
 fn set_fd_nonblocking(fd: i32, enabled: bool) {
@@ -127,6 +277,7 @@ enum PtyControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PtyFocus {
     Terminal,
+    Chat,
 }
 
 struct PtyUiState {
@@ -144,6 +295,9 @@ struct PtyUiState {
     cmd: String,
     saved_path: String,
     status_path: String,
+    started_at: Instant,
+    pid: Option<i32>,
+    pgrp: Option<i32>,
     // 按用户决策：交互输入也记录并回传给 AI（含敏感信息）。
     input_log: String,
     // 用户在终端里主动生成的快照（Alt+↑）。用于暂存到输入框；旧链路 final 回传会优先用它。
@@ -180,6 +334,9 @@ impl PtyUiState {
             cmd,
             saved_path,
             status_path,
+            started_at: Instant::now(),
+            pid: None,
+            pgrp: None,
             input_log: String::new(),
             last_user_snapshot: None,
             screen_lines: Vec::new(),
@@ -307,6 +464,22 @@ fn safe_prefix(text: &str, end: usize) -> String {
     text[..idx].to_string()
 }
 
+fn bash_single_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::from("'");
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\"'\"'");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn key_to_pty_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);
@@ -382,16 +555,7 @@ fn kill_process_tree(pid: i32, sig: i32, depth: usize) {
 }
 
 fn find_tool_start(text: &str) -> Option<usize> {
-    if let Some(pos) = text.find("<tool>") {
-        return Some(pos);
-    }
-    if let Some(pos) = text.find("\"tool\"") {
-        if let Some(brace) = text[..pos].rfind('{') {
-            return Some(brace);
-        }
-        return Some(pos);
-    }
-    None
+    text.find("<tool>")
 }
 
 fn extract_tool_name_hint(text: &str) -> Option<String> {
@@ -664,6 +828,7 @@ fn settings_field_hint(section: SettingsSection, kind: SettingsFieldKind) -> &'s
             SettingsFieldKind::BaseUrl => "API base URL",
             SettingsFieldKind::ApiKey => "API key",
             SettingsFieldKind::Model => "Model",
+            SettingsFieldKind::ReasoningEffort => "Reasoning effort",
             SettingsFieldKind::Temperature => "Temperature (0~2)",
             SettingsFieldKind::MaxTokens => "Max tokens",
             SettingsFieldKind::ContextK => "Context compaction threshold (k)",
@@ -862,6 +1027,7 @@ struct InlineInsertArgs<'a> {
     cursor: &'a mut usize,
     input_chars: &'a mut usize,
     pending_pastes: &'a mut Vec<(String, String)>,
+    pending_pty_snapshot: &'a mut Option<PendingPtySnapshot>,
     toast: &'a mut Option<(Instant, String)>,
     max_input_chars: usize,
     burst_count: &'a mut usize,
@@ -886,6 +1052,7 @@ where
         cursor,
         input_chars,
         pending_pastes,
+        pending_pty_snapshot,
         toast,
         max_input_chars,
         burst_count,
@@ -898,6 +1065,7 @@ where
         command_menu_suppress,
     } = args;
     *cursor = snap_cursor_out_of_placeholder(input, pending_pastes, *cursor);
+    *cursor = snap_cursor_out_of_pty_snapshot_placeholder(input, pending_pty_snapshot, *cursor);
     update_paste_burst(
         now,
         burst_last_at,
@@ -993,6 +1161,7 @@ where
         );
     }
     prune_pending_pastes(input, pending_pastes);
+    prune_pending_pty_snapshot(input, pending_pty_snapshot);
 }
 
 struct InsertNewlineArgs<'a> {
@@ -1001,6 +1170,7 @@ struct InsertNewlineArgs<'a> {
     cursor: &'a mut usize,
     input_chars: &'a mut usize,
     pending_pastes: &'a mut Vec<(String, String)>,
+    pending_pty_snapshot: &'a mut Option<PendingPtySnapshot>,
     toast: &'a mut Option<(Instant, String)>,
     max_input_chars: usize,
     command_menu_suppress: Option<&'a mut bool>,
@@ -1013,11 +1183,13 @@ fn insert_newline_limited(args: InsertNewlineArgs<'_>) -> bool {
         cursor,
         input_chars,
         pending_pastes,
+        pending_pty_snapshot,
         toast,
         max_input_chars,
         command_menu_suppress,
     } = args;
     *cursor = snap_cursor_out_of_placeholder(input, pending_pastes, *cursor);
+    *cursor = snap_cursor_out_of_pty_snapshot_placeholder(input, pending_pty_snapshot, *cursor);
     if !can_accept_more(input, pending_pastes, *input_chars, 1, max_input_chars) {
         set_input_limit_toast(now, max_input_chars, toast, false);
         return false;
@@ -1028,6 +1200,7 @@ fn insert_newline_limited(args: InsertNewlineArgs<'_>) -> bool {
         *menu = false;
     }
     prune_pending_pastes(input, pending_pastes);
+    prune_pending_pty_snapshot(input, pending_pty_snapshot);
     true
 }
 
@@ -1126,147 +1299,6 @@ fn compact_ws_inline(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn extract_internal_tool_echo_blocks(text: &str) -> (String, Vec<String>) {
-    fn is_header(line: &str) -> bool {
-        let l = line.trim_start();
-        (l.starts_with("● Ran CMD") || l.starts_with("○ Ran CMD"))
-            || (l.starts_with("● Tool result") || l.starts_with("○ Tool result"))
-            // 新注入头：模型有时会误把“系统回执头”复写进正文，需剥离。
-            || l.starts_with("【工具输出（系统回执")
-            || l.starts_with("● 【工具输出（系统回执")
-            || l.starts_with("○ 【工具输出（系统回执")
-            // 兼容：模型直接复写工具块而不带前缀
-            || l.starts_with("TOOL:")
-            || l.starts_with("TOOL：")
-    }
-
-    fn is_continuation(line: &str) -> bool {
-        let l = line.trim_start();
-        l.starts_with('↳')
-            || l.starts_with('┆')
-            || l.starts_with("meta:")
-            || l.starts_with("output:")
-            || l.starts_with("input:")
-            || l.starts_with("explain:")
-            || l.starts_with("状态:")
-            || l.starts_with("Tool result:")
-            || l.starts_with("TOOL:")
-            || l.starts_with("TOOL：")
-            || l.starts_with("EXPLAIN:")
-            || l.starts_with("EXPLAIN：")
-            || l.starts_with("INPUT:")
-            || l.starts_with("INPUT：")
-            || l.starts_with("OUTPUT:")
-            || l.starts_with("OUTPUT：")
-            || l.starts_with("META:")
-            || l.starts_with("META：")
-    }
-
-    let mut assistant_lines: Vec<String> = Vec::new();
-    let mut blocks: Vec<String> = Vec::new();
-    let mut cur_block: Vec<String> = Vec::new();
-    let mut in_block = false;
-
-    let flush_block = |blocks: &mut Vec<String>, cur: &mut Vec<String>| {
-        if cur.is_empty() {
-            return;
-        }
-        while cur.last().is_some_and(|l| l.trim().is_empty()) {
-            cur.pop();
-        }
-        if !cur.is_empty() {
-            blocks.push(cur.join("\n").trim_end().to_string());
-        }
-        cur.clear();
-    };
-
-    for raw in text.lines() {
-        let line = raw.trim_end();
-        if !in_block {
-            if is_header(line) {
-                in_block = true;
-                cur_block.push(line.to_string());
-            } else {
-                assistant_lines.push(line.to_string());
-            }
-            continue;
-        }
-
-        if line.trim().is_empty() {
-            flush_block(&mut blocks, &mut cur_block);
-            in_block = false;
-            continue;
-        }
-        if is_header(line) {
-            flush_block(&mut blocks, &mut cur_block);
-            cur_block.push(line.to_string());
-            in_block = true;
-            continue;
-        }
-        if is_continuation(line) {
-            cur_block.push(line.to_string());
-            continue;
-        }
-        flush_block(&mut blocks, &mut cur_block);
-        in_block = false;
-        assistant_lines.push(line.to_string());
-    }
-    if in_block {
-        flush_block(&mut blocks, &mut cur_block);
-    }
-
-    while assistant_lines.last().is_some_and(|l| l.trim().is_empty()) {
-        assistant_lines.pop();
-    }
-    (assistant_lines.join("\n").trim().to_string(), blocks)
-}
-
-fn wrap_tool_echo_block_as_tool_message(block: &str) -> String {
-    let mut cleaned_lines: Vec<String> = Vec::new();
-    let mut status: Option<String> = None;
-    for raw in block.lines() {
-        let line = raw.trim_end();
-        let trimmed = line.trim_start();
-        let stripped = if let Some(rest) = trimmed.strip_prefix("● ") {
-            rest
-        } else if let Some(rest) = trimmed.strip_prefix("○ ") {
-            rest
-        } else if let Some(rest) =
-            trimmed.strip_prefix("【工具输出（系统回执，仅供参考，不要复述）】")
-        {
-            rest.trim_start()
-        } else if let Some(rest) = trimmed.strip_prefix("【工具输出（系统回执") {
-            // 兜底：不同版本的提示词头可能略有差异，直接去掉整段前缀到行首剩余内容。
-            // 这里不做复杂匹配，避免误删；只处理“以该头开头”的行。
-            rest.trim_start()
-        } else {
-            line
-        };
-        if status.is_none() {
-            if let Some(pos) = stripped.find("状态:") {
-                let rest = stripped[pos + "状态:".len()..].trim();
-                let tok = rest
-                    .split(|c: char| c.is_whitespace() || c == '|' || c == ',')
-                    .next()
-                    .unwrap_or("")
-                    .trim();
-                if !tok.is_empty() {
-                    status = Some(tok.to_string());
-                }
-            }
-        }
-        cleaned_lines.push(stripped.to_string());
-    }
-    let mut cleaned = cleaned_lines.join("\n").trim_end().to_string();
-    truncate_to_max_bytes(&mut cleaned, 24_000);
-    let meta = status
-        .map(|s| format!("状态:{s}"))
-        .unwrap_or_else(|| "状态:unknown".to_string());
-    format!(
-        "操作: TOOL_ECHO\nexplain: 解析到内部工具回显（已从正文剥离）\noutput:\n```text\n{cleaned}\n```\nmeta:\n```text\n{meta}\n```\n"
-    )
-}
-
 fn load_prompt(path: &Path) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读取提示词失败: {}", path.display()))?;
@@ -1296,14 +1328,14 @@ fn truncate_chars_safe(text: &str, max_chars: usize) -> String {
 
 fn read_fastmemo_for_context() -> String {
     // fastmemo 文件由记忆工具维护；这里仅做只读注入。
-    let path = Path::new("memory/fastmemo.jsonl");
+    let path = Path::new("memory/fastmemory.jsonl");
     // 结构自愈：避免 fastmemo v1/脏结构进入上下文，导致后续 memory_add/edit 逻辑出现偏差。
     let _ = crate::mcp::ensure_memory_file("fastmemo", FASTMEMO_PATH);
     let text = std::fs::read_to_string(path).unwrap_or_default();
     truncate_chars_safe(text.trim(), 1800)
 }
 
-const FASTMEMO_PATH: &str = "memory/fastmemo.jsonl";
+const FASTMEMO_PATH: &str = "memory/fastmemory.jsonl";
 
 fn fastmemo_event_count_and_any_ge10(text: &str) -> (usize, bool) {
     let mut current: Option<&str> = None;
@@ -1431,7 +1463,6 @@ struct DogState {
     messages: Vec<ApiMessage>,
     prompt: String,
     prompt_reinject_pct: u8,
-    deepseek_tool_loop_tick_user: String,
     tool_result_assistant_template: String,
     last_prompt_inject_user: usize,
     user_count: usize,
@@ -1445,17 +1476,40 @@ struct DogState {
 }
 
 impl DogState {
+    fn now_hhmmss() -> String {
+        chrono::Local::now().format("%H%M%S").to_string()
+    }
+
+    fn now_date_tz() -> String {
+        // 只注入日期与时区，便于模型用 HHMM 构建“时间链”，同时减少 token。
+        chrono::Local::now().format("%Y-%m-%d %:z").to_string()
+    }
+
+    fn strip_stamp_footer(text: &str) -> &str {
+        const MARK: &str = "\n[[t:";
+        if let Some(pos) = text.rfind(MARK) {
+            let tail = &text[pos + 1..]; // skip the leading '\n'
+            if !tail.contains('\n') && tail.ends_with("]]") {
+                return &text[..pos];
+            }
+        }
+        text
+    }
+
+    fn with_stamp_footer(text: &str) -> String {
+        let base = Self::strip_stamp_footer(text).trim_end();
+        format!("{base}\n[[t:{}]]", Self::now_hhmmss())
+    }
+
     fn new(
         prompt: String,
         prompt_reinject_pct: u8,
-        deepseek_tool_loop_tick_user: String,
         tool_result_assistant_template: String,
     ) -> Self {
         let mut s = Self {
             messages: Vec::new(),
             prompt,
             prompt_reinject_pct,
-            deepseek_tool_loop_tick_user,
             tool_result_assistant_template,
             last_prompt_inject_user: 0,
             user_count: 0,
@@ -1472,6 +1526,7 @@ impl DogState {
     }
 
     fn inject_prompt(&mut self) {
+        self.push_message("system", format!("[sys:日期]{}", Self::now_date_tz()));
         let prompt = self.prompt.trim();
         if prompt.is_empty() {
             return;
@@ -1490,21 +1545,24 @@ impl DogState {
             && let Some(last) = self.messages.last_mut()
             && last.role == "assistant"
         {
-            let old = estimate_tokens(&last.content);
-            if !last.content.trim_end().is_empty() {
-                last.content.push_str("\n\n");
+            let mut merged = Self::strip_stamp_footer(&last.content).trim_end().to_string();
+            let old = estimate_tokens(&merged);
+            if !merged.is_empty() {
+                merged.push_str("\n\n");
             }
-            last.content.push_str(clean);
-            let new = estimate_tokens(&last.content);
+            merged.push_str(clean);
+            merged = Self::with_stamp_footer(&merged);
+            let new = estimate_tokens(&merged);
             if new >= old {
                 self.used_tokens_est = self.used_tokens_est.saturating_add(new - old);
             } else {
                 self.used_tokens_est = self.used_tokens_est.saturating_sub(old - new);
             }
+            last.content = merged;
             return;
         }
 
-        let clean = clean.to_string();
+        let clean = Self::with_stamp_footer(clean);
         self.used_tokens_est = self.used_tokens_est.saturating_add(estimate_tokens(&clean));
         self.messages.push(ApiMessage {
             role: role.to_string(),
@@ -1543,7 +1601,7 @@ impl DogState {
         if let Some(pos) = *idx {
             if let Some(entry) = self.messages.get_mut(pos) {
                 let old = estimate_tokens(&entry.content);
-                entry.content = clean.to_string();
+                entry.content = Self::with_stamp_footer(clean);
                 let new = estimate_tokens(&entry.content);
                 if new >= old {
                     self.used_tokens_est = self.used_tokens_est.saturating_add(new - old);
@@ -1567,11 +1625,11 @@ impl DogState {
         if clean.is_empty() {
             return;
         }
-        // DeepSeek chat/completions 没有 tool role：用 assistant 承载 tool 结果。
-        // “伪 user 占位”只在 message_snapshot() 里按需追加，避免污染历史与 token 预算。
+        // DeepSeek chat/completions 没有 tool role：
+        // 用 system 承载工具回执，确保来源清晰（不是 assistant 自己说的话）。
         self.push_message(
-            "assistant",
-            crate::mcp_messages::render_template(
+            "system",
+            crate::messages::render_template(
                 &self.tool_result_assistant_template,
                 &[("RESULT", clean)],
             ),
@@ -1610,27 +1668,14 @@ impl DogState {
         if let Some(extra) = extra_system {
             let clean = extra.trim();
             if !clean.is_empty() {
-                // DeepSeek 对“最后一条消息的 role”很敏感：若最后是 assistant（或 system），
-                // 可能报 400（Invalid consecutive assistant message）。这里将附加指令以 user 形式注入，
-                // 且文本本身以“系统：...”开头，保留“系统指令”语义。
+                // 额外指令按 system 角色入列，保持上下文语义稳定。
                 out.push(ApiMessage {
-                    role: "user".to_string(),
-                    content: clean.to_string(),
+                    role: "system".to_string(),
+                    content: Self::with_stamp_footer(clean),
                 });
             }
         }
-        let mut out = normalize_messages_for_deepseek(&out);
-        let need_tick = match out.last() {
-            None => true,
-            Some(m) => m.role.trim() != "user" || m.content.trim().is_empty(),
-        };
-        if need_tick {
-            out.push(ApiMessage {
-                role: "user".to_string(),
-                content: self.deepseek_tool_loop_tick_user.clone(),
-            });
-        }
-        out
+        normalize_messages_for_deepseek(&out)
     }
 
     fn set_include_tool_context(&mut self, enabled: bool) {
@@ -1684,6 +1729,11 @@ impl DogState {
     }
 
     fn arm_context_compact_if_needed(&mut self, sys_cfg: &SystemConfig) -> bool {
+        if !sys_cfg.context_compact_enabled {
+            self.ctx_compact_pending = false;
+            self.ctx_compact_inflight = false;
+            return false;
+        }
         if self.ctx_compact_pending || self.ctx_compact_inflight {
             return false;
         }
@@ -1778,6 +1828,10 @@ fn normalize_messages_for_deepseek(messages: &[ApiMessage]) -> Vec<ApiMessage> {
     out
 }
 
+fn build_codex_input_messages(messages: &[ApiMessage]) -> Vec<serde_json::Value> {
+    api::build_codex_input_messages(messages)
+}
+
 #[derive(Debug, Clone)]
 struct DogClient {
     http: reqwest::blocking::Client,
@@ -1839,6 +1893,303 @@ impl DogClient {
             })
     }
 
+    fn post_codex_responses(
+        &self,
+        req: &serde_json::Value,
+        key: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<reqwest::blocking::Response> {
+        let url = build_api_url(&self.cfg.base_url, "responses");
+        self.http
+            .post(&url)
+            .bearer_auth(key)
+            .header("Accept", "text/event-stream")
+            .timeout(Duration::from_secs(timeout_secs))
+            .json(req)
+            .send()
+            .context("请求 Codex 失败")
+            .and_then(|r| {
+                let status = r.status();
+                if !status.is_success() {
+                    let body = r.text().unwrap_or_default();
+                    let body = body.trim();
+                    if body.is_empty() {
+                        return Err(anyhow::anyhow!("Codex 返回异常状态: {status}"));
+                    }
+                    return Err(anyhow::anyhow!("Codex 返回异常状态: {status} | {}", body));
+                }
+                Ok(r)
+            })
+    }
+
+    fn is_codex_provider(&self) -> bool {
+        normalize_provider(&self.cfg.provider) == "codex"
+    }
+
+    fn send_codex_stream(
+        &self,
+        messages: Vec<ApiMessage>,
+        tx: mpsc::Sender<AsyncEvent>,
+        kind: MindKind,
+        request_id: u64,
+        cancel: Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        let key = self.cfg.api_key.as_deref().unwrap_or("").trim();
+        if key.is_empty() {
+            runlog_event(
+                "ERROR",
+                "model.request.aborted",
+                json!({"mind": mind_label(kind), "request_id": request_id, "reason": "missing_api_key"}),
+            );
+            return Err(anyhow::anyhow!("API Key 为空"));
+        }
+
+        let mut req = json!({
+            "model": &self.cfg.model,
+            "input": build_codex_input_messages(&messages),
+            "stream": true,
+        });
+        if let Some(effort) = normalize_reasoning_effort(self.cfg.reasoning_effort.as_deref()) {
+            req["reasoning"] = json!({ "effort": effort });
+        }
+
+        let max_retries = 3usize;
+        let mut retries_done = 0usize;
+        let mut started = false;
+        let mut last_err: Option<anyhow::Error> = None;
+
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+
+            let resp = match self.post_codex_responses(&req, key, self.request_timeout_secs(true)) {
+                Ok(r) => r,
+                Err(e) => {
+                    if Self::is_non_retryable_request_error(&e) {
+                        runlog_event(
+                            "ERROR",
+                            "model.request.error",
+                            json!({
+                                "mind": mind_label(kind),
+                                "request_id": request_id,
+                                "attempt": retries_done.saturating_add(1),
+                                "error": format!("{e:#}"),
+                                "retryable": false,
+                            }),
+                        );
+                        let _ = last_err.replace(e);
+                        break;
+                    }
+                    runlog_event(
+                        "WARN",
+                        "model.request.retryable_error",
+                        json!({
+                            "mind": mind_label(kind),
+                            "request_id": request_id,
+                            "attempt": retries_done.saturating_add(1),
+                            "max_retries": max_retries,
+                            "error": format!("{e:#}"),
+                        }),
+                    );
+                    let _ = last_err.replace(e);
+                    if retries_done >= max_retries {
+                        break;
+                    }
+                    retries_done = retries_done.saturating_add(1);
+                    let _ = tx.send(AsyncEvent::ErrorRetry {
+                        attempt: retries_done,
+                        max: max_retries,
+                        request_id,
+                    });
+                    std::thread::sleep(Duration::from_millis(240 * retries_done as u64));
+                    continue;
+                }
+            };
+
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if !started {
+                let _ = tx.send(AsyncEvent::ModelStreamStart { kind, request_id });
+                started = true;
+            }
+
+            let mut resp = resp;
+            let mut reader = io::BufReader::new(&mut resp);
+            let mut line = String::new();
+            let mut usage = 0u64;
+            let mut emitted = false;
+            let mut done_text = String::new();
+            let stream_result: anyhow::Result<()> = (|| {
+                loop {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    line.clear();
+                    let bytes = reader.read_line(&mut line).context("读取 Codex 流式响应失败")?;
+                    if bytes == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !trimmed.starts_with("data:") {
+                        continue;
+                    }
+                    let payload = trimmed.trim_start_matches("data:").trim();
+                    if payload == "[DONE]" {
+                        break;
+                    }
+                    let value: serde_json::Value = match serde_json::from_str(payload) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    match value.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                        "response.output_text.delta" => {
+                            let content = value
+                                .get("delta")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if RUN_LOGGER.get().map(|l| l.stream_chunks).unwrap_or(false)
+                                && !content.is_empty()
+                            {
+                                runlog_event(
+                                    "DEBUG",
+                                    "model.stream.chunk",
+                                    json!({
+                                        "mind": mind_label(kind),
+                                        "request_id": request_id,
+                                        "content": &content,
+                                        "reasoning": "",
+                                    }),
+                                );
+                            }
+                            if !content.is_empty() {
+                                if cancel.load(Ordering::SeqCst) {
+                                    return Ok(());
+                                }
+                                emitted = true;
+                                let _ = tx.send(AsyncEvent::ModelStreamChunk {
+                                    content,
+                                    reasoning: String::new(),
+                                    request_id,
+                                });
+                            }
+                        }
+                        "response.output_text.done" => {
+                            if let Some(text) = value.get("text").and_then(|v| v.as_str())
+                                && !text.trim().is_empty()
+                            {
+                                done_text = text.to_string();
+                            }
+                        }
+                        "response.completed" => {
+                            if let Some(total) = value
+                                .get("response")
+                                .and_then(|r| r.get("usage"))
+                                .and_then(|u| u.get("total_tokens"))
+                                .and_then(|v| v.as_u64())
+                            {
+                                usage = total;
+                            }
+                        }
+                        "response.error" | "response.failed" | "error" => {
+                            let msg = value
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|v| v.as_str())
+                                .or_else(|| value.get("message").and_then(|v| v.as_str()))
+                                .unwrap_or("Codex 返回错误事件");
+                            return Err(anyhow::anyhow!(msg.to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            })();
+
+            match stream_result {
+                Ok(()) => {
+                    if !cancel.load(Ordering::SeqCst) && !emitted && !done_text.trim().is_empty() {
+                        emitted = true;
+                        let _ = tx.send(AsyncEvent::ModelStreamChunk {
+                            content: done_text,
+                            reasoning: String::new(),
+                            request_id,
+                        });
+                    }
+                    if !cancel.load(Ordering::SeqCst) {
+                        let _ = tx.send(AsyncEvent::ModelStreamEnd {
+                            kind,
+                            usage,
+                            error: None,
+                            request_id,
+                        });
+                    }
+                    runlog_event(
+                        "INFO",
+                        "model.stream.end",
+                        json!({
+                            "mind": mind_label(kind),
+                            "request_id": request_id,
+                            "usage_total_tokens": usage,
+                            "emitted_any_chunk": emitted,
+                        }),
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    runlog_event(
+                        "ERROR",
+                        "model.stream.read_error",
+                        json!({
+                            "mind": mind_label(kind),
+                            "request_id": request_id,
+                            "error": format!("{e:#}"),
+                            "emitted_any_chunk": emitted,
+                        }),
+                    );
+                    let _ = last_err.replace(e);
+                    if !emitted && retries_done < max_retries {
+                        retries_done = retries_done.saturating_add(1);
+                        let _ = tx.send(AsyncEvent::ErrorRetry {
+                            attempt: retries_done,
+                            max: max_retries,
+                            request_id,
+                        });
+                        std::thread::sleep(Duration::from_millis(240 * retries_done as u64));
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let msg = last_err
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_else(|| "Codex 请求失败".to_string());
+        let _ = tx.send(AsyncEvent::ModelStreamEnd {
+            kind,
+            usage: 0,
+            error: Some(msg),
+            request_id,
+        });
+        Ok(())
+    }
+
+    fn is_non_retryable_request_error(err: &anyhow::Error) -> bool {
+        let s = format!("{err:#}").to_ascii_lowercase();
+        s.contains("invalid_request_error")
+            || s.contains("400 bad request")
+            || s.contains("invalid max_tokens value")
+    }
+
     fn send_chat_stream(
         &self,
         messages: Vec<ApiMessage>,
@@ -1858,6 +2209,7 @@ impl DogClient {
                 "provider": &self.cfg.provider,
                 "base_url": &self.cfg.base_url,
                 "model": &self.cfg.model,
+                "reasoning_effort": self.cfg.reasoning_effort.as_deref(),
                 "temperature": self.cfg.temperature,
                 "max_tokens": self.cfg.max_tokens,
                 "timeout_secs": self.request_timeout_secs(true),
@@ -1874,6 +2226,9 @@ impl DogClient {
                 json!({"mind": mind_label(kind), "request_id": request_id, "reason": "missing_api_key"}),
             );
             return Err(anyhow::anyhow!("API Key 为空"));
+        }
+        if self.is_codex_provider() {
+            return self.send_codex_stream(messages, tx, kind, request_id, cancel);
         }
         let req = DeepseekRequest {
             model: &self.cfg.model,
@@ -1898,6 +2253,21 @@ impl DogClient {
             let resp = match self.post_deepseek(&req, key, self.request_timeout_secs(true)) {
                 Ok(r) => r,
                 Err(e) => {
+                    if Self::is_non_retryable_request_error(&e) {
+                        runlog_event(
+                            "ERROR",
+                            "model.request.error",
+                            json!({
+                                "mind": mind_label(kind),
+                                "request_id": request_id,
+                                "attempt": retries_done.saturating_add(1),
+                                "error": format!("{e:#}"),
+                                "retryable": false,
+                            }),
+                        );
+                        let _ = last_err.replace(e);
+                        break;
+                    }
                     runlog_event(
                         "WARN",
                         "model.request.retryable_error",
@@ -2086,6 +2456,10 @@ impl DogClient {
         request_id: u64,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
+        if self.is_codex_provider() {
+            // Codex responses 端点要求 stream=true；非流式模式回落到同一套流式处理。
+            return self.send_chat_stream(messages, tx, kind, request_id, cancel);
+        }
         runlog_event(
             "INFO",
             "model.request.start",
@@ -2096,6 +2470,7 @@ impl DogClient {
                 "provider": &self.cfg.provider,
                 "base_url": &self.cfg.base_url,
                 "model": &self.cfg.model,
+                "reasoning_effort": self.cfg.reasoning_effort.as_deref(),
                 "temperature": self.cfg.temperature,
                 "max_tokens": self.cfg.max_tokens,
                 "timeout_secs": self.request_timeout_secs(false),
@@ -2133,6 +2508,21 @@ impl DogClient {
             let resp = match self.post_deepseek(&req, key, self.request_timeout_secs(false)) {
                 Ok(r) => r,
                 Err(e) => {
+                    if Self::is_non_retryable_request_error(&e) {
+                        runlog_event(
+                            "ERROR",
+                            "model.request.error",
+                            json!({
+                                "mind": mind_label(kind),
+                                "request_id": request_id,
+                                "attempt": retries_done.saturating_add(1),
+                                "error": format!("{e:#}"),
+                                "retryable": false,
+                            }),
+                        );
+                        let _ = last_err.replace(e);
+                        break;
+                    }
                     runlog_event(
                         "WARN",
                         "model.request.retryable_error",
@@ -2465,18 +2855,11 @@ mod heartbeat_reply_tests {
 #[cfg(test)]
 mod message_normalize_tests {
     use super::*;
-
-    fn tool_loop_tick_user() -> String {
-        crate::mcp_messages::McpMessages::default().deepseek_tool_loop_tick_user
-    }
-
     #[test]
     fn merges_consecutive_assistant_messages_for_deepseek() {
-        let tick = tool_loop_tick_user();
         let mut state = DogState::new(
             String::new(),
             80,
-            tick,
             "Tool result:
 {RESULT}"
                 .to_string(),
@@ -2498,11 +2881,9 @@ mod message_normalize_tests {
 
     #[test]
     fn message_snapshot_normalizes_existing_consecutive_assistants() {
-        let tick = tool_loop_tick_user();
         let mut state = DogState::new(
             String::new(),
             80,
-            tick,
             "Tool result:
 {RESULT}"
                 .to_string(),
@@ -2525,12 +2906,10 @@ mod message_normalize_tests {
     }
 
     #[test]
-    fn tool_context_user_placeholder_is_injected_at_snapshot() {
-        let tick = tool_loop_tick_user();
+    fn tool_context_snapshot_keeps_system_receipt() {
         let mut state = DogState::new(
             String::new(),
             80,
-            tick.clone(),
             "Tool result:
 {RESULT}"
                 .to_string(),
@@ -2540,15 +2919,13 @@ mod message_normalize_tests {
 
         state.push_tool("ok");
         assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].role, "assistant");
+        assert_eq!(state.messages[0].role, "system");
         assert!(state.messages[0].content.contains("Tool result:"));
 
         let snap = state.message_snapshot(None);
-        assert_eq!(snap.len(), 2);
-        assert_eq!(snap[0].role, "assistant");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].role, "system");
         assert!(snap[0].content.contains("Tool result:"));
-        assert_eq!(snap[1].role, "user");
-        assert_eq!(snap[1].content, tick);
     }
 }
 
@@ -2666,7 +3043,7 @@ where
 }
 
 fn load_dog_api_config() -> (DogApiConfig, Option<String>, PathBuf) {
-    let path_buf = resolve_config_path_from_env("YING_DOG_CONFIG", "config/dog_api.json");
+    let path_buf = resolve_config_path_from_env("YING_DOG_CONFIG", "config/dogAPI.json");
     let (mut cfg, err) = load_json_config::<DogApiConfig>(&path_buf, "DOG 配置");
     if let Ok(key) =
         std::env::var("DEEPSEEK_API_KEY").or_else(|_| std::env::var("YING_DOG_API_KEY"))
@@ -2688,7 +3065,7 @@ fn load_dog_api_config() -> (DogApiConfig, Option<String>, PathBuf) {
 }
 
 fn load_main_api_config() -> (MainApiConfig, Option<String>, PathBuf) {
-    let path_buf = resolve_config_path_from_env("YING_MAIN_CONFIG", "config/main_api.json");
+    let path_buf = resolve_config_path_from_env("YING_MAIN_CONFIG", "config/mainAPI.json");
     let (mut cfg, err) = load_json_config::<MainApiConfig>(&path_buf, "MAIN 配置");
     if let Ok(key) =
         std::env::var("DEEPSEEK_API_KEY").or_else(|_| std::env::var("YING_MAIN_API_KEY"))
@@ -2707,7 +3084,7 @@ fn load_main_api_config() -> (MainApiConfig, Option<String>, PathBuf) {
 }
 
 fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
-    let path_buf = resolve_config_path_from_env("YING_SYSTEM_CONFIG", "config/system.json");
+    let path_buf = resolve_config_path_from_env("YING_SYSTEM_CONFIG", "config/System.json");
     let (mut cfg, err) = load_json_config::<SystemConfig>(&path_buf, "系统配置");
     if cfg.context_k < 8 || cfg.context_k > 1024 {
         cfg.context_k = 128;
@@ -2720,28 +3097,16 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
         cfg.ctx_pool_max_items = 10;
     }
     if cfg.context_compact_prompt_path.trim().is_empty() {
-        cfg.context_compact_prompt_path = "config/prompt/memory/context_compact.txt".to_string();
-    }
-    if cfg.pty_audit_prompt_path.trim().is_empty() {
-        cfg.pty_audit_prompt_path = "config/prompt/mcp/pty_audit.txt".to_string();
+        cfg.context_compact_prompt_path = "prompt/contextsummary.txt".to_string();
     }
     if cfg.pty_help_prompt_path.trim().is_empty() {
-        cfg.pty_help_prompt_path = "config/prompt/mcp/pty_help.txt".to_string();
-    }
-    if cfg.pty_started_notice_prompt_path.trim().is_empty() {
-        cfg.pty_started_notice_prompt_path = "config/prompt/mcp/pty_started_notice.txt".to_string();
-    }
-    if cfg.mcp_messages_path.trim().is_empty() {
-        cfg.mcp_messages_path = "config/prompt/mcp/mcp_messages.json".to_string();
-    }
-    if cfg.tool_messages_path.trim().is_empty() {
-        cfg.tool_messages_path = "config/prompt/mcp/tool_messages.json".to_string();
+        cfg.pty_help_prompt_path = "prompt/Terminalwelcome.txt".to_string();
     }
     if cfg.welcome_shortcuts_prompt_path.trim().is_empty() {
-        cfg.welcome_shortcuts_prompt_path =
-            "config/prompt/system/welcome_shortcuts.txt".to_string();
+        cfg.welcome_shortcuts_prompt_path = "prompt/Systemwelcome.txt".to_string();
     }
     cfg.chat_target = normalize_chat_target_value(&cfg.chat_target);
+    cfg = normalize_system_config_paths(cfg, &path_buf);
     (cfg, err, path_buf)
 }
 
@@ -2751,6 +3116,7 @@ fn normalize_common_api_fields(
     timeout_secs: &mut u64,
     max_tokens: &mut Option<u32>,
 ) {
+    const MAX_TOKENS_HARD_MAX: u32 = 65_536;
     if let Some(temp) = *temperature {
         if !(0.0..=1.5).contains(&temp) {
             *temperature = None;
@@ -2767,6 +3133,8 @@ fn normalize_common_api_fields(
     if let Some(tokens) = *max_tokens {
         if tokens == 0 {
             *max_tokens = Some(5_000);
+        } else if tokens > MAX_TOKENS_HARD_MAX {
+            *max_tokens = Some(MAX_TOKENS_HARD_MAX);
         }
     } else {
         *max_tokens = Some(5_000);
@@ -2819,7 +3187,7 @@ fn reset_state_for_target(
 const HEARTBEAT_DEFER_SECS: u64 = 600;
 // 关闭心跳时，把 next_heartbeat_at 推到足够远，避免极端情况下被其它逻辑误触发。
 const HEARTBEAT_DISABLED_SECS: u64 = 60 * 60 * 24 * 365 * 10;
-const PTY_AUDIT_INTERVAL_SECS: u64 = 300;
+const PTY_AUDIT_INTERVAL_SECS: u64 = 600;
 const PTY_AUDIT_DEFER_SECS: u64 = 120;
 
 fn heartbeat_interval(minutes: usize) -> Duration {
@@ -3051,7 +3419,7 @@ fn load_context_prompts() -> (ContextPromptConfig, Vec<String>, PathBuf) {
     let defaults = ContextPromptConfig::default();
     let main_path = resolve_config_path_from_env(
         "YING_CTX_MAIN_PROMPT_PATH",
-        "config/prompt/memory/context_main.txt",
+        "prompt/datesummary.txt",
     );
     let mut errors = Vec::new();
     let (main_prompt, err_main) =
@@ -3073,12 +3441,22 @@ fn load_context_compact_prompt(sys_cfg: &SystemConfig) -> (String, Option<String
     (text, err, path)
 }
 
-const DEFAULT_PTY_AUDIT_PROMPT: &str = "系统：你正在进行“后台终端任务审计”。\n\n背景：用户启动了一个后台 PTY 终端任务（bash interactive）。你需要每 5 分钟审计一次其状态，判断是否：卡住/报错/需要输入/已完成。\n\n重要约束：\n- 先读 status 文件，再读 log 文件（只读需要的头/尾，不要把整份日志搬回上下文）。\n- 仅做简短回复（最多 6 行），不要执行额外操作。\n- 如果需要用户介入，请明确告诉用户要做什么（例如“打开 Terminal 输入 X”或“运行 read_file 读取 Y”）。\n\n任务信息：\n- owner: {OWNER}\n- job_id: {JOB_ID}\n- cmd: {CMD}\n- status_path: {STATUS_PATH}\n- log_path: {LOG_PATH}\n\n现在请：\n1) 使用 read_file 读取 status_path（全量或 tail 都可）。\n2) 使用 read_file 读取 log_path 的 tail（建议 200~400 行），必要时再读 head。\n3) 给出审计结论与下一步建议。\n";
-
-fn load_pty_audit_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
-    let path = resolve_config_path(&sys_cfg.pty_audit_prompt_path, true);
-    let (text, err) = load_prompt_file_with_default(&path, DEFAULT_PTY_AUDIT_PROMPT, "PTY-AUDIT");
-    (text, err, path)
+fn tail_preview_text(path: &str, max_bytes: u64, max_lines: usize, max_chars: usize) -> String {
+    let raw = read_tail_text(path, max_bytes).unwrap_or_default();
+    let mut lines: Vec<&str> = raw
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .collect::<Vec<_>>();
+    if max_lines > 0 && lines.len() > max_lines {
+        lines = lines[lines.len().saturating_sub(max_lines)..].to_vec();
+    }
+    let joined = lines.join("\n");
+    let joined = truncate_with_suffix(joined.trim_end(), max_chars.max(1));
+    if joined.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        joined
+    }
 }
 
 const DEFAULT_PTY_HELP_PROMPT: &str = "Terminal（PTY）已启动：\n- Home：打开/隐藏 Terminal 视图（后台继续运行）\n- Esc：发送给终端内程序（例如退出 vim/less）\n- （兼容）{DOUBLE_ESC_MS}ms 内快速连按两次 Esc：结束当前终端任务（终止 PTY）\n- PgUp/PgDn：切换不同终端任务（多 PTY tab）\n- Alt+↑：复制当前终端快照到聊天输入框（由用户决定是否发送给 AI）\n";
@@ -3100,11 +3478,8 @@ fn render_pty_help_prompt(template: &str, double_esc_ms: u64) -> String {
 }
 
 const DEFAULT_PTY_STARTED_NOTICE_PROMPT: &str = "PTY 已启动（后台运行）。\njob_id:{JOB_ID} | owner:{OWNER}\ncwd:{CWD}\ncmd:\n```sh\n{CMD}\n```\nlog:{LOG_PATH}\nstatus:{STATUS_PATH}\n\n说明：终端在运行，期间可继续对话。\n       任务结束后会自动关闭。\n       按HOME可展开查看与交互。\n\n{INITIAL_PREVIEW_BLOCK}\n";
-fn load_pty_started_notice_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
-    let path = resolve_config_path(&sys_cfg.pty_started_notice_prompt_path, true);
-    let (text, err) =
-        load_prompt_file_with_default(&path, DEFAULT_PTY_STARTED_NOTICE_PROMPT, "PTY-START");
-    (text, err, path)
+fn load_pty_started_notice_prompt() -> String {
+    DEFAULT_PTY_STARTED_NOTICE_PROMPT.to_string()
 }
 
 fn render_pty_started_notice_prompt(args: PtyStartedNotice<'_>, template: &str) -> String {
@@ -3147,23 +3522,30 @@ fn render_pty_audit_prompt(
     cmd: &str,
     status_path: &str,
     log_path: &str,
+    running_total: usize,
+    running_owner: usize,
+    status_tail: &str,
+    log_tail: &str,
 ) -> String {
     let t = template.trim();
-    let tpl = if t.is_empty() {
-        DEFAULT_PTY_AUDIT_PROMPT
-    } else {
-        t
-    };
+    if t.is_empty() {
+        return String::new();
+    }
+    let tpl = t;
     let owner_label = if matches!(owner, MindKind::Sub) {
         "dog"
     } else {
         "main"
     };
     tpl.replace("{OWNER}", owner_label)
+        .replace("{RUNNING_TOTAL}", &running_total.to_string())
+        .replace("{RUNNING_OWNER}", &running_owner.to_string())
         .replace("{JOB_ID}", &job_id.to_string())
         .replace("{CMD}", cmd.trim())
         .replace("{STATUS_PATH}", status_path)
         .replace("{LOG_PATH}", log_path)
+        .replace("{STATUS_TAIL}", status_tail.trim_end())
+        .replace("{LOG_TAIL}", log_tail.trim_end())
 }
 
 const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str = "系统：fastmemo 已达到阈值，需要进行压缩（由 DOG 执行，静默维护）。\n\n任务：\n- 读取 fastmemo（优先使用 memory_read 读取 fastmemo 原文；若上下文已包含 fastmemo，也可直接使用）。\n- fastmemo 包含 4 个固定区域：[自我感知] [用户感知] [环境感知] [事件感知]\n- 你需要把每个区域的内容“迭代压缩”为 1 条 bullet（只保留长期稳定、可复用、关键的信息；不确定就丢弃或标注待确认）。\n- 禁止把工具输出原文/日志/大段代码写回 fastmemo；若需要引用，只写摘要+指针。\n\n输出格式（强制）：\n- 只允许输出工具 JSON（不要输出正文）。\n- 推荐流程：先 1 次 memory_read，然后依次对 4 个区域使用 memory_edit(section=..., content=...) 覆盖为 1 条 bullet。\n\n示例：\n<tool>{\"tool\":\"memory_read\",\"path\":\"fastmemo\",\"brief\":\"读取 fastmemo 原文\"}</tool>\n<tool>{\"tool\":\"memory_edit\",\"path\":\"fastmemo\",\"section\":\"自我感知\",\"content\":\"- ...\",\"brief\":\"压缩自我感知\"}</tool>\n\n注意：完成压缩后，不要再输出任何解释性文字。";
@@ -3171,7 +3553,7 @@ const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str = "系统：fastmemo 已达到阈值
 fn load_fastmemo_compact_prompt() -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path_from_env(
         "YING_FASTMEMO_COMPACT_PROMPT_PATH",
-        "config/prompt/memory/fastmemo_compact.txt",
+        "prompt/fastmemorycompact.txt",
     );
     let (text, err) =
         load_prompt_file_with_default(&path, DEFAULT_FASTMEMO_COMPACT_PROMPT, "FASTMEMO-COMPACT");
@@ -3268,12 +3650,25 @@ fn normalize_dog_config_paths(mut cfg: DogApiConfig, cfg_path: &Path) -> DogApiC
         cfg.prompt_path = resolve_relative_path(&cfg.prompt_path, &base);
         cfg.token_total_path = resolve_relative_path(&cfg.token_total_path, &base);
     }
+    hydrate_provider_profiles_dog(&mut cfg);
     cfg
 }
 
 fn normalize_main_config_paths(mut cfg: MainApiConfig, cfg_path: &Path) -> MainApiConfig {
     if let Some(base) = config_root_dir(cfg_path) {
         cfg.prompt_path = resolve_relative_path(&cfg.prompt_path, &base);
+    }
+    hydrate_provider_profiles_main(&mut cfg);
+    cfg
+}
+
+fn normalize_system_config_paths(mut cfg: SystemConfig, cfg_path: &Path) -> SystemConfig {
+    if let Some(base) = config_root_dir(cfg_path) {
+        cfg.context_compact_prompt_path =
+            resolve_relative_path(&cfg.context_compact_prompt_path, &base);
+        cfg.pty_help_prompt_path = resolve_relative_path(&cfg.pty_help_prompt_path, &base);
+        cfg.welcome_shortcuts_prompt_path =
+            resolve_relative_path(&cfg.welcome_shortcuts_prompt_path, &base);
     }
     cfg
 }
@@ -3284,9 +3679,11 @@ fn build_main_client(cfg: &MainApiConfig) -> anyhow::Result<DogClient> {
         provider: cfg.provider.clone(),
         base_url: cfg.base_url.clone(),
         model: cfg.model.clone(),
+        reasoning_effort: cfg.reasoning_effort.clone(),
         temperature: cfg.temperature,
         timeout_secs: cfg.timeout_secs,
         max_tokens: cfg.max_tokens,
+        provider_profiles: cfg.provider_profiles.clone(),
         ..Default::default()
     };
     DogClient::new(dog_cfg)
@@ -4146,6 +4543,7 @@ enum SettingsFieldKind {
     BaseUrl,
     ApiKey,
     Model,
+    ReasoningEffort,
     Temperature,
     MaxTokens,
     ContextK,
@@ -4278,6 +4676,62 @@ struct DrainedSendText {
     model_text: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingPtySnapshot {
+    job_id: u64,
+    placeholder: String,
+    content: String,
+}
+
+fn materialize_placeholders(base: &str, pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() || base.is_empty() {
+        return base.to_string();
+    }
+    let mut idx = 0usize;
+    let mut out = String::new();
+    while idx < base.len() {
+        let mut best_pos: Option<usize> = None;
+        let mut best_ph: Option<&str> = None;
+        let mut best_actual: Option<&str> = None;
+        for (ph, actual) in pairs {
+            let ph = ph.as_str();
+            if ph.is_empty() {
+                continue;
+            }
+            if let Some(rel) = base[idx..].find(ph) {
+                let pos = idx + rel;
+                let better = match best_pos {
+                    None => true,
+                    Some(cur) => pos < cur,
+                };
+                let tie_longer = best_pos.is_some_and(|cur| pos == cur)
+                    && best_ph.is_some_and(|cur_ph| ph.len() > cur_ph.len());
+                if better || tie_longer {
+                    best_pos = Some(pos);
+                    best_ph = Some(ph);
+                    best_actual = Some(actual.as_str());
+                }
+            }
+        }
+        let Some(pos) = best_pos else {
+            out.push_str(&base[idx..]);
+            break;
+        };
+        if pos > idx {
+            out.push_str(&base[idx..pos]);
+        }
+        if let (Some(ph), Some(actual)) = (best_ph, best_actual) {
+            out.push_str(actual);
+            idx = pos.saturating_add(ph.len());
+        } else {
+            // 不应发生：兜底避免死循环
+            out.push_str(&base[idx..]);
+            break;
+        }
+    }
+    out
+}
+
 fn drain_input_for_send(
     input: &mut String,
     cursor: &mut usize,
@@ -4286,11 +4740,12 @@ fn drain_input_for_send(
     pending_pastes: &mut Vec<(String, String)>,
     paste_capture: &mut Option<PasteCapture>,
     command_menu_suppress: &mut bool,
-    pending_pty_snapshot: &mut Option<(u64, String)>,
+    pending_pty_snapshot: &mut Option<PendingPtySnapshot>,
 ) -> DrainedSendText {
     let base = input.trim_end().to_string();
     let mut ui_text = base.clone();
-    let mut model_text = base;
+    let mut placeholders: Vec<(String, String)> = Vec::new();
+    let mut model_text_base = base.clone();
     if !pending_pastes.is_empty() {
         let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let pid = unsafe { libc::getpid() };
@@ -4318,7 +4773,6 @@ fn drain_input_for_send(
             ui_text.push_str(actual.trim_end());
             ui_text.push('\n');
             ui_text.push_str(&format!("{USER_PASTE_MARKER_END}id={id}]]"));
-
             // 发给模型：仅摘要+路径
             let mut item = format!("- {id}: {chars} chars / {lines} lines");
             if saved {
@@ -4329,10 +4783,33 @@ fn drain_input_for_send(
             attachments.push(item);
         }
         if !attachments.is_empty() {
-            model_text.push_str("\n\n[Pasted Content]\n");
-            model_text.push_str(&attachments.join("\n"));
+            model_text_base.push_str("\n\n[Pasted Content]\n");
+            model_text_base.push_str(&attachments.join("\n"));
         }
     }
+    if let Some(snap) = pending_pty_snapshot.as_ref()
+        && !snap.content.trim().is_empty()
+        && !snap.placeholder.trim().is_empty()
+        && base.contains(snap.placeholder.as_str())
+    {
+        let id = format!("pty_{}", snap.job_id);
+        let chars = count_chars(&snap.content);
+        let lines = snap.content.lines().count().max(1);
+        ui_text.push_str("\n\n");
+        ui_text.push_str(&format!(
+            "{USER_PTY_SNAPSHOT_MARKER_BEGIN}id={id}|job_id={}|lines={lines}|chars={chars}]]\n",
+            snap.job_id
+        ));
+        ui_text.push_str(snap.content.trim_end());
+        ui_text.push('\n');
+        ui_text.push_str(&format!("{USER_PTY_SNAPSHOT_MARKER_END}id={id}]]"));
+        placeholders.push((snap.placeholder.clone(), snap.content.clone()));
+    }
+    let model_text = if placeholders.is_empty() {
+        model_text_base
+    } else {
+        materialize_placeholders(&model_text_base, &placeholders)
+    };
     reset_input_buffer(input, cursor, input_chars, last_input_at);
     pending_pastes.clear();
     *paste_capture = None;
@@ -4342,6 +4819,110 @@ fn drain_input_for_send(
         ui_text,
         model_text,
     }
+}
+
+fn prune_pending_pty_snapshot(input: &str, pending: &mut Option<PendingPtySnapshot>) {
+    if let Some(p) = pending.as_ref() {
+        if !input.contains(p.placeholder.as_str()) {
+            *pending = None;
+        }
+    }
+}
+
+fn snap_cursor_out_of_pty_snapshot_placeholder(
+    input: &str,
+    pending: &Option<PendingPtySnapshot>,
+    cursor: usize,
+) -> usize {
+    let cur = cursor.min(input.len());
+    let Some(p) = pending.as_ref() else {
+        return cur;
+    };
+    let ph = p.placeholder.as_str();
+    if ph.trim().is_empty() || input.is_empty() {
+        return cur;
+    }
+    let mut search = 0usize;
+    while let Some(pos) = input.get(search..).and_then(|s| s.find(ph)) {
+        let start = search + pos;
+        let end = start + ph.len();
+        if cur > start && cur < end {
+            return end;
+        }
+        search = end;
+        if search >= input.len() {
+            break;
+        }
+    }
+    cur
+}
+
+fn try_remove_pty_snapshot_placeholder_at_cursor(
+    input: &mut String,
+    cursor: &mut usize,
+    input_chars: &mut usize,
+    pending: &mut Option<PendingPtySnapshot>,
+    how: input::PlaceholderRemove,
+) -> bool {
+    let Some(p) = pending.as_ref() else {
+        return false;
+    };
+    let ph = p.placeholder.as_str();
+    if ph.trim().is_empty() {
+        return false;
+    }
+    if !input.contains(ph) {
+        *pending = None;
+        return false;
+    }
+
+    let cur = (*cursor).min(input.len());
+    let ph_len = ph.len();
+    let ph_chars = input::count_chars(ph);
+
+    let mut remove_at = None;
+    let mut search = 0usize;
+    while let Some(pos) = input.get(search..).and_then(|s| s.find(ph)) {
+        let start = search + pos;
+        let end = start + ph_len;
+        if cur > start && cur < end {
+            remove_at = Some((start, end));
+            break;
+        }
+        search = end;
+        if search >= input.len() {
+            break;
+        }
+    }
+
+    if remove_at.is_none() {
+        let before = cur.checked_sub(ph_len).map(|start| (start, cur));
+        let after = if cur + ph_len <= input.len() {
+            Some((cur, cur + ph_len))
+        } else {
+            None
+        };
+        let candidates: [Option<(usize, usize)>; 2] = match how {
+            input::PlaceholderRemove::Backspace => [before, after],
+            input::PlaceholderRemove::Delete => [after, before],
+        };
+        for cand in candidates.into_iter().flatten() {
+            let (start, end) = cand;
+            if input.get(start..end) == Some(ph) {
+                remove_at = Some((start, end));
+                break;
+            }
+        }
+    }
+
+    let Some((start, end)) = remove_at else {
+        return false;
+    };
+    input.drain(start..end);
+    *cursor = start;
+    *input_chars = input_chars.saturating_sub(ph_chars);
+    *pending = None;
+    true
 }
 
 fn sync_system_toggles(sys_cfg: &SystemConfig, sse_enabled: &mut bool, chat_target: &mut MindKind) {
@@ -4493,30 +5074,35 @@ fn mask_api_key(key: Option<&str>) -> String {
 }
 
 fn provider_label(value: &str) -> &'static str {
-    if value.trim().eq_ignore_ascii_case("deepseek") {
-        "DeepSeek"
-    } else {
-        "开发中"
-    }
+    api::provider_label(value)
 }
 
 fn normalize_provider(value: &str) -> &str {
-    if value.trim().eq_ignore_ascii_case("deepseek") {
-        "deepseek"
-    } else {
-        "dev"
-    }
+    api::normalize_provider(value)
 }
 
 fn model_label(value: &str) -> &'static str {
-    let v = value.trim().to_ascii_lowercase();
-    if v.contains("reasoner") {
-        "DeepSeek Reasoner"
-    } else if v.contains("chat") {
-        "DeepSeek Chat"
-    } else {
-        "自定义"
-    }
+    api::model_label(value)
+}
+
+fn available_models_for_provider(provider: &str) -> &'static [&'static str] {
+    api::available_models_for_provider(provider)
+}
+
+fn default_model_for_provider(provider: &str) -> &'static str {
+    api::default_model_for_provider(provider)
+}
+
+fn normalize_reasoning_effort(value: Option<&str>) -> Option<&'static str> {
+    api::normalize_reasoning_effort(value)
+}
+
+fn normalize_reasoning_effort_or_default(value: Option<&str>) -> &'static str {
+    api::normalize_reasoning_effort_or_default(value)
+}
+
+fn format_reasoning_effort(provider: &str, value: Option<&str>) -> String {
+    api::format_reasoning_effort(provider, value)
 }
 
 fn format_temp(temp: Option<f32>) -> String {
@@ -4586,70 +5172,108 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
         context_compact_prompt_text,
     } = args;
     match section {
-        SettingsSection::MainApi => vec![
-            SettingsFieldSpec {
-                label: "Provider",
-                value: provider_label(&main_cfg.provider).to_string(),
-                kind: SettingsFieldKind::Provider,
-            },
-            SettingsFieldSpec {
-                label: "Base URL",
-                value: main_cfg.base_url.clone(),
-                kind: SettingsFieldKind::BaseUrl,
-            },
-            SettingsFieldSpec {
-                label: "Key",
-                value: mask_api_key(main_cfg.api_key.as_deref()),
-                kind: SettingsFieldKind::ApiKey,
-            },
-            SettingsFieldSpec {
-                label: "Model",
-                value: model_label(&main_cfg.model).to_string(),
-                kind: SettingsFieldKind::Model,
-            },
-            SettingsFieldSpec {
-                label: "Temp",
-                value: format_temp(main_cfg.temperature),
-                kind: SettingsFieldKind::Temperature,
-            },
-            SettingsFieldSpec {
-                label: "MaxToken",
-                value: format_max_tokens(main_cfg.max_tokens),
-                kind: SettingsFieldKind::MaxTokens,
-            },
-        ],
-        SettingsSection::DogApi => vec![
-            SettingsFieldSpec {
-                label: "Provider",
-                value: provider_label(&dog_cfg.provider).to_string(),
-                kind: SettingsFieldKind::Provider,
-            },
-            SettingsFieldSpec {
-                label: "Base URL",
-                value: dog_cfg.base_url.clone(),
-                kind: SettingsFieldKind::BaseUrl,
-            },
-            SettingsFieldSpec {
-                label: "Key",
-                value: mask_api_key(dog_cfg.api_key.as_deref()),
-                kind: SettingsFieldKind::ApiKey,
-            },
-            SettingsFieldSpec {
-                label: "Model",
-                value: model_label(&dog_cfg.model).to_string(),
-                kind: SettingsFieldKind::Model,
-            },
-            SettingsFieldSpec {
-                label: "Temp",
-                value: format_temp(dog_cfg.temperature),
-                kind: SettingsFieldKind::Temperature,
-            },
-            SettingsFieldSpec {
-                label: "MaxToken",
-                value: format_max_tokens(dog_cfg.max_tokens),
-                kind: SettingsFieldKind::MaxTokens,
-            },
-        ],
+        SettingsSection::MainApi => {
+            let provider = normalize_provider(&main_cfg.provider);
+            let caps = api::capabilities(provider);
+            let mut fields = vec![
+                SettingsFieldSpec {
+                    label: "Provider",
+                    value: provider_label(&main_cfg.provider).to_string(),
+                    kind: SettingsFieldKind::Provider,
+                },
+                SettingsFieldSpec {
+                    label: "Base URL",
+                    value: main_cfg.base_url.clone(),
+                    kind: SettingsFieldKind::BaseUrl,
+                },
+                SettingsFieldSpec {
+                    label: "Key",
+                    value: mask_api_key(main_cfg.api_key.as_deref()),
+                    kind: SettingsFieldKind::ApiKey,
+                },
+                SettingsFieldSpec {
+                    label: "Model",
+                    value: model_label(&main_cfg.model).to_string(),
+                    kind: SettingsFieldKind::Model,
+                },
+            ];
+            if caps.supports_reasoning_effort {
+                fields.push(SettingsFieldSpec {
+                    label: "Reasoning",
+                    value: format_reasoning_effort(
+                        &main_cfg.provider,
+                        main_cfg.reasoning_effort.as_deref(),
+                    ),
+                    kind: SettingsFieldKind::ReasoningEffort,
+                });
+            }
+            if caps.supports_temperature {
+                fields.push(SettingsFieldSpec {
+                    label: "Temperature",
+                    value: format_temp(main_cfg.temperature),
+                    kind: SettingsFieldKind::Temperature,
+                });
+            }
+            if caps.supports_max_tokens {
+                fields.push(SettingsFieldSpec {
+                    label: "MaxToken",
+                    value: format_max_tokens(main_cfg.max_tokens),
+                    kind: SettingsFieldKind::MaxTokens,
+                });
+            }
+            fields
+        }
+        SettingsSection::DogApi => {
+            let provider = normalize_provider(&dog_cfg.provider);
+            let caps = api::capabilities(provider);
+            let mut fields = vec![
+                SettingsFieldSpec {
+                    label: "Provider",
+                    value: provider_label(&dog_cfg.provider).to_string(),
+                    kind: SettingsFieldKind::Provider,
+                },
+                SettingsFieldSpec {
+                    label: "Base URL",
+                    value: dog_cfg.base_url.clone(),
+                    kind: SettingsFieldKind::BaseUrl,
+                },
+                SettingsFieldSpec {
+                    label: "Key",
+                    value: mask_api_key(dog_cfg.api_key.as_deref()),
+                    kind: SettingsFieldKind::ApiKey,
+                },
+                SettingsFieldSpec {
+                    label: "Model",
+                    value: model_label(&dog_cfg.model).to_string(),
+                    kind: SettingsFieldKind::Model,
+                },
+            ];
+            if caps.supports_reasoning_effort {
+                fields.push(SettingsFieldSpec {
+                    label: "Reasoning",
+                    value: format_reasoning_effort(
+                        &dog_cfg.provider,
+                        dog_cfg.reasoning_effort.as_deref(),
+                    ),
+                    kind: SettingsFieldKind::ReasoningEffort,
+                });
+            }
+            if caps.supports_temperature {
+                fields.push(SettingsFieldSpec {
+                    label: "Temperature",
+                    value: format_temp(dog_cfg.temperature),
+                    kind: SettingsFieldKind::Temperature,
+                });
+            }
+            if caps.supports_max_tokens {
+                fields.push(SettingsFieldSpec {
+                    label: "MaxToken",
+                    value: format_max_tokens(dog_cfg.max_tokens),
+                    kind: SettingsFieldKind::MaxTokens,
+                });
+            }
+            fields
+        }
         SettingsSection::System => vec![
             SettingsFieldSpec {
                 label: "Ctx compact (k)",
@@ -4765,6 +5389,17 @@ fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
             SettingsSection::DogApi => dog_cfg.model.clone(),
             _ => String::new(),
         },
+        SettingsFieldKind::ReasoningEffort => match section {
+            SettingsSection::MainApi => normalize_reasoning_effort_or_default(
+                main_cfg.reasoning_effort.as_deref(),
+            )
+            .to_string(),
+            SettingsSection::DogApi => normalize_reasoning_effort_or_default(
+                dog_cfg.reasoning_effort.as_deref(),
+            )
+            .to_string(),
+            _ => "high".to_string(),
+        },
         SettingsFieldKind::Temperature => match section {
             SettingsSection::MainApi => main_cfg
                 .temperature
@@ -4833,27 +5468,156 @@ fn selected_model(
     match section {
         SettingsSection::DogApi => dog_cfg.model.trim().to_string(),
         SettingsSection::MainApi => main_cfg.model.trim().to_string(),
-        _ => "deepseek-chat".to_string(),
+        _ => default_model_for_provider("deepseek").to_string(),
+    }
+}
+
+fn selected_reasoning_effort(
+    section: SettingsSection,
+    dog_cfg: &DogApiConfig,
+    main_cfg: &MainApiConfig,
+) -> String {
+    match section {
+        SettingsSection::DogApi => {
+            normalize_reasoning_effort_or_default(dog_cfg.reasoning_effort.as_deref()).to_string()
+        }
+        SettingsSection::MainApi => {
+            normalize_reasoning_effort_or_default(main_cfg.reasoning_effort.as_deref()).to_string()
+        }
+        _ => "high".to_string(),
     }
 }
 
 fn next_provider(current: &str) -> String {
-    if current.eq_ignore_ascii_case("deepseek") {
-        "dev".to_string()
+    if normalize_provider(current) == "deepseek" {
+        "codex".to_string()
     } else {
         "deepseek".to_string()
     }
 }
 
-fn next_model(current: &str, section: SettingsSection) -> String {
-    let cur = current.to_ascii_lowercase();
-    if cur.contains("reasoner") {
-        "deepseek-chat".to_string()
-    } else if cur.contains("chat") || matches!(section, SettingsSection::DogApi) {
-        "deepseek-reasoner".to_string()
+fn next_model(current: &str, provider: &str) -> String {
+    api::next_model(current, provider)
+}
+
+fn next_reasoning_effort(current: &str) -> String {
+    api::next_reasoning_effort(current)
+}
+
+fn provider_profile_ref<'a>(
+    profiles: &'a ApiProviderProfiles,
+    provider: &str,
+) -> &'a ApiProviderProfile {
+    if normalize_provider(provider) == "codex" {
+        &profiles.codex
     } else {
-        "deepseek-chat".to_string()
+        &profiles.deepseek
     }
+}
+
+fn provider_profile_mut<'a>(
+    profiles: &'a mut ApiProviderProfiles,
+    provider: &str,
+) -> &'a mut ApiProviderProfile {
+    if normalize_provider(provider) == "codex" {
+        &mut profiles.codex
+    } else {
+        &mut profiles.deepseek
+    }
+}
+
+fn save_active_to_profile_dog(cfg: &mut DogApiConfig) {
+    let provider = cfg.provider.clone();
+    let profile = provider_profile_mut(&mut cfg.provider_profiles, &provider);
+    profile.base_url = cfg.base_url.trim().to_string();
+    profile.api_key = cfg
+        .api_key
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    profile.model = cfg.model.trim().to_string();
+    profile.reasoning_effort = cfg.reasoning_effort.clone();
+    profile.temperature = cfg.temperature;
+    profile.max_tokens = cfg.max_tokens;
+}
+
+fn save_active_to_profile_main(cfg: &mut MainApiConfig) {
+    let provider = cfg.provider.clone();
+    let profile = provider_profile_mut(&mut cfg.provider_profiles, &provider);
+    profile.base_url = cfg.base_url.trim().to_string();
+    profile.api_key = cfg
+        .api_key
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    profile.model = cfg.model.trim().to_string();
+    profile.reasoning_effort = cfg.reasoning_effort.clone();
+    profile.temperature = cfg.temperature;
+    profile.max_tokens = cfg.max_tokens;
+}
+
+fn apply_profile_to_active_dog(cfg: &mut DogApiConfig) {
+    let profile = provider_profile_ref(&cfg.provider_profiles, &cfg.provider).clone();
+    if !profile.base_url.trim().is_empty() {
+        cfg.base_url = profile.base_url;
+    }
+    cfg.api_key = profile.api_key;
+    if !profile.model.trim().is_empty() {
+        cfg.model = profile.model;
+    }
+    cfg.reasoning_effort = Some(
+        normalize_reasoning_effort_or_default(profile.reasoning_effort.as_deref()).to_string(),
+    );
+    if profile.temperature.is_some() {
+        cfg.temperature = profile.temperature;
+    }
+    if profile.max_tokens.is_some() {
+        cfg.max_tokens = profile.max_tokens;
+    }
+    if !available_models_for_provider(&cfg.provider)
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(cfg.model.trim()))
+    {
+        cfg.model = default_model_for_provider(&cfg.provider).to_string();
+    }
+}
+
+fn apply_profile_to_active_main(cfg: &mut MainApiConfig) {
+    let profile = provider_profile_ref(&cfg.provider_profiles, &cfg.provider).clone();
+    if !profile.base_url.trim().is_empty() {
+        cfg.base_url = profile.base_url;
+    }
+    cfg.api_key = profile.api_key;
+    if !profile.model.trim().is_empty() {
+        cfg.model = profile.model;
+    }
+    cfg.reasoning_effort = Some(
+        normalize_reasoning_effort_or_default(profile.reasoning_effort.as_deref()).to_string(),
+    );
+    if profile.temperature.is_some() {
+        cfg.temperature = profile.temperature;
+    }
+    if profile.max_tokens.is_some() {
+        cfg.max_tokens = profile.max_tokens;
+    }
+    if !available_models_for_provider(&cfg.provider)
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(cfg.model.trim()))
+    {
+        cfg.model = default_model_for_provider(&cfg.provider).to_string();
+    }
+}
+
+fn hydrate_provider_profiles_dog(cfg: &mut DogApiConfig) {
+    cfg.provider = normalize_provider(&cfg.provider).to_string();
+    save_active_to_profile_dog(cfg);
+    apply_profile_to_active_dog(cfg);
+}
+
+fn hydrate_provider_profiles_main(cfg: &mut MainApiConfig) {
+    cfg.provider = normalize_provider(&cfg.provider).to_string();
+    save_active_to_profile_main(cfg);
+    apply_profile_to_active_main(cfg);
 }
 
 struct ApplySettingsEditArgs<'a> {
@@ -4910,18 +5674,19 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
     let trimmed = value.trim();
     match kind {
         SettingsFieldKind::Provider => {
-            let next = if trimmed.is_empty() {
-                "deepseek".to_string()
-            } else {
-                trimmed.to_string()
-            };
+            let next = normalize_provider(if trimmed.is_empty() { "deepseek" } else { trimmed })
+                .to_string();
             match section {
                 SettingsSection::DogApi => {
-                    dog_cfg.provider = next;
+                    save_active_to_profile_dog(dog_cfg);
+                    dog_cfg.provider = next.clone();
+                    apply_profile_to_active_dog(dog_cfg);
                     store_config_file(dog_cfg_path, dog_cfg).map_err(|e| e.to_string())?;
                 }
                 SettingsSection::MainApi => {
-                    main_cfg.provider = next;
+                    save_active_to_profile_main(main_cfg);
+                    main_cfg.provider = next.clone();
+                    apply_profile_to_active_main(main_cfg);
                     store_config_file(main_cfg_path, main_cfg).map_err(|e| e.to_string())?;
                 }
                 _ => {}
@@ -4934,10 +5699,12 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             match section {
                 SettingsSection::DogApi => {
                     dog_cfg.base_url = trimmed.to_string();
+                    save_active_to_profile_dog(dog_cfg);
                     store_config_file(dog_cfg_path, dog_cfg).map_err(|e| e.to_string())?;
                 }
                 SettingsSection::MainApi => {
                     main_cfg.base_url = trimmed.to_string();
+                    save_active_to_profile_main(main_cfg);
                     store_config_file(main_cfg_path, main_cfg).map_err(|e| e.to_string())?;
                 }
                 _ => {}
@@ -4952,10 +5719,12 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             match section {
                 SettingsSection::DogApi => {
                     dog_cfg.api_key = next;
+                    save_active_to_profile_dog(dog_cfg);
                     store_config_file(dog_cfg_path, dog_cfg).map_err(|e| e.to_string())?;
                 }
                 SettingsSection::MainApi => {
                     main_cfg.api_key = next;
+                    save_active_to_profile_main(main_cfg);
                     store_config_file(main_cfg_path, main_cfg).map_err(|e| e.to_string())?;
                 }
                 _ => {}
@@ -4968,10 +5737,34 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             match section {
                 SettingsSection::DogApi => {
                     dog_cfg.model = trimmed.to_string();
+                    save_active_to_profile_dog(dog_cfg);
                     store_config_file(dog_cfg_path, dog_cfg).map_err(|e| e.to_string())?;
                 }
                 SettingsSection::MainApi => {
                     main_cfg.model = trimmed.to_string();
+                    save_active_to_profile_main(main_cfg);
+                    store_config_file(main_cfg_path, main_cfg).map_err(|e| e.to_string())?;
+                }
+                _ => {}
+            }
+        }
+        SettingsFieldKind::ReasoningEffort => {
+            let next = normalize_reasoning_effort(if trimmed.is_empty() {
+                Some("high")
+            } else {
+                Some(trimmed)
+            })
+            .ok_or_else(|| "Reasoning 仅支持 low/medium/high/xhigh".to_string())?
+            .to_string();
+            match section {
+                SettingsSection::DogApi => {
+                    dog_cfg.reasoning_effort = Some(next);
+                    save_active_to_profile_dog(dog_cfg);
+                    store_config_file(dog_cfg_path, dog_cfg).map_err(|e| e.to_string())?;
+                }
+                SettingsSection::MainApi => {
+                    main_cfg.reasoning_effort = Some(next);
+                    save_active_to_profile_main(main_cfg);
                     store_config_file(main_cfg_path, main_cfg).map_err(|e| e.to_string())?;
                 }
                 _ => {}
@@ -4991,10 +5784,12 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             match section {
                 SettingsSection::DogApi => {
                     dog_cfg.temperature = next;
+                    save_active_to_profile_dog(dog_cfg);
                     store_config_file(dog_cfg_path, dog_cfg).map_err(|e| e.to_string())?;
                 }
                 SettingsSection::MainApi => {
                     main_cfg.temperature = next;
+                    save_active_to_profile_main(main_cfg);
                     store_config_file(main_cfg_path, main_cfg).map_err(|e| e.to_string())?;
                 }
                 _ => {}
@@ -5013,10 +5808,12 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             match section {
                 SettingsSection::DogApi => {
                     dog_cfg.max_tokens = Some(v);
+                    save_active_to_profile_dog(dog_cfg);
                     store_config_file(dog_cfg_path, dog_cfg).map_err(|e| e.to_string())?;
                 }
                 SettingsSection::MainApi => {
                     main_cfg.max_tokens = Some(v);
+                    save_active_to_profile_main(main_cfg);
                     store_config_file(main_cfg_path, main_cfg).map_err(|e| e.to_string())?;
                 }
                 _ => {}
@@ -5151,6 +5948,7 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                 | SettingsFieldKind::BaseUrl
                 | SettingsFieldKind::ApiKey
                 | SettingsFieldKind::Model
+                | SettingsFieldKind::ReasoningEffort
                 | SettingsFieldKind::Temperature
                 | SettingsFieldKind::MaxTokens
         )
@@ -5173,6 +5971,7 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                 | SettingsFieldKind::BaseUrl
                 | SettingsFieldKind::ApiKey
                 | SettingsFieldKind::Model
+                | SettingsFieldKind::ReasoningEffort
                 | SettingsFieldKind::Temperature
                 | SettingsFieldKind::MaxTokens
         )
@@ -5277,13 +6076,40 @@ fn apply_settings_with_notice(args: ApplySettingsWithNoticeArgs<'_>) {
 }
 
 fn tool_confirm_prompt(mcp_messages: &McpMessages, reason: &str, call: &ToolCall) -> String {
-    crate::mcp_messages::render_tool_confirm_prompt(mcp_messages, reason, call)
+    crate::messages::render_tool_confirm_prompt(mcp_messages, reason, call)
 }
 
 static PTY_JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn next_pty_job_id() -> u64 {
     PTY_JOB_SEQ.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+static ACTIVE_PTY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn active_pty_count() -> u64 {
+    ACTIVE_PTY_COUNT.load(Ordering::Relaxed).max(0)
+}
+
+struct ActivePtyGuard;
+
+impl ActivePtyGuard {
+    fn new() -> Self {
+        ACTIVE_PTY_COUNT.fetch_add(1, Ordering::Relaxed);
+        ActivePtyGuard
+    }
+}
+
+impl Drop for ActivePtyGuard {
+    fn drop(&mut self) {
+        ACTIVE_PTY_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+static PTY_DONE_EXPORT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_pty_done_export_id() -> u64 {
+    PTY_DONE_EXPORT_SEQ.fetch_add(1, Ordering::Relaxed).max(1)
 }
 
 static SEND_QUEUE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -5297,6 +6123,12 @@ struct QueuedUserMessage {
     id: u64,
     target: MindKind,
     ui_text: String,
+    model_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct InternalUserMessage {
+    target: MindKind,
     model_text: String,
 }
 
@@ -5447,15 +6279,35 @@ impl PtyDoneBatches {
 #[derive(Debug, Clone)]
 struct PtyDoneFollowup {
     owner: MindKind,
+    jobs: usize,
     tool_text: String,
     pushed: bool,
 }
 
-fn format_pty_done_batch_tool_text(owner: MindKind, jobs: &[PtyDoneJob]) -> String {
+fn format_pty_done_batch_tool_text_unlimited(
+    owner: MindKind,
+    jobs: &[PtyDoneJob],
+    batch_saved: Option<&str>,
+) -> String {
     let mut out = String::new();
+    let input_line = if jobs.len() == 1 {
+        let j = &jobs[0];
+        let cmd_preview = truncate_with_suffix(j.cmd.trim(), 140);
+        format!(
+            "job_id={} exit={} 耗时={}ms cmd={}",
+            j.job_id, j.exit_code, j.elapsed_ms, cmd_preview
+        )
+    } else {
+        let last_id = jobs.last().map(|j| j.job_id).unwrap_or(0);
+        format!("jobs={} last_job_id={}", jobs.len(), last_id)
+    };
     out.push_str("操作: PTY Done\n");
-    out.push_str("explain: 终端任务完成\n");
+    out.push_str("explain: 终端任务结束\n");
+    out.push_str(&format!("input: {input_line}\n"));
     out.push_str("output:\n```text\n");
+    if let Some(path) = batch_saved.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("batch_saved:{path}\n\n"));
+    }
     for (idx, j) in jobs.iter().enumerate() {
         out.push_str(&format!("#{}\n", idx + 1));
         out.push_str(&format!(
@@ -5479,15 +6331,98 @@ fn format_pty_done_batch_tool_text(owner: MindKind, jobs: &[PtyDoneJob]) -> Stri
             out.push('\n');
         }
         out.push('\n');
+    }
+    out.push_str("```\nmeta:\n```text\n");
+    out.push_str(&format!("owner:{owner:?} | jobs:{}\n", jobs.len()));
+    out.push_str("```\n");
+    out.trim_end().to_string()
+}
+
+fn format_pty_done_batch_tool_text(
+    owner: MindKind,
+    jobs: &[PtyDoneJob],
+    batch_saved: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    let input_line = if jobs.len() == 1 {
+        let j = &jobs[0];
+        let cmd_preview = truncate_with_suffix(j.cmd.trim(), 140);
+        format!(
+            "job_id={} exit={} 耗时={}ms cmd={}",
+            j.job_id, j.exit_code, j.elapsed_ms, cmd_preview
+        )
+    } else {
+        let last_id = jobs.last().map(|j| j.job_id).unwrap_or(0);
+        format!("jobs={} last_job_id={}", jobs.len(), last_id)
+    };
+    out.push_str("操作: PTY Done\n");
+    out.push_str("explain: 终端任务结束\n");
+    out.push_str(&format!("input: {input_line}\n"));
+    out.push_str("output:\n```text\n");
+    if let Some(path) = batch_saved.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("batch_saved:{path}\n\n"));
+    }
+    let mut shown = 0usize;
+    let mut truncated = false;
+    for (idx, j) in jobs.iter().enumerate() {
+        out.push_str(&format!("#{}\n", idx + 1));
+        out.push_str(&format!(
+            "job_id:{} | 状态:{} | exit:{} | 耗时:{}ms | size:{} | lines:{}\n",
+            j.job_id,
+            j.status,
+            j.exit_code,
+            j.elapsed_ms,
+            format_bytes_short(j.bytes),
+            j.lines
+        ));
+        let cmd_preview = truncate_with_suffix(j.cmd.trim(), 320);
+        out.push_str("cmd: ");
+        out.push_str(cmd_preview.trim_end());
+        out.push('\n');
+        out.push_str(&format!("log:{}\n", j.saved_path));
+        out.push_str(&format!("status:{}\n", j.status_path));
+        if !j.tail.trim().is_empty() {
+            out.push_str("tail:\n");
+            out.push_str(j.tail.trim_end());
+            out.push('\n');
+        }
+        out.push('\n');
+        shown = shown.saturating_add(1);
         if out.chars().count() >= PTY_DONE_BATCH_TOOL_MAX_CHARS {
+            truncated = true;
             break;
         }
     }
     out = truncate_with_suffix(out.trim_end(), PTY_DONE_BATCH_TOOL_MAX_CHARS);
     out.push_str("\n```\nmeta:\n```text\n");
-    out.push_str(&format!("owner:{owner:?} | jobs:{}\n", jobs.len()));
+    out.push_str(&format!(
+        "owner:{owner:?} | jobs:{} | shown:{} | truncated:{}\n",
+        jobs.len(),
+        shown,
+        truncated
+    ));
     out.push_str("```\n");
     out
+}
+
+fn export_pty_done_batch_summary(owner: MindKind, tool_text: &str) -> Option<String> {
+    if tool_text.trim().is_empty() {
+        return None;
+    }
+    let max = PTY_DONE_BATCH_TOOL_MAX_CHARS.max(1);
+    if tool_text.chars().count() <= max {
+        return None;
+    }
+    let dir = std::path::Path::new("log/bash-cache");
+    let _ = std::fs::create_dir_all(dir);
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let id = next_pty_done_export_id();
+    let file = format!("pty_done_batch_{owner:?}_{stamp}_{id}.txt");
+    let path = dir.join(file);
+    if std::fs::write(&path, tool_text.as_bytes()).is_ok() {
+        return Some(path.to_string_lossy().to_string());
+    }
+    None
 }
 
 fn format_bytes_short(bytes: usize) -> String {
@@ -5552,6 +6487,7 @@ fn spawn_tool_execution(
     owner: MindKind,
     tx: mpsc::Sender<AsyncEvent>,
     pty_started_notice_prompt_text: String,
+    pty_started_model_note_template: String,
 ) {
     let _ = tx.send(AsyncEvent::ToolStreamStart {
         owner,
@@ -5569,8 +6505,22 @@ fn spawn_tool_execution(
         });
         return;
     }
+    if call.tool == "pty" {
+        let _ = tx.send(AsyncEvent::PtyToolRequest {
+            owner,
+            call: Box::new(call),
+        });
+        return;
+    }
     if call.tool == "bash" && call.interactive.unwrap_or(false) {
-        spawn_interactive_bash_execution(call, owner, tx, pty_started_notice_prompt_text);
+        spawn_interactive_bash_execution(
+            call,
+            owner,
+            tx,
+            pty_started_notice_prompt_text,
+            pty_started_model_note_template,
+            true,
+        );
         return;
     }
     thread::spawn(move || {
@@ -5715,10 +6665,12 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
 
     *active_kind = target;
     let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
-    let fastmemo = read_fastmemo_for_context();
-    match target {
-        MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
-        MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
+    if sys_cfg.fastmemo_inject_enabled {
+        let fastmemo = read_fastmemo_for_context();
+        match target {
+            MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
+            MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
+        }
     }
     match target {
         MindKind::Main => {
@@ -5964,10 +6916,12 @@ fn handle_send_text(
 
     *active_kind = target;
     let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
-    let fastmemo = read_fastmemo_for_context();
-    match target {
-        MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
-        MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
+    if sys_cfg.fastmemo_inject_enabled {
+        let fastmemo = read_fastmemo_for_context();
+        match target {
+            MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
+            MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
+        }
     }
     match target {
         MindKind::Main => {
@@ -6057,12 +7011,33 @@ fn spawn_interactive_bash_execution(
     owner: MindKind,
     tx: mpsc::Sender<AsyncEvent>,
     pty_started_notice_prompt_text: String,
+    pty_started_model_note_template: String,
+    send_started_receipt: bool,
 ) {
     thread::spawn(move || {
-        let cwd_display = std::env::current_dir()
+        let cwd_now = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "(unknown)".to_string());
+        let (cwd_exec, cwd_display) = match call
+            .cwd
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            None => (None, cwd_now.clone()),
+            Some(raw) => {
+                let p = Path::new(raw);
+                let abs = if p.is_absolute() {
+                    raw.to_string()
+                } else if let Ok(base) = std::env::current_dir() {
+                    base.join(p).to_string_lossy().to_string()
+                } else {
+                    raw.to_string()
+                };
+                (Some(abs.clone()), abs)
+            }
+        };
         let cmd = call.input.trim().to_string();
         if cmd.is_empty() {
             let outcome = ToolOutcome {
@@ -6077,6 +7052,7 @@ fn spawn_interactive_bash_execution(
         }
 
         let started = Instant::now();
+        let started_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let timeout_secs = call
             .timeout_secs
             .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000))
@@ -6121,6 +7097,40 @@ fn spawn_interactive_bash_execution(
             .open(&saved_path)
             .ok();
 
+        let emit_fail_done = |outcome: ToolOutcome, exit_code: i32| {
+            if send_started_receipt {
+                let _ = tx.send(AsyncEvent::ToolStreamEnd {
+                    outcome: outcome.clone(),
+                    sys_msg: Some("工具执行失败".to_string()),
+                });
+            }
+            let elapsed_ms = started.elapsed().as_millis();
+            write_pty_status_file(
+                &status_path,
+                PtyStatusPhase::Done,
+                owner,
+                job_id,
+                &cmd,
+                &saved_path,
+                0,
+                0,
+                Some(exit_code),
+            );
+            let _ = tx.send(AsyncEvent::PtyJobDone {
+                owner,
+                job_id,
+                cmd: cmd.clone(),
+                saved_path: saved_path.clone(),
+                status_path: status_path.clone(),
+                exit_code,
+                timed_out: false,
+                user_exit: false,
+                elapsed_ms,
+                bytes: 0,
+                lines: 0,
+            });
+        };
+
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
             rows: 24,
@@ -6134,17 +7144,24 @@ fn spawn_interactive_bash_execution(
                     user_message: format!("PTY open failed: {e:#}"),
                     log_lines: vec![format!("状态:pty_open_failed | cwd:{cwd_display}")],
                 };
-                let _ = tx.send(AsyncEvent::ToolStreamEnd {
-                    outcome,
-                    sys_msg: Some("工具执行失败".to_string()),
-                });
+                emit_fail_done(outcome, -1);
                 return;
             }
         };
 
         // 默认关闭 echoctl，避免用户在终端里误触 Esc/控制键时输出出现 `^[` 等“噪音”。
         // 这不影响程序收到的按键，只影响控制字符的回显方式。
-        let cmd_exec = format!("stty -echoctl 2>/dev/null || true\n{cmd}");
+        let mut cmd_exec = "stty -echoctl 2>/dev/null || true\n".to_string();
+        if let Some(cwd_exec) = cwd_exec.as_deref() {
+            cmd_exec.push_str(&format!(
+                "cd -- {} || exit 1\n",
+                bash_single_quote(cwd_exec)
+            ));
+        }
+        cmd_exec.push_str(cmd.as_str());
+        if !cmd_exec.ends_with('\n') {
+            cmd_exec.push('\n');
+        }
         let mut cmd_builder = CommandBuilder::new("/data/data/com.termux/files/usr/bin/bash");
         cmd_builder.args(["-lc", &cmd_exec]);
         cmd_builder.env("TERM", "xterm-256color");
@@ -6154,23 +7171,24 @@ fn spawn_interactive_bash_execution(
         cmd_builder.env("TERM_PROGRAM", "AItermux");
         cmd_builder.env("COLUMNS", "80");
         cmd_builder.env("LINES", "24");
-        let child = match pair.slave.spawn_command(cmd_builder) {
+        let mut child = match pair.slave.spawn_command(cmd_builder) {
             Ok(c) => c,
             Err(e) => {
                 let outcome = ToolOutcome {
                     user_message: format!("PTY spawn failed: {e:#}"),
                     log_lines: vec![format!("状态:pty_spawn_failed | cwd:{cwd_display}")],
                 };
-                let _ = tx.send(AsyncEvent::ToolStreamEnd {
-                    outcome,
-                    sys_msg: Some("工具执行失败".to_string()),
-                });
+                emit_fail_done(outcome, -1);
                 return;
             }
         };
+        let _pty_guard = ActivePtyGuard::new();
+        let pid = child.process_id().map(|v| v as i32);
 
         // master：拆出 reader/writer，并保留 master 以处理 resize。
         let master = pair.master;
+        let pgrp = master.process_group_leader().map(|v| v as i32);
+        let _ = tx.send(AsyncEvent::PtySpawned { job_id, pid, pgrp });
 
         // 为了让 “Kill / 超时” 能可靠打断 reader.read()，把 master fd 设为 nonblocking。
         // portable-pty 的 try_clone_reader() 通常基于 dup；O_NONBLOCK 属于 open-file-description，
@@ -6187,10 +7205,12 @@ fn spawn_interactive_bash_execution(
                     user_message: format!("PTY reader failed: {e:#}"),
                     log_lines: vec![format!("状态:pty_reader_failed | cwd:{cwd_display}")],
                 };
-                let _ = tx.send(AsyncEvent::ToolStreamEnd {
-                    outcome,
-                    sys_msg: Some("工具执行失败".to_string()),
-                });
+                #[cfg(unix)]
+                if let Some(pgrp) = master.process_group_leader().map(|v| v as i32) {
+                    unsafe { libc::kill(-pgrp, libc::SIGKILL) };
+                }
+                let _ = child.kill();
+                emit_fail_done(outcome, -1);
                 return;
             }
         };
@@ -6201,10 +7221,12 @@ fn spawn_interactive_bash_execution(
                     user_message: format!("PTY writer failed: {e:#}"),
                     log_lines: vec![format!("状态:pty_writer_failed | cwd:{cwd_display}")],
                 };
-                let _ = tx.send(AsyncEvent::ToolStreamEnd {
-                    outcome,
-                    sys_msg: Some("工具执行失败".to_string()),
-                });
+                #[cfg(unix)]
+                if let Some(pgrp) = master.process_group_leader().map(|v| v as i32) {
+                    unsafe { libc::kill(-pgrp, libc::SIGKILL) };
+                }
+                let _ = child.kill();
+                emit_fail_done(outcome, -1);
                 return;
             }
         };
@@ -6218,6 +7240,9 @@ fn spawn_interactive_bash_execution(
         let timed_out = Arc::new(AtomicBool::new(false));
         let user_aborted = Arc::new(AtomicBool::new(false));
         let user_aborted2 = user_aborted.clone();
+        // 注意：portable_pty::Child::try_wait() 可能会“回收”子进程；若后续再 wait() 会得到 ECHILD。
+        // 因此一旦任何线程通过 try_wait() 观察到退出，就把 exit_code 记录下来，finalize 阶段优先使用它。
+        let exit_code_seen: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
 
         // ctrl 线程：stdin / resize / kill
         let ctrl_handle = thread::spawn(move || {
@@ -6272,6 +7297,7 @@ fn spawn_interactive_bash_execution(
             let timed_out2 = timed_out.clone();
             let done_timeout = done.clone();
             let child_timeout = child.clone();
+            let exit_code_timeout = exit_code_seen.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(timeout_secs));
                 // 防止“子进程已退出但仍被标记 timeout”：先检查 try_wait，再决定是否触发 Kill。
@@ -6280,7 +7306,16 @@ fn spawn_interactive_bash_execution(
                 }
                 let exited = if let Ok(mut guard) = child_timeout.lock() {
                     if let Some(ch) = guard.as_mut() {
-                        ch.try_wait().ok().flatten().is_some()
+                        match ch.try_wait() {
+                            Ok(Some(status)) => {
+                                if let Ok(mut g) = exit_code_timeout.lock() {
+                                    *g = Some(status.exit_code() as i32);
+                                }
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(_) => false,
+                        }
                     } else {
                         true
                     }
@@ -6300,9 +7335,10 @@ fn spawn_interactive_bash_execution(
         let mut bytes_written: usize = 0;
         let mut lines_written: usize = 0;
         let mut last_status_flush_at = Instant::now();
+        let mut last_try_wait_at = Instant::now();
         let mut initial_preview: Vec<u8> = Vec::new();
         let initial_preview_deadline = Instant::now() + Duration::from_millis(260);
-        let mut started_notice_sent = false;
+        let mut started_notice_sent = !send_started_receipt;
         let mut kill_grace_started_at: Option<Instant> = None;
         loop {
             match reader.read(&mut buf) {
@@ -6343,7 +7379,10 @@ fn spawn_interactive_bash_execution(
                             None,
                         );
                     }
-                    if !started_notice_sent && Instant::now() >= initial_preview_deadline {
+                    if send_started_receipt
+                        && !started_notice_sent
+                        && Instant::now() >= initial_preview_deadline
+                    {
                         started_notice_sent = true;
                         let initial_preview_text = {
                             let mut s = String::from_utf8_lossy(&initial_preview).to_string();
@@ -6364,12 +7403,35 @@ fn spawn_interactive_bash_execution(
                         );
                         let started_outcome = ToolOutcome {
                             user_message: started_notice,
-                            log_lines: vec![
-                                format!(
-                                    "状态:running | phase:pty_started | job_id:{job_id} | cwd:{cwd_display} | saved:{saved_path} | status:{status_path}"
-                                ),
-                                format!("cmd_len:{}", cmd.chars().count()),
-                            ],
+                            log_lines: {
+                                let mut lines = vec![
+                                    format!(
+                                        "状态:running | phase:pty_started | job_id:{job_id} | cwd:{cwd_display} | saved:{saved_path} | status:{status_path}"
+                                    ),
+                                    format!("cmd_len:{}", cmd.chars().count()),
+                                ];
+                                let tpl = pty_started_model_note_template.trim();
+                                if !tpl.is_empty() {
+                                    let note = crate::messages::render_template(
+                                        tpl,
+                                        &[
+                                            ("JOB_ID", &job_id.to_string()),
+                                            ("OWNER", &format!("{owner:?}")),
+                                            ("PTY_COUNT", &active_pty_count().to_string()),
+                                            ("STARTED_AT", &started_at),
+                                            ("CWD", &cwd_display),
+                                            ("CMD", &cmd),
+                                            ("LOG_PATH", &saved_path),
+                                            ("STATUS_PATH", &status_path),
+                                        ],
+                                    );
+                                    let note = note.trim();
+                                    if !note.is_empty() {
+                                        lines.push(format!("{MODEL_NOTE_PREFIX}{note}"));
+                                    }
+                                }
+                                lines
+                            },
                         };
                         let _ = tx.send(AsyncEvent::ToolStreamEnd {
                             outcome: started_outcome,
@@ -6378,7 +7440,10 @@ fn spawn_interactive_bash_execution(
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if !started_notice_sent && Instant::now() >= initial_preview_deadline {
+                    if send_started_receipt
+                        && !started_notice_sent
+                        && Instant::now() >= initial_preview_deadline
+                    {
                         started_notice_sent = true;
                         let initial_preview_text = {
                             let mut s = String::from_utf8_lossy(&initial_preview).to_string();
@@ -6399,12 +7464,35 @@ fn spawn_interactive_bash_execution(
                         );
                         let started_outcome = ToolOutcome {
                             user_message: started_notice,
-                            log_lines: vec![
-                                format!(
-                                    "状态:running | phase:pty_started | job_id:{job_id} | cwd:{cwd_display} | saved:{saved_path} | status:{status_path}"
-                                ),
-                                format!("cmd_len:{}", cmd.chars().count()),
-                            ],
+                            log_lines: {
+                                let mut lines = vec![
+                                    format!(
+                                        "状态:running | phase:pty_started | job_id:{job_id} | cwd:{cwd_display} | saved:{saved_path} | status:{status_path}"
+                                    ),
+                                    format!("cmd_len:{}", cmd.chars().count()),
+                                ];
+                                let tpl = pty_started_model_note_template.trim();
+                                if !tpl.is_empty() {
+                                    let note = crate::messages::render_template(
+                                        tpl,
+                                        &[
+                                            ("JOB_ID", &job_id.to_string()),
+                                            ("OWNER", &format!("{owner:?}")),
+                                            ("PTY_COUNT", &active_pty_count().to_string()),
+                                            ("STARTED_AT", &started_at),
+                                            ("CWD", &cwd_display),
+                                            ("CMD", &cmd),
+                                            ("LOG_PATH", &saved_path),
+                                            ("STATUS_PATH", &status_path),
+                                        ],
+                                    );
+                                    let note = note.trim();
+                                    if !note.is_empty() {
+                                        lines.push(format!("{MODEL_NOTE_PREFIX}{note}"));
+                                    }
+                                }
+                                lines
+                            },
                         };
                         let _ = tx.send(AsyncEvent::ToolStreamEnd {
                             outcome: started_outcome,
@@ -6426,6 +7514,27 @@ fn spawn_interactive_bash_execution(
                             lines_written,
                             None,
                         );
+                    }
+                    // 重要：某些平台/实现下，子进程退出后 reader.read() 可能长期返回 WouldBlock，
+                    // 导致 PTY “看起来还在跑”。这里定期 try_wait()，一旦观察到退出就收敛退出。
+                    if Instant::now().saturating_duration_since(last_try_wait_at)
+                        >= Duration::from_millis(240)
+                    {
+                        last_try_wait_at = Instant::now();
+                        let already_seen = exit_code_seen.lock().ok().and_then(|g| *g).is_some();
+                        if already_seen {
+                            break;
+                        }
+                        if let Ok(mut guard) = child.lock() {
+                            if let Some(ch) = guard.as_mut() {
+                                if let Ok(Some(status)) = ch.try_wait() {
+                                    if let Ok(mut g) = exit_code_seen.lock() {
+                                        *g = Some(status.exit_code() as i32);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
                     // nonblocking：没有数据时让出 CPU，并在 kill/timeout 后做 bounded 收尾。
                     if user_aborted.load(Ordering::Relaxed) || timed_out.load(Ordering::Relaxed) {
@@ -6457,7 +7566,7 @@ fn spawn_interactive_bash_execution(
                 Err(_) => break,
             }
         }
-        if !started_notice_sent {
+        if send_started_receipt && !started_notice_sent {
             let initial_preview_text = {
                 let mut s = String::from_utf8_lossy(&initial_preview).to_string();
                 s.retain(|ch| ch != '\u{0}');
@@ -6477,12 +7586,35 @@ fn spawn_interactive_bash_execution(
             );
             let started_outcome = ToolOutcome {
                 user_message: started_notice,
-                log_lines: vec![
-                    format!(
-                        "状态:running | phase:pty_started | job_id:{job_id} | cwd:{cwd_display} | saved:{saved_path} | status:{status_path}"
-                    ),
-                    format!("cmd_len:{}", cmd.chars().count()),
-                ],
+                log_lines: {
+                    let mut lines = vec![
+                        format!(
+                            "状态:running | phase:pty_started | job_id:{job_id} | cwd:{cwd_display} | saved:{saved_path} | status:{status_path}"
+                        ),
+                        format!("cmd_len:{}", cmd.chars().count()),
+                    ];
+                    let tpl = pty_started_model_note_template.trim();
+                    if !tpl.is_empty() {
+                        let note = crate::messages::render_template(
+                            tpl,
+                            &[
+                                ("JOB_ID", &job_id.to_string()),
+                                ("OWNER", &format!("{owner:?}")),
+                                ("PTY_COUNT", &active_pty_count().to_string()),
+                                ("STARTED_AT", &started_at),
+                                ("CWD", &cwd_display),
+                                ("CMD", &cmd),
+                                ("LOG_PATH", &saved_path),
+                                ("STATUS_PATH", &status_path),
+                            ],
+                        );
+                        let note = note.trim();
+                        if !note.is_empty() {
+                            lines.push(format!("{MODEL_NOTE_PREFIX}{note}"));
+                        }
+                    }
+                    lines
+                },
             };
             let _ = tx.send(AsyncEvent::ToolStreamEnd {
                 outcome: started_outcome,
@@ -6491,7 +7623,13 @@ fn spawn_interactive_bash_execution(
         }
 
         // wait + 收尾
-        let code = if let Ok(mut guard) = child.lock() {
+        let code_from_try_wait = exit_code_seen.lock().ok().and_then(|g| *g);
+        let code = if let Some(code) = code_from_try_wait {
+            if let Ok(mut guard) = child.lock() {
+                let _ = guard.take();
+            }
+            code
+        } else if let Ok(mut guard) = child.lock() {
             if let Some(mut ch) = guard.take() {
                 // 若已触发 kill/timeout：bounded wait，避免卡死在 .wait()
                 if user_aborted.load(Ordering::Relaxed) || timed_out.load(Ordering::Relaxed) {
@@ -6568,6 +7706,7 @@ struct TryStartNextToolArgs<'a> {
     sys_cfg: &'a SystemConfig,
     owner: MindKind,
     mcp_messages: &'a McpMessages,
+    pty_messages: &'a PtyMessages,
     pty_started_notice_prompt_text: &'a str,
 }
 
@@ -6585,6 +7724,7 @@ fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
         sys_cfg,
         owner,
         mcp_messages,
+        pty_messages,
         pty_started_notice_prompt_text,
     } = args;
     if matches!(*mode, Mode::ExecutingTool | Mode::ApprovingTool) {
@@ -6607,7 +7747,13 @@ fn try_start_next_tool(args: TryStartNextToolArgs<'_>) -> bool {
         push_sys_log(sys_log, sys_log_limit, "等待工具确认");
         return true;
     }
-    spawn_tool_execution(call, owner, tx, pty_started_notice_prompt_text.to_string());
+    spawn_tool_execution(
+        call,
+        owner,
+        tx,
+        pty_started_notice_prompt_text.to_string(),
+        pty_messages.pty_started_model_note.clone(),
+    );
     true
 }
 
@@ -6620,6 +7766,10 @@ fn normalize_confirm_input(s: &str) -> Option<bool> {
     } else {
         None
     }
+}
+
+fn is_idle_like(mode: Mode) -> bool {
+    matches!(mode, Mode::Idle)
 }
 
 fn build_tool_stream_message(state: &ToolStreamState) -> String {
@@ -6655,8 +7805,8 @@ fn is_chat_message_selectable(
     }
     if msg.role == Role::Tool {
         let head = msg.text.trim_start();
-        let lower = head.to_ascii_lowercase();
-        let is_think = lower.starts_with("操作: think") || lower.starts_with("[tool:think]");
+        let prefix = head.get(..THINK_TOOL_MARKER.len()).unwrap_or("");
+        let is_think = prefix.eq_ignore_ascii_case(THINK_TOOL_MARKER);
         if is_think
             && !details_mode
             && !expanded_thinking_idxs.contains(&msg_idx)
@@ -6672,8 +7822,9 @@ fn is_think_tool_message(msg: &Message) -> bool {
     if msg.role != Role::Tool {
         return false;
     }
-    let lower = msg.text.trim_start().to_ascii_lowercase();
-    lower.starts_with("操作: think") || lower.starts_with("[tool:think]")
+    let head = msg.text.trim_start();
+    let prefix = head.get(..THINK_TOOL_MARKER.len()).unwrap_or("");
+    prefix.eq_ignore_ascii_case(THINK_TOOL_MARKER)
 }
 
 fn find_think_message_for_selection(core: &Core, selected_idx: usize) -> Option<usize> {
@@ -6928,7 +8079,8 @@ fn build_thinking_summary(kind: MindKind, secs: u64) -> String {
 
 fn build_thinking_tool_message_stub(kind: MindKind, status: &str, input: &str) -> String {
     let mut msg = String::new();
-    msg.push_str("操作: Think\n");
+    msg.push_str(THINK_TOOL_MARKER);
+    msg.push('\n');
     msg.push_str(&format!("input: {}\n", input.trim()));
     let mind = if matches!(kind, MindKind::Sub) {
         "dog"
@@ -7094,7 +8246,8 @@ fn build_thinking_tool_message(
         return String::new();
     }
     let mut msg = String::new();
-    msg.push_str("操作: Think\n");
+    msg.push_str(THINK_TOOL_MARKER);
+    msg.push('\n');
     msg.push_str(&format!("input: {}\n", summary.trim()));
     let mind = if matches!(kind, MindKind::Sub) {
         "dog"
@@ -7118,7 +8271,8 @@ fn build_thinking_tool_message_running(kind: MindKind, full_text: &str) -> Strin
         return build_thinking_tool_message_stub(kind, "running", "");
     }
     let mut msg = String::new();
-    msg.push_str("操作: Think\n");
+    msg.push_str(THINK_TOOL_MARKER);
+    msg.push('\n');
     msg.push_str("input:\n");
     let mind = if matches!(kind, MindKind::Sub) {
         "dog"
@@ -7414,6 +8568,11 @@ enum AsyncEvent {
         job_id: u64,
         bytes: Vec<u8>,
     },
+    PtySpawned {
+        job_id: u64,
+        pid: Option<i32>,
+        pgrp: Option<i32>,
+    },
     PtyJobDone {
         owner: MindKind,
         job_id: u64,
@@ -7426,6 +8585,10 @@ enum AsyncEvent {
         elapsed_ms: u128,
         bytes: usize,
         lines: usize,
+    },
+    PtyToolRequest {
+        owner: MindKind,
+        call: Box<ToolCall>,
     },
 }
 
@@ -7951,6 +9114,24 @@ fn handle_context_compact_tool(args: ContextCompactToolArgs<'_>) {
         ctx_compact_notice_idx,
     } = args;
 
+    if !sys_cfg.context_compact_enabled {
+        outcome.user_message = "context_compact 已停用（开发期聚焦 MCP）".to_string();
+        outcome
+            .log_lines
+            .push("状态:skipped | reason:context_compact_disabled".to_string());
+        update_ctx_compact_notice(
+            core,
+            render_cache,
+            ctx_compact_notice_idx,
+            "↻ CONTEXT SUMMARY（已停用）",
+        );
+        match state.owner {
+            MindKind::Main => main_state.abort_context_compact(),
+            MindKind::Sub => dog_state.abort_context_compact(),
+        }
+        return;
+    }
+
     let target = state
         .call
         .target
@@ -8199,36 +9380,34 @@ fn run_loop(
     };
     let (mut context_compact_prompt_text, context_compact_prompt_err, context_compact_prompt_path) =
         load_context_compact_prompt(&sys_cfg);
-    let (pty_audit_prompt_text, pty_audit_prompt_err, _pty_audit_prompt_path) =
-        load_pty_audit_prompt(&sys_cfg);
-    let (pty_help_prompt_text, pty_help_prompt_err, _pty_help_prompt_path) =
+    let (pty_help_prompt_text, pty_help_prompt_err, pty_help_prompt_path) =
         load_pty_help_prompt(&sys_cfg);
-    let (pty_started_notice_prompt_text, pty_started_notice_prompt_err, _pty_started_notice_path) =
-        load_pty_started_notice_prompt(&sys_cfg);
-    let (fastmemo_compact_prompt_text, fastmemo_compact_prompt_err, _fastmemo_compact_prompt_path) =
-        load_fastmemo_compact_prompt();
+    let pty_started_notice_prompt_text = load_pty_started_notice_prompt();
+    let pty_started_notice_prompt_err: Option<String> = None;
+    let (
+        fastmemo_compact_prompt_text,
+        fastmemo_compact_prompt_err,
+        fastmemo_compact_prompt_path,
+    ) = load_fastmemo_compact_prompt();
     let (
         welcome_shortcuts_prompt_text,
         welcome_shortcuts_prompt_err,
         welcome_shortcuts_prompt_path,
     ) = load_welcome_shortcuts_prompt(&sys_cfg);
-    let (mcp_messages, mcp_messages_err, mcp_messages_path) =
-        crate::mcp_messages::load_mcp_messages(&sys_cfg);
-
-    let (tool_messages, tool_messages_err, tool_messages_path) =
-        crate::tool_messages::load_tool_messages(&sys_cfg);
-    crate::tool_messages::set_tool_messages(tool_messages);
+    let mcp_messages_err: Option<String> = None;
+    let pty_messages_err: Option<String> = None;
+    let mcp_messages = McpMessages::default();
+    let pty_messages = PtyMessages::default();
+    let pty_audit_prompt_text = pty_messages.pty_audit_prompt.clone();
     let mut dog_state = DogState::new(
         dog_prompt,
         dog_cfg.prompt_reinject_pct,
-        mcp_messages.deepseek_tool_loop_tick_user.clone(),
         mcp_messages.tool_result_assistant.clone(),
     );
     let mut main_prompt_text = main_prompt;
     let mut main_state = DogState::new(
         main_prompt_text.clone(),
         80,
-        mcp_messages.deepseek_tool_loop_tick_user.clone(),
         mcp_messages.tool_result_assistant.clone(),
     );
     // MAIN 也可能发起工具调用（记忆/系统配置等）。若不回注工具结果，模型会反复重试同一工具。
@@ -8271,7 +9450,7 @@ fn run_loop(
     let mut render_cache = ui::ChatRenderCache::new();
     core.push_system(&welcome_shortcuts_prompt_text);
     let mut input = String::new();
-    let mut pending_pty_snapshot: Option<(u64, String)> = None;
+    let mut pending_pty_snapshot: Option<PendingPtySnapshot> = None;
     let mut cursor: usize = 0;
     let mut input_chars: usize = 0;
     let mut scroll: u16 = 0;
@@ -8299,9 +9478,10 @@ fn run_loop(
     } else {
         now0 + heartbeat_interval(heartbeat_minutes_cache)
     };
-    let mut heartbeat_request_id: Option<u64> = None;
-    let mut next_pty_audit_at: Option<Instant> = None;
-    let mut pulse_notice: Option<PulseNotice> = None;
+	    let mut heartbeat_request_id: Option<u64> = None;
+	    let mut next_pty_audit_at: Option<Instant> = None;
+	    let mut last_pty_running_total: usize = 0;
+	    let mut pulse_notice: Option<PulseNotice> = None;
     let mut heartbeat_count: u64 = token_totals.total_heartbeat_count;
     let mut response_count: u64 = token_totals.total_heartbeat_responses;
     let mut hint_last = String::new();
@@ -8398,7 +9578,10 @@ fn run_loop(
         push_sys_log(
             &mut sys_log,
             config.sys_log_limit,
-            format!("CONTEXT-COMPACT: {err}"),
+            format!(
+                "CONTEXT-COMPACT: {err} ({})",
+                context_compact_prompt_path.display()
+            ),
         );
     } else if context_compact_prompt_text.trim().is_empty() {
         push_sys_log(
@@ -8410,34 +9593,31 @@ fn run_loop(
         push_sys_log(
             &mut sys_log,
             config.sys_log_limit,
-            "CONTEXT-COMPACT: 已载入提示词",
+            format!(
+                "CONTEXT-COMPACT: 配置 {}",
+                context_compact_prompt_path.display()
+            ),
         );
     }
-    if let Some(err) = pty_audit_prompt_err {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            format!("PTY-AUDIT: {err}"),
-        );
-    } else if pty_audit_prompt_text.trim().is_empty() {
+    if pty_audit_prompt_text.trim().is_empty() {
         push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-AUDIT: 提示词为空");
     } else {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            "PTY-AUDIT: 已载入提示词",
-        );
+        push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-AUDIT: 内置");
     }
     if let Some(err) = pty_help_prompt_err {
         push_sys_log(
             &mut sys_log,
             config.sys_log_limit,
-            format!("PTY-HELP: {err}"),
+            format!("PTY-HELP: {err} ({})", pty_help_prompt_path.display()),
         );
     } else if pty_help_prompt_text.trim().is_empty() {
         push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-HELP: 提示词为空");
     } else {
-        push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-HELP: 已载入提示词");
+        push_sys_log(
+            &mut sys_log,
+            config.sys_log_limit,
+            format!("PTY-HELP: 配置 {}", pty_help_prompt_path.display()),
+        );
     }
     if let Some(err) = pty_started_notice_prompt_err {
         push_sys_log(
@@ -8448,17 +9628,16 @@ fn run_loop(
     } else if pty_started_notice_prompt_text.trim().is_empty() {
         push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-START: 提示词为空");
     } else {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            "PTY-START: 已载入提示词",
-        );
+        push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-START: 内置");
     }
     if let Some(err) = fastmemo_compact_prompt_err {
         push_sys_log(
             &mut sys_log,
             config.sys_log_limit,
-            format!("FASTMEMO-COMPACT: {err}"),
+            format!(
+                "FASTMEMO-COMPACT: {err} ({})",
+                fastmemo_compact_prompt_path.display()
+            ),
         );
     } else if fastmemo_compact_prompt_text.trim().is_empty() {
         push_sys_log(
@@ -8470,7 +9649,10 @@ fn run_loop(
         push_sys_log(
             &mut sys_log,
             config.sys_log_limit,
-            "FASTMEMO-COMPACT: 已载入提示词",
+            format!(
+                "FASTMEMO-COMPACT: 配置 {}",
+                fastmemo_compact_prompt_path.display()
+            ),
         );
     }
     if let Some(err) = welcome_shortcuts_prompt_err {
@@ -8492,32 +9674,16 @@ fn run_loop(
         );
     }
     if let Some(err) = mcp_messages_err {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            format!("MCP-MESSAGES: {err} ({})", mcp_messages_path.display()),
-        );
+        push_sys_log(&mut sys_log, config.sys_log_limit, format!("MCP-MESSAGES: {err}"));
     } else {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            format!("MCP-MESSAGES: 配置 {}", mcp_messages_path.display()),
-        );
+        push_sys_log(&mut sys_log, config.sys_log_limit, "MCP-MESSAGES: 内置");
+    }
+    if let Some(err) = pty_messages_err {
+        push_sys_log(&mut sys_log, config.sys_log_limit, format!("PTY-MESSAGES: {err}"));
+    } else {
+        push_sys_log(&mut sys_log, config.sys_log_limit, "PTY-MESSAGES: 内置");
     }
 
-    if let Some(err) = tool_messages_err {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            format!("TOOL-MESSAGES: {err} ({})", tool_messages_path.display()),
-        );
-    } else {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            format!("TOOL-MESSAGES: 配置 {}", tool_messages_path.display()),
-        );
-    }
     if let Some(err) = metamemo_err.take() {
         push_sys_log(
             &mut sys_log,
@@ -8595,6 +9761,7 @@ fn run_loop(
     let mut pending_tool_confirm: Option<(ToolCall, String, usize)> = None;
     let mut send_queue_high: VecDeque<QueuedUserMessage> = VecDeque::new();
     let mut send_queue_low: VecDeque<QueuedUserMessage> = VecDeque::new();
+    let mut send_queue_internal: VecDeque<InternalUserMessage> = VecDeque::new();
     let mut send_queue_ui: SendQueueUiState = SendQueueUiState::Closed;
     // 自动出队节流：避免“刚空闲就连发多条”让人类/模型都来不及反应。
     let mut send_queue_dequeue_cooldown_until: Option<Instant> = None;
@@ -8622,6 +9789,8 @@ fn run_loop(
     let mut burst_start_cursor: Option<usize> = None;
     let mut paste_capture: Option<PasteCapture> = None;
     let mut toast: Option<(Instant, String)> = None;
+    // 大粘贴占位符缓存：当 pending_pastes 非空，说明输入框里存在“粘贴块”占位符，
+    // 为避免误触 Enter 提交，需要 Alt+Enter 才允许发送。
     let mut pending_pastes: Vec<(String, String)> = Vec::new();
     let max_input_chars = config.max_input_chars;
     let paste_capture_max_bytes = config.paste_capture_max_bytes;
@@ -8642,10 +9811,10 @@ fn run_loop(
                 pty_tabs: &mut pty_tabs,
                 pty_active_idx: &mut pty_active_idx,
                 pty_handles: &mut pty_handles,
-                pty_view: &mut pty_view,
-                pty_done_batches: &mut pty_done_batches,
-                pty_done_followups: &mut pty_done_followups,
-                mode: &mut mode,
+	                pty_view: &mut pty_view,
+	                pty_done_batches: &mut pty_done_batches,
+	                pty_done_followups: &mut pty_done_followups,
+	                mode: &mut mode,
                 scroll: &mut scroll,
                 follow_bottom: &mut follow_bottom,
                 active_kind: &mut active_kind,
@@ -8700,6 +9869,7 @@ fn run_loop(
                 pty_help_prompt_text: &pty_help_prompt_text,
                 pty_started_notice_prompt_text: &pty_started_notice_prompt_text,
                 mcp_messages: &mcp_messages,
+                pty_messages: &pty_messages,
                 auto_fastmemo_compact: &mut auto_fastmemo_compact,
                 fastmemo_compact_inflight: &mut fastmemo_compact_inflight,
                 fastmemo_compact_edit_mask: &mut fastmemo_compact_edit_mask,
@@ -8759,9 +9929,8 @@ fn run_loop(
             };
         }
 
-        // PTY DONE（批量）回传：当一批后台终端全部结束后，统一把聚合后的 Tool result 交给模型继续处理。
-        // 优先级：工具/系统回执优先于“用户发送队列”，避免队列堆积导致回执延后。
-        // 约束：不与用户请求并发；若当前忙，则等待下一轮 tick。
+        // PTY DONE（批量）回传：当一批后台终端全部结束后，把聚合后的 Tool result 写入聊天并注入模型上下文。
+        // 可选：注入一条“内部提示”让模型简短汇报执行结果（由 pty_messages 配置控制）。
         if !pty_done_followups.is_empty()
             && pty_tabs.is_empty()
             && can_inject_heartbeat(
@@ -8772,58 +9941,104 @@ fn run_loop(
                 &active_tool_stream,
             )
         {
-            let owner = {
-                let front = &mut pty_done_followups[0];
-                if !front.pushed {
-                    core.push_tool(front.tool_text.clone());
-                    match front.owner {
-                        MindKind::Sub => dog_state.push_tool(&front.tool_text),
-                        _ => main_state.push_tool(&front.tool_text),
-                    }
-                    render_cache.invalidate(core.history.len().saturating_sub(1));
-                    front.pushed = true;
+            let front = &mut pty_done_followups[0];
+            if !front.pushed {
+                core.push_tool(front.tool_text.clone());
+                match front.owner {
+                    MindKind::Sub => dog_state.push_tool(&front.tool_text),
+                    _ => main_state.push_tool(&front.tool_text),
                 }
-                front.owner
-            };
-            let (client_ref, state_ref) = if matches!(owner, MindKind::Sub) {
-                (&dog_client, &dog_state)
-            } else {
-                (&main_client, &main_state)
-            };
-            if let Some(in_tokens) = try_start_dog_generation(TryStartDogGenerationArgs {
-                kind: owner,
-                dog_client: client_ref,
-                dog_state: state_ref,
-                extra_system: None,
-                tx: &tx,
-                config: &config,
-                mode: &mut mode,
-                active_kind: &mut active_kind,
-                sending_until: &mut sending_until,
-                sys_log: &mut sys_log,
-                sys_log_limit: config.sys_log_limit,
-                streaming_state: &mut streaming_state,
-                request_seq: &mut request_seq,
-                active_request_id: &mut active_request_id,
-                active_cancel: &mut active_cancel,
-                sse_enabled,
-            }) {
-                push_sys_log(
-                    &mut sys_log,
-                    config.sys_log_limit,
-                    "Terminal: done followup",
-                );
-                record_request_in_tokens(
-                    &mut core,
-                    &mut token_totals,
-                    &token_total_path,
-                    &context_usage,
-                    &mut active_request_in_tokens,
-                    in_tokens,
-                );
+                render_cache.invalidate(core.history.len().saturating_sub(1));
+                front.pushed = true;
                 push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: batch ready");
-                pty_done_followups.pop_front();
+                let mut auto_reply = false;
+                let tpl = pty_messages.pty_done_auto_report_prompt.trim();
+                if !tpl.is_empty() {
+                    let prompt = crate::messages::render_template(
+                        tpl,
+                        &[
+                            ("JOBS", &front.jobs.to_string()),
+                            ("OWNER", mind_label(front.owner)),
+                        ],
+                    );
+                    if !prompt.trim().is_empty() {
+                        send_queue_internal.push_back(InternalUserMessage {
+                            target: front.owner,
+                            model_text: prompt,
+                        });
+                        auto_reply = true;
+                    }
+                }
+                runlog_event(
+                    "INFO",
+                    "pty.batch.ready",
+                    json!({"owner": mind_label(front.owner), "jobs": front.jobs, "auto_reply": auto_reply}),
+                );
+            }
+            pty_done_followups.pop_front();
+            needs_redraw = true;
+        }
+
+        // 内部队列：空闲时自动出队（不展示给用户）。
+        if !send_queue_internal.is_empty()
+            && !send_queue_dequeue_cooldown_until.is_some_and(|t| now < t)
+            && matches!(send_queue_ui, SendQueueUiState::Closed)
+            && !diary_state.active()
+            && !(main_state.ctx_compact_inflight || dog_state.ctx_compact_inflight)
+            && can_inject_heartbeat(
+                mode,
+                &active_request_id,
+                &pending_tools,
+                &pending_tool_confirm,
+                &active_tool_stream,
+            )
+        {
+            if let Some(msg) = send_queue_internal.pop_front() {
+                send_queue_dequeue_cooldown_until = Some(now + Duration::from_millis(450));
+                // 内部消息不写入聊天 UI：ui_text 为空即可（Core.push_user 会忽略空）。
+                start_user_chat_request(StartUserChatRequestArgs {
+                    now,
+                    ui_text: String::new(),
+                    model_text: msg.model_text,
+                    target: msg.target,
+                    core: &mut core,
+                    metamemo: &mut metamemo,
+                    context_usage: &mut context_usage,
+                    pending_mind_half: &mut pending_mind_half,
+                    dog_state: &mut dog_state,
+                    main_state: &mut main_state,
+                    sys_cfg: &sys_cfg,
+                    config: &config,
+                    tx: &tx,
+                    mode: &mut mode,
+                    active_kind: &mut active_kind,
+                    sending_until: &mut sending_until,
+                    sys_log: &mut sys_log,
+                    streaming_state: &mut streaming_state,
+                    request_seq: &mut request_seq,
+                    active_request_id: &mut active_request_id,
+                    active_cancel: &mut active_cancel,
+                    sse_enabled,
+                    next_heartbeat_at: &mut next_heartbeat_at,
+                    thinking_text: &mut thinking_text,
+                    thinking_full_text: &mut thinking_full_text,
+                    thinking_idx: &mut thinking_idx,
+                    thinking_in_progress: &mut thinking_in_progress,
+                    thinking_pending_idle: &mut thinking_pending_idle,
+                    thinking_started_at: &mut thinking_started_at,
+                    expanded_tool_idxs: &mut expanded_tool_idxs,
+                    expanded_thinking_idxs: &mut expanded_thinking_idxs,
+                    scroll: &mut scroll,
+                    follow_bottom: &mut follow_bottom,
+                    context_compact_prompt_text: &context_compact_prompt_text,
+                    token_totals: &mut token_totals,
+                    token_total_path: &token_total_path,
+                    active_request_in_tokens: &mut active_request_in_tokens,
+                    dog_client: &dog_client,
+                    main_client: &main_client,
+                })?;
                 needs_redraw = true;
+                continue;
             }
         }
 
@@ -8989,7 +10204,7 @@ fn run_loop(
             // DeepSeek 对 system 消息位置/排序比较敏感（容易触发 400: Invalid consecutive assistant message）。
             // 心跳作为一次“用户事件”，用 user 消息注入到对话上下文：assistant -> user(heartbeat) -> assistant(reply)。
             let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
-            let hb_user = crate::mcp_messages::render_heartbeat_user(&mcp_messages, &stamp);
+            let hb_user = crate::messages::render_heartbeat_user(&mcp_messages, &stamp);
             let _ = main_state.push_user(&hb_user, ctx_limit);
             if let Some(in_tokens) = try_start_main_heartbeat(TryStartMainHeartbeatArgs {
                 main_client: &main_client,
@@ -9027,10 +10242,17 @@ fn run_loop(
             }
         }
 
-        // PTY 自动审计（可选）：默认关闭，避免在用户未要求时触发额外的 read_file/BASH 调用造成资源浪费。
+        // PTY 自动审计（可选）：默认关闭，避免在用户未要求时触发额外的 BASH 调用造成资源浪费。
         if sys_cfg.pty_audit_enabled {
-            // PTY 定时审计（每 5 分钟）：以“额外系统消息”注入，让模型按需 read_file 读取 status/log。
+            // PTY 定时审计（每 10 分钟）：以“额外系统消息”注入，让模型按需读取 status/log。
             // 说明：不与用户请求并发；若当前忙，则延后。
+            let running_total_now = pty_tabs.len();
+            // 只要“PTY 总数增加”（新任务启动），就重置一次审计计时：确保“本次启动的 PTY”
+            // 至少运行满间隔才会触发首轮审计。
+            if running_total_now > last_pty_running_total && running_total_now > 0 {
+                next_pty_audit_at = Some(now + Duration::from_secs(PTY_AUDIT_INTERVAL_SECS));
+            }
+            last_pty_running_total = running_total_now;
             let pty_info = if !pty_tabs.is_empty() {
                 let idx = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
                 let state = &pty_tabs[idx];
@@ -9053,6 +10275,8 @@ fn run_loop(
             if let (Some((owner, job_id, cmd, status_path, log_path)), Some(next_at)) =
                 (pty_info, next_pty_audit_at)
                 && now >= next_at
+                // 若用户正在看终端或正在交互，则不打扰：只在“后台运行”时审计更符合预期。
+                && !pty_view
                 && send_queue_len(&send_queue_high, &send_queue_low) == 0
                 && can_inject_heartbeat(
                     mode,
@@ -9062,6 +10286,11 @@ fn run_loop(
                     &active_tool_stream,
                 )
             {
+                let running_total = pty_tabs.len();
+                let running_owner = pty_tabs.iter().filter(|s| s.owner == owner).count();
+                let status_tail =
+                    tail_preview_text(&status_path, 24_000, 40, 2200);
+                let log_tail = tail_preview_text(&log_path, 48_000, 28, 2400);
                 let prompt = render_pty_audit_prompt(
                     &pty_audit_prompt_text,
                     owner,
@@ -9069,6 +10298,10 @@ fn run_loop(
                     &cmd,
                     &status_path,
                     &log_path,
+                    running_total,
+                    running_owner,
+                    &status_tail,
+                    &log_tail,
                 );
                 let (client_ref, state_ref) = if matches!(owner, MindKind::Sub) {
                     (&dog_client, &dog_state)
@@ -9109,10 +10342,11 @@ fn run_loop(
             }
         } else {
             next_pty_audit_at = None;
+            last_pty_running_total = 0;
         }
         let menu_items = if screen == Screen::Chat
             && !command_menu_suppress
-            && mode == Mode::Idle
+            && is_idle_like(mode)
             && !(pty_view && !pty_tabs.is_empty())
         {
             filter_commands_for_input(&input, sse_enabled, chat_target)
@@ -9271,7 +10505,9 @@ fn run_loop(
                 SettingsFocus::Fields => {
                     if let Some(kind) = selected_kind {
                         match kind {
-                            SettingsFieldKind::Provider | SettingsFieldKind::Model => {
+                            SettingsFieldKind::Provider
+                            | SettingsFieldKind::Model
+                            | SettingsFieldKind::ReasoningEffort => {
                                 format!("{} (Enter)", settings_field_hint(settings_section, kind))
                             }
                             SettingsFieldKind::SseEnabled
@@ -9390,29 +10626,27 @@ fn run_loop(
         } else {
             ("思考".to_string(), String::new())
         };
-        let guard_active = paste_guard_until.is_some_and(|t| now < t);
-        if !guard_active {
-            let finalize = finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-                force: false,
-                now,
-                config: &config,
-                paste_capture: &mut paste_capture,
-                input: &mut input,
-                cursor: &mut cursor,
-                input_chars: &mut input_chars,
-                pending_pastes: &mut pending_pastes,
-                toast: &mut toast,
-                max_input_chars,
-                burst_count: &mut burst_count,
-                burst_last_at: &mut burst_last_at,
-                burst_started_at: &mut burst_started_at,
-                burst_start_cursor: &mut burst_start_cursor,
-                paste_drop_until: &mut paste_drop_until,
-                paste_guard_until: &mut paste_guard_until,
-            });
-            if finalize.flushed {
-                needs_redraw = true;
-            }
+        cursor = snap_cursor_out_of_pty_snapshot_placeholder(&input, &pending_pty_snapshot, cursor);
+        let finalize = finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+            force: false,
+            now,
+            config: &config,
+            paste_capture: &mut paste_capture,
+            input: &mut input,
+            cursor: &mut cursor,
+            input_chars: &mut input_chars,
+            pending_pastes: &mut pending_pastes,
+            toast: &mut toast,
+            max_input_chars,
+            burst_count: &mut burst_count,
+            burst_last_at: &mut burst_last_at,
+            burst_started_at: &mut burst_started_at,
+            burst_start_cursor: &mut burst_start_cursor,
+            paste_drop_until: &mut paste_drop_until,
+            paste_guard_until: &mut paste_guard_until,
+        });
+        if finalize.flushed {
+            needs_redraw = true;
         }
         if context_usage.dirty()
             && now.saturating_duration_since(last_context_save) >= Duration::from_millis(800)
@@ -9556,16 +10790,16 @@ fn run_loop(
                 };
                 let input_inner_w = size.width.saturating_sub(2).max(1) as usize;
                 let input_lines = ui::wrapped_line_count(input_inner_w, input_text);
-                let input_lines =
-                    if pty_view && !pty_tabs.is_empty() && matches!(screen, Screen::Chat) {
-                        // PTY 视图下也保留一个“可用的输入框高度”，避免被终端挤压到只剩一行。
-                        4u16
-                    } else {
-                        input_lines.clamp(4, 10) as u16
-                    };
+                let input_lines = input_lines.clamp(4, 10) as u16;
                 let desired_input_h = input_lines;
-                let max_input_h = size.height.saturating_sub(1 + 1 + 1 + 1 + 1 + 1 + 1); // header + header-sep + chat(min1) + spacer + status + sep + ctx
+                let fixed = 1 + 1 + 1 + 1 + 1 + 1; // header + header-sep + spacer + status + sep + ctx
+                let avail = size.height.saturating_sub(fixed).max(2); // 至少给 chat+bottom 留 2 行
+                let max_input_h = avail.saturating_sub(1); // 给 chat 至少 1 行
                 let input_h = desired_input_h.min(max_input_h.max(1));
+                let pty_panel_active =
+                    matches!(screen, Screen::Chat) && pty_view && !pty_tabs.is_empty();
+                let pty_h = (avail / 2).max(6).min(max_input_h.max(1));
+                let bottom_h = if pty_panel_active { pty_h } else { input_h };
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -9575,7 +10809,7 @@ fn run_loop(
                         Constraint::Length(1),
                         Constraint::Length(1),
                         Constraint::Length(1),
-                        Constraint::Length(input_h),
+                        Constraint::Length(bottom_h),
                         Constraint::Length(1),
                     ])
                     .split(size);
@@ -9644,108 +10878,44 @@ fn run_loop(
                 );
 
                 if screen == Screen::Chat {
-                    // 交互 PTY：聊天区域临时切为“真实终端视图”，Home 可来回切换。
-                    if pty_view && !pty_tabs.is_empty() {
-                        let pty_focused = matches!(pty_focus, PtyFocus::Terminal);
-                        let border = if pty_focused {
-                            theme.border_active
-                        } else {
-                            theme.border_idle
-                        };
-                        let total = pty_tabs.len().max(1);
-                        let active0 = pty_active_idx.min(total.saturating_sub(1));
-                        let title = {
-                            let s = &pty_tabs[active0];
-                            let cmd_clean = s.cmd.trim().replace('\n', " ⏎ ").replace('\t', " ");
-                            let cmd = truncate_with_ellipsis(&cmd_clean, 36);
-                            format!(
-                                "Terminal {}/{} · job:{} · {}",
-                                active0.saturating_add(1),
-                                total,
-                                s.job_id,
-                                cmd
-                            )
-                        };
-                        let block = Block::default()
-                            .borders(Borders::ALL)
-                            .title(title)
-                            .border_style(Style::default().fg(border));
-                        let inner = block.inner(chunks[2]);
-                        let cols = inner.width.max(1);
-                        let rows = inner.height.max(1);
-                        let mut lines: Vec<Line<'static>> = Vec::new();
-                        for s in pty_tabs.iter_mut() {
-                            s.ensure_size(cols, rows);
-                        }
-                        let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
-                        if let Some(state) = pty_tabs.get_mut(active) {
-                            state.rebuild_cache();
-                            let base = Style::default().fg(theme.fg).bg(theme.bg);
-                            for l in state.screen_lines.iter() {
-                                lines.push(Line::from(vec![Span::styled(l.clone(), base)]));
-                            }
-                            f.render_widget(
-                                Paragraph::new(lines)
-                                    .style(base)
-                                    .block(block)
-                                    .scroll((0, 0)),
-                                chunks[2],
-                            );
-                            if pty_focused
-                                && state.scroll == 0
-                                && !state.parser.screen().hide_cursor()
-                            {
-                                let (cur_row, cur_col) = state.parser.screen().cursor_position();
-                                let max_col = cols.saturating_sub(1);
-                                let max_row = rows.saturating_sub(1);
-                                let cx = inner.x.saturating_add(cur_col.min(max_col));
-                                let cy = inner.y.saturating_add(cur_row.min(max_row));
-                                f.set_cursor_position((cx, cy));
-                            }
-                        }
-                        // pty 视图下不更新聊天布局缓存，避免误用选择/自动滚动逻辑。
-                        chat_width_cache = cols as usize;
-                        chat_height_cache = rows as usize;
-                        max_scroll_cache = 0;
-                    } else {
-                        let chat_width = chunks[2].width.max(1) as usize;
-                        if chat_anim_fast_forward {
-                            render_cache.prepare(chat_width, core.history.len());
-                            render_cache.fast_forward_all_animations_to_tail(&core);
-                            chat_anim_fast_forward = false;
-                        }
-                        let layout = ui::build_chat_layout(ui::BuildChatLinesArgs {
-                            theme: &theme,
-                            core: &core,
-                            render_cache: &mut render_cache,
-                            width: chat_width,
-                            streaming_idx: streaming_state.idx,
-                            reveal_idx,
-                            reveal_len,
-                            tick: spinner_tick,
-                            selected_msg_idx,
-                            expanded_tool_idxs: &expanded_tool_idxs,
-                            expanded_user_idxs: &expanded_user_idxs,
-                            thinking_idx,
-                            expanded_thinking_idxs: &expanded_thinking_idxs,
-                            details_mode,
-                            streaming_enabled: sse_enabled,
-                            pulse_idx,
-                            pulse_style,
-                        });
-                        msg_line_ranges_cache = layout.msg_line_ranges;
-                        let chat_lines = layout.lines;
-                        chat_width_cache = chat_width;
-                        let chat_height = chunks[2].height.max(1) as usize;
-                        chat_height_cache = chat_height;
-                        let total_lines = chat_lines.len();
-                        let max_scroll = total_lines.saturating_sub(chat_height) as u16;
-                        max_scroll_cache = max_scroll as usize;
-                        if follow_bottom || scroll > max_scroll {
-                            scroll = max_scroll;
-                        }
-                        ui::draw_chat(f, &theme, chunks[2], chat_lines, scroll);
+                    // Chat 始终可见：PTY 仅占用底部面板（半屏），不再“整块替换聊天区”。
+                    let chat_width = chunks[2].width.max(1) as usize;
+                    if chat_anim_fast_forward {
+                        render_cache.prepare(chat_width, core.history.len());
+                        render_cache.fast_forward_all_animations_to_tail(&core);
+                        chat_anim_fast_forward = false;
                     }
+                    let layout = ui::build_chat_layout(ui::BuildChatLinesArgs {
+                        theme: &theme,
+                        core: &core,
+                        render_cache: &mut render_cache,
+                        width: chat_width,
+                        streaming_idx: streaming_state.idx,
+                        reveal_idx,
+                        reveal_len,
+                        tick: spinner_tick,
+                        selected_msg_idx,
+                        expanded_tool_idxs: &expanded_tool_idxs,
+                        expanded_user_idxs: &expanded_user_idxs,
+                        thinking_idx,
+                        expanded_thinking_idxs: &expanded_thinking_idxs,
+                        details_mode,
+                        streaming_enabled: sse_enabled,
+                        pulse_idx,
+                        pulse_style,
+                    });
+                    msg_line_ranges_cache = layout.msg_line_ranges;
+                    let chat_lines = layout.lines;
+                    chat_width_cache = chat_width;
+                    let chat_height = chunks[2].height.max(1) as usize;
+                    chat_height_cache = chat_height;
+                    let total_lines = chat_lines.len();
+                    let max_scroll = total_lines.saturating_sub(chat_height) as u16;
+                    max_scroll_cache = max_scroll as usize;
+                    if follow_bottom || scroll > max_scroll {
+                        scroll = max_scroll;
+                    }
+                    ui::draw_chat(f, &theme, chunks[2], chat_lines, scroll);
 
                     ui::draw_hint_line(
                         f,
@@ -9812,19 +10982,74 @@ fn run_loop(
                         hint: "",
                     },
                 );
-                ui::draw_input(
-                    f,
-                    ui::DrawInputArgs {
-                        theme: &theme,
-                        area: chunks[6],
-                        input: input_text,
-                        cursor: input_cursor,
-                        focused: matches!(screen, Screen::Chat)
-                            && !(pty_view
-                                && !pty_tabs.is_empty()
-                                && matches!(pty_focus, PtyFocus::Terminal)),
-                    },
-                );
+                if matches!(screen, Screen::Chat) && pty_panel_active {
+                    let pty_focused = matches!(pty_focus, PtyFocus::Terminal);
+                    let border = if pty_focused {
+                        theme.border_active
+                    } else {
+                        theme.border_idle
+                    };
+                    let total = pty_tabs.len().max(1);
+                    let active0 = pty_active_idx.min(total.saturating_sub(1));
+                    let title = {
+                        let s = &pty_tabs[active0];
+                        let cmd_clean = s.cmd.trim().replace('\n', " ⏎ ").replace('\t', " ");
+                        let cmd = truncate_with_ellipsis(&cmd_clean, 36);
+                        format!(
+                            "Terminal {}/{} · job:{} · {}",
+                            active0.saturating_add(1),
+                            total,
+                            s.job_id,
+                            cmd
+                        )
+                    };
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(Style::default().fg(border));
+                    let inner = block.inner(chunks[6]);
+                    let cols = inner.width.max(1);
+                    let rows = inner.height.max(1);
+                    let mut lines: Vec<Line<'static>> = Vec::new();
+                    for s in pty_tabs.iter_mut() {
+                        s.ensure_size(cols, rows);
+                    }
+                    let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
+                    if let Some(state) = pty_tabs.get_mut(active) {
+                        state.rebuild_cache();
+                        let base = Style::default().fg(theme.fg).bg(theme.bg);
+                        for l in state.screen_lines.iter() {
+                            lines.push(Line::from(vec![Span::styled(l.clone(), base)]));
+                        }
+                        f.render_widget(
+                            Paragraph::new(lines)
+                                .style(base)
+                                .block(block)
+                                .scroll((0, 0)),
+                            chunks[6],
+                        );
+                        if pty_focused && state.scroll == 0 && !state.parser.screen().hide_cursor()
+                        {
+                            let (cur_row, cur_col) = state.parser.screen().cursor_position();
+                            let max_col = cols.saturating_sub(1);
+                            let max_row = rows.saturating_sub(1);
+                            let cx = inner.x.saturating_add(cur_col.min(max_col));
+                            let cy = inner.y.saturating_add(cur_row.min(max_row));
+                            f.set_cursor_position((cx, cy));
+                        }
+                    }
+                } else {
+                    ui::draw_input(
+                        f,
+                        ui::DrawInputArgs {
+                            theme: &theme,
+                            area: chunks[6],
+                            input: input_text,
+                            cursor: input_cursor,
+                            focused: matches!(screen, Screen::Chat),
+                        },
+                    );
+                }
                 if let Some(pos) = settings_draw.cursor {
                     f.set_cursor_position(pos);
                 }
@@ -10068,16 +11293,52 @@ fn run_loop(
                                     if matches!(spec.kind, SettingsFieldKind::Model) {
                                         let provider =
                                             selected_provider(section, &dog_cfg, &main_cfg);
-                                        if provider != "deepseek" {
+                                        let current = selected_model(section, &dog_cfg, &main_cfg);
+                                        let next = next_model(&current, &provider);
+                                        apply_settings_with_notice(ApplySettingsWithNoticeArgs {
+                                            kind: spec.kind,
+                                            section,
+                                            value: &next,
+                                            settings: &mut settings,
+                                            now,
+                                            dog_cfg: &mut dog_cfg,
+                                            main_cfg: &mut main_cfg,
+                                            sys_cfg: &mut sys_cfg,
+                                            dog_cfg_path: &dog_cfg_path,
+                                            main_cfg_path: &main_cfg_path,
+                                            sys_cfg_path: &sys_cfg_path,
+                                            dog_state: &mut dog_state,
+                                            main_state: &mut main_state,
+                                            mind_ctx_idx_main: &mut mind_ctx_idx_main,
+                                            mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                            main_prompt_text: &mut main_prompt_text,
+                                            context_compact_prompt_text:
+                                                &mut context_compact_prompt_text,
+                                            dog_client: &mut dog_client,
+                                            main_client: &mut main_client,
+                                            sys_log: &mut sys_log,
+                                            sys_log_limit: config.sys_log_limit,
+                                            context_prompts: &mut context_prompts,
+                                            context_prompt_path: &context_prompt_path,
+                                            context_compact_prompt_path:
+                                                &context_compact_prompt_path,
+                                        });
+                                        continue;
+                                    }
+                                    if matches!(spec.kind, SettingsFieldKind::ReasoningEffort) {
+                                        let provider =
+                                            selected_provider(section, &dog_cfg, &main_cfg);
+                                        if !api::capabilities(&provider).supports_reasoning_effort {
                                             set_settings_notice(
                                                 &mut settings,
                                                 now,
-                                                "当前供应商暂无模型".to_string(),
+                                                "当前供应商不使用 Reasoning".to_string(),
                                             );
                                             continue;
                                         }
-                                        let current = selected_model(section, &dog_cfg, &main_cfg);
-                                        let next = next_model(&current, section);
+                                        let current =
+                                            selected_reasoning_effort(section, &dog_cfg, &main_cfg);
+                                        let next = next_reasoning_effort(&current);
                                         apply_settings_with_notice(ApplySettingsWithNoticeArgs {
                                             kind: spec.kind,
                                             section,
@@ -10170,7 +11431,7 @@ fn run_loop(
                                             &mut chat_target,
                                         );
                                         if matches!(spec.kind, SettingsFieldKind::ChatTarget)
-                                            && matches!(mode, Mode::Idle)
+                                            && is_idle_like(mode)
                                         {
                                             active_kind = chat_target;
                                         }
@@ -10450,41 +11711,46 @@ fn run_loop(
                     if !matches!(key.code, KeyCode::Esc) {
                         last_esc_at = None;
                     }
-                    // PgUp/PgDn：快速切换终端 tab（焦点切换）。
-                    // 约束：只占用无修饰键；Ctrl/Alt+PgUp/PgDn 等仍可透传给终端内程序。
-                    if !ctrl && !alt && matches!(key.code, KeyCode::PageUp) {
-                        let n = pty_tabs.len();
-                        if n > 0 {
-                            pty_active_idx = if pty_active_idx == 0 {
-                                n - 1
-                            } else {
-                                pty_active_idx - 1
-                            };
+                    // PgUp/PgDn：焦点/Tab 切换（仅占用无修饰键）。
+                    // 策略：把“每个终端 tab + Chat”视为一个环，PgUp/PgDn 在环上移动。
+                    // 这样既能切 tab，也能把焦点切到 Chat，让 ↑↓ 滚动历史消息。
+                    if !ctrl
+                        && !alt
+                        && (matches!(key.code, KeyCode::PageUp)
+                            || matches!(key.code, KeyCode::PageDown))
+                    {
+                        let n = pty_tabs.len().max(1);
+                        let ring = n.saturating_add(1); // + Chat
+                        let mut idx = match pty_focus {
+                            PtyFocus::Chat => n,
+                            PtyFocus::Terminal => pty_active_idx.min(n.saturating_sub(1)),
+                        };
+                        if matches!(key.code, KeyCode::PageDown) {
+                            idx = (idx + 1) % ring;
+                        } else {
+                            idx = (idx + ring - 1) % ring;
+                        }
+                        if idx >= n {
+                            pty_focus = PtyFocus::Chat;
+                        } else {
+                            pty_focus = PtyFocus::Terminal;
+                            pty_active_idx = idx;
                         }
                         last_esc_at = None;
                         runlog_event(
                             "INFO",
-                            "pty.ui.tab",
-                            json!({"action":"prev","active_idx":pty_active_idx,"tabs":n}),
-                        );
-                        continue;
-                    }
-                    if !ctrl && !alt && matches!(key.code, KeyCode::PageDown) {
-                        let n = pty_tabs.len();
-                        if n > 0 {
-                            pty_active_idx = (pty_active_idx + 1) % n;
-                        }
-                        last_esc_at = None;
-                        runlog_event(
-                            "INFO",
-                            "pty.ui.tab",
-                            json!({"action":"next","active_idx":pty_active_idx,"tabs":n}),
+                            "pty.ui.focus",
+                            json!({"focus":format!("{pty_focus:?}"),"active_idx":pty_active_idx,"tabs":n}),
                         );
                         continue;
                     }
                     // 终端内程序常用 Esc（vim/less/cancel 等），因此默认透传 Esc；
                     // 若用户快速连按两次 Esc，则将第二次视为“结束当前终端任务”（终止 PTY）。
-                    if !ctrl && !alt && matches!(key.code, KeyCode::Esc) {
+                    if matches!(pty_focus, PtyFocus::Terminal)
+                        && !ctrl
+                        && !alt
+                        && matches!(key.code, KeyCode::Esc)
+                    {
                         const DOUBLE_ESC_MS: u64 = 350;
                         if let Some(t0) = last_esc_at
                             && now.saturating_duration_since(t0)
@@ -10507,6 +11773,7 @@ fn run_loop(
                                 pty_active_idx =
                                     pty_active_idx.min(pty_tabs.len().saturating_sub(1));
                             }
+	                            // 不向模型注入 PTY 索引：避免“启动/终止 PTY”造成额外上下文噪声。
                             push_sys_log(
                                 &mut sys_log,
                                 config.sys_log_limit,
@@ -10520,10 +11787,10 @@ fn run_loop(
                                 "pty.ui.kill",
                                 json!({"via":"double_esc","job_id":killed_job_id.unwrap_or(0)}),
                             );
-                            if let Some((snap_job_id, snap_block)) = pending_pty_snapshot.take() {
-                                if Some(snap_job_id) == killed_job_id {
-                                    if let Some(pos) = input.find(&snap_block) {
-                                        input.replace_range(pos..pos + snap_block.len(), "");
+                            if let Some(snap) = pending_pty_snapshot.take() {
+                                if Some(snap.job_id) == killed_job_id {
+                                    if let Some(pos) = input.find(snap.placeholder.as_str()) {
+                                        input.replace_range(pos..pos + snap.placeholder.len(), "");
                                         cursor = cursor.min(input.len());
                                         input_chars = count_chars(&input);
                                         if input.is_empty() {
@@ -10531,7 +11798,7 @@ fn run_loop(
                                         }
                                     }
                                 } else {
-                                    pending_pty_snapshot = Some((snap_job_id, snap_block));
+                                    pending_pty_snapshot = Some(snap);
                                 }
                             }
                             last_esc_at = None;
@@ -10546,7 +11813,11 @@ fn run_loop(
                         runlog_event("INFO", "pty.ui.home", json!({"action":"hide"}));
                         continue;
                     }
-                    if alt && !ctrl && matches!(key.code, KeyCode::Up) {
+                    if matches!(pty_focus, PtyFocus::Terminal)
+                        && alt
+                        && !ctrl
+                        && matches!(key.code, KeyCode::Up)
+                    {
                         let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
                         if let Some(state) = pty_tabs.get_mut(active) {
                             let snap_plain = state.snapshot_plain();
@@ -10559,21 +11830,22 @@ fn run_loop(
 
                             // Alt+↑：把快照“暂存到聊天输入框”，由用户决定是否发送给 AI。
                             // 若上一次快照仍未发送且仍在输入框中，则先移除旧快照块，避免堆叠。
-                            if let Some((_old_job_id, old_block)) = pending_pty_snapshot.take() {
-                                if let Some(pos) = input.find(&old_block) {
-                                    input.replace_range(pos..pos + old_block.len(), "");
+                            if let Some(old) = pending_pty_snapshot.take() {
+                                if let Some(pos) = input.find(old.placeholder.as_str()) {
+                                    input.replace_range(pos..pos + old.placeholder.len(), "");
                                 }
                             }
 
-                            let block = format!(
-                                "[PTY SNAPSHOT job_id:{}]\n```text\n{}\n```\n",
-                                state.job_id, snap
-                            );
-                            pending_pty_snapshot = Some((state.job_id, block.clone()));
+                            pending_pty_snapshot = Some(PendingPtySnapshot {
+                                job_id: state.job_id,
+                                placeholder: USER_PTY_SNAPSHOT_PLACEHOLDER.to_string(),
+                                content: snap.clone(),
+                            });
                             if !input.is_empty() && input.as_bytes().last().copied() != Some(10) {
                                 input.push(10 as char);
                             }
-                            input.push_str(&block);
+                            input.push_str(USER_PTY_SNAPSHOT_PLACEHOLDER);
+                            input.push(10 as char);
                             cursor = input.len();
                             input_chars = count_chars(&input);
                             last_input_at = Some(now);
@@ -10585,16 +11857,33 @@ fn run_loop(
                         }
                         continue;
                     }
-                    let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
-                    if let Some(state) = pty_tabs.get_mut(active) {
-                        if let Some(bytes) = key_to_pty_bytes(key.code, key.modifiers) {
-                            state.record_input_bytes(&bytes);
-                            if let Some(tx_in) = pty_handles.get(&state.job_id) {
-                                let _ = tx_in.send(PtyControl::Input(bytes));
+                    // Chat 焦点时：不拦截其它按键，让聊天滚动/其它快捷键继续工作。
+                    if matches!(pty_focus, PtyFocus::Chat) {
+                        // 终端面板展开时，输入框不显示：避免“键入字符却写进隐藏的 input”。
+                        // Chat 焦点仅用于滚动/查看历史消息，因此拦截所有会修改 input 的按键。
+                        if matches!(
+                            key.code,
+                            KeyCode::Char(_)
+                                | KeyCode::Enter
+                                | KeyCode::Backspace
+                                | KeyCode::Delete
+                                | KeyCode::Tab
+                        ) {
+                            continue;
+                        }
+                        // fallthrough：↑↓/←→ 等仍由下方聊天逻辑处理
+                    } else {
+                        let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
+                        if let Some(state) = pty_tabs.get_mut(active) {
+                            if let Some(bytes) = key_to_pty_bytes(key.code, key.modifiers) {
+                                state.record_input_bytes(&bytes);
+                                if let Some(tx_in) = pty_handles.get(&state.job_id) {
+                                    let _ = tx_in.send(PtyControl::Input(bytes));
+                                }
                             }
                         }
+                        continue;
                     }
-                    continue;
                 }
                 // 交互 PTY 存在但未显示：Home 快速切回终端视图。
                 if matches!(screen, Screen::Chat)
@@ -10773,7 +12062,7 @@ fn run_loop(
                 if alt
                     && matches!(key.code, KeyCode::Down)
                     && input.trim().is_empty()
-                    && matches!(mode, Mode::Idle)
+                    && is_idle_like(mode)
                     && let Some(sel) = selected_msg_idx
                     && let Some(msg) = core.history.get(sel)
                 {
@@ -10792,7 +12081,7 @@ fn run_loop(
                     }
                     continue;
                 }
-                if mode == Mode::Idle && menu_open && !ctrl {
+                if is_idle_like(mode) && menu_open && !ctrl {
                     let items_now = filter_commands_for_input(&input, sse_enabled, chat_target);
                     if !items_now.is_empty() && command_menu_selected >= items_now.len() {
                         command_menu_selected = items_now.len().saturating_sub(1);
@@ -11079,9 +12368,8 @@ fn run_loop(
                                 if msg.role == Role::Tool {
                                     expanded_tool_idxs.insert(idx);
                                     let head = msg.text.trim_start();
-                                    let lower = head.to_ascii_lowercase();
-                                    let is_think = lower.starts_with("操作: think")
-                                        || lower.starts_with("[tool:think]");
+                                    let prefix = head.get(..THINK_TOOL_MARKER.len()).unwrap_or("");
+                                    let is_think = prefix.eq_ignore_ascii_case(THINK_TOOL_MARKER);
                                     if is_think {
                                         expanded_thinking_idxs.insert(idx);
                                     }
@@ -11304,6 +12592,16 @@ fn run_loop(
                             command_menu_suppress = false;
                             continue;
                         }
+                        if try_remove_pty_snapshot_placeholder_at_cursor(
+                            &mut input,
+                            &mut cursor,
+                            &mut input_chars,
+                            &mut pending_pty_snapshot,
+                            PlaceholderRemove::Backspace,
+                        ) {
+                            command_menu_suppress = false;
+                            continue;
+                        }
                         if cursor > 0 {
                             let prev = prev_char_boundary(&input, cursor);
                             let removed_chars =
@@ -11314,6 +12612,7 @@ fn run_loop(
                             command_menu_suppress = false;
                         }
                         prune_pending_pastes(&input, &mut pending_pastes);
+                        prune_pending_pty_snapshot(&input, &mut pending_pty_snapshot);
                     }
                     KeyCode::Delete => {
                         last_input_at = Some(now);
@@ -11345,6 +12644,16 @@ fn run_loop(
                             command_menu_suppress = false;
                             continue;
                         }
+                        if try_remove_pty_snapshot_placeholder_at_cursor(
+                            &mut input,
+                            &mut cursor,
+                            &mut input_chars,
+                            &mut pending_pty_snapshot,
+                            PlaceholderRemove::Delete,
+                        ) {
+                            command_menu_suppress = false;
+                            continue;
+                        }
                         if cursor < input.len() {
                             let next = next_char_boundary(&input, cursor);
                             let removed_chars =
@@ -11354,11 +12663,12 @@ fn run_loop(
                             command_menu_suppress = false;
                         }
                         prune_pending_pastes(&input, &mut pending_pastes);
+                        prune_pending_pty_snapshot(&input, &mut pending_pty_snapshot);
                     }
                     KeyCode::Enter => {
                         if !ctrl
                             && input.trim().is_empty()
-                            && matches!(mode, Mode::Idle)
+                            && is_idle_like(mode)
                             && let Some(sel) = selected_msg_idx
                             && let Some(msg) = core.history.get(sel)
                         {
@@ -11402,6 +12712,7 @@ fn run_loop(
                                 cursor: &mut cursor,
                                 input_chars: &mut input_chars,
                                 pending_pastes: &mut pending_pastes,
+                                pending_pty_snapshot: &mut pending_pty_snapshot,
                                 toast: &mut toast,
                                 max_input_chars,
                                 command_menu_suppress: Some(&mut command_menu_suppress),
@@ -11462,6 +12773,7 @@ fn run_loop(
                                 cursor: &mut cursor,
                                 input_chars: &mut input_chars,
                                 pending_pastes: &mut pending_pastes,
+                                pending_pty_snapshot: &mut pending_pty_snapshot,
                                 toast: &mut toast,
                                 max_input_chars,
                                 command_menu_suppress: None,
@@ -11510,21 +12822,22 @@ fn run_loop(
                                         push_sys_log(
                                             &mut sys_log,
                                             config.sys_log_limit,
-                                            "工具确认：用户已允许执行",
+                                            mcp_messages.tool_confirm_user_allowed.clone(),
                                         );
                                         match active_kind {
-                                            MindKind::Sub => {
-                                                dog_state.push_tool("工具确认：用户已允许执行")
-                                            }
-                                            MindKind::Main => {
-                                                main_state.push_tool("工具确认：用户已允许执行")
-                                            }
+                                            MindKind::Sub => dog_state.push_tool(
+                                                mcp_messages.tool_confirm_user_allowed.as_str(),
+                                            ),
+                                            MindKind::Main => main_state.push_tool(
+                                                mcp_messages.tool_confirm_user_allowed.as_str(),
+                                            ),
                                         }
                                         spawn_tool_execution(
                                             call,
                                             active_kind,
                                             tx.clone(),
                                             pty_started_notice_prompt_text.clone(),
+                                            pty_messages.pty_started_model_note.clone(),
                                         );
                                         mode = Mode::ExecutingTool;
                                     } else {
@@ -11537,94 +12850,24 @@ fn run_loop(
                                         push_sys_log(
                                             &mut sys_log,
                                             config.sys_log_limit,
-                                            "工具确认：用户拒绝执行（等待下一条指令）",
+                                            mcp_messages.tool_confirm_user_denied.clone(),
                                         );
                                         match active_kind {
                                             MindKind::Sub => dog_state.push_tool(
-                                                "工具确认：用户拒绝执行，请等待下一条指令",
+                                                mcp_messages.tool_confirm_user_denied.as_str(),
                                             ),
                                             MindKind::Main => main_state.push_tool(
-                                                "工具确认：用户拒绝执行，请等待下一条指令",
+                                                mcp_messages.tool_confirm_user_denied.as_str(),
                                             ),
                                         }
+                                        // 用户拒绝工具执行：停止后续工具链，交由模型在后续对话中解释并礼貌询问原因。
+                                        pending_tools.clear();
                                         mode = Mode::Idle;
-                                        let has_next = try_start_next_tool(TryStartNextToolArgs {
-                                            pending_tools: &mut pending_tools,
-                                            pending_tool_confirm: &mut pending_tool_confirm,
-                                            tx: tx.clone(),
-                                            core: &mut core,
-                                            meta: &mut metamemo,
-                                            context_usage: &mut context_usage,
-                                            mode: &mut mode,
-                                            sys_log: &mut sys_log,
-                                            sys_log_limit: config.sys_log_limit,
-                                            sys_cfg: &sys_cfg,
-                                            owner: active_kind,
-                                            mcp_messages: &mcp_messages,
-                                            pty_started_notice_prompt_text:
-                                                &pty_started_notice_prompt_text,
-                                        });
-                                        if !has_next && matches!(active_kind, MindKind::Sub) {
-                                            if let Some(in_tokens) = try_start_dog_generation(
-                                                TryStartDogGenerationArgs {
-                                                    kind: MindKind::Sub,
-                                                    dog_client: &dog_client,
-                                                    dog_state: &dog_state,
-                                                    extra_system: None,
-                                                    tx: &tx,
-                                                    config: &config,
-                                                    mode: &mut mode,
-                                                    active_kind: &mut active_kind,
-                                                    sending_until: &mut sending_until,
-                                                    sys_log: &mut sys_log,
-                                                    sys_log_limit: config.sys_log_limit,
-                                                    streaming_state: &mut streaming_state,
-                                                    request_seq: &mut request_seq,
-                                                    active_request_id: &mut active_request_id,
-                                                    active_cancel: &mut active_cancel,
-                                                    sse_enabled,
-                                                },
-                                            ) {
-                                                record_request_in_tokens(
-                                                    &mut core,
-                                                    &mut token_totals,
-                                                    &token_total_path,
-                                                    &context_usage,
-                                                    &mut active_request_in_tokens,
-                                                    in_tokens,
-                                                );
-                                            }
-                                        } else if !has_next
-                                            && matches!(active_kind, MindKind::Main)
-                                            && let Some(in_tokens) = try_start_main_generation(
-                                                TryStartMainGenerationArgs {
-                                                    main_client: &main_client,
-                                                    main_state: &main_state,
-                                                    extra_system: None,
-                                                    tx: &tx,
-                                                    config: &config,
-                                                    mode: &mut mode,
-                                                    active_kind: &mut active_kind,
-                                                    sending_until: &mut sending_until,
-                                                    sys_log: &mut sys_log,
-                                                    sys_log_limit: config.sys_log_limit,
-                                                    streaming_state: &mut streaming_state,
-                                                    request_seq: &mut request_seq,
-                                                    active_request_id: &mut active_request_id,
-                                                    active_cancel: &mut active_cancel,
-                                                    sse_enabled,
-                                                },
-                                            )
-                                        {
-                                            record_request_in_tokens(
-                                                &mut core,
-                                                &mut token_totals,
-                                                &token_total_path,
-                                                &context_usage,
-                                                &mut active_request_in_tokens,
-                                                in_tokens,
-                                            );
-                                        }
+                                        push_sys_log(
+                                            &mut sys_log,
+                                            config.sys_log_limit,
+                                            "工具被拒绝",
+                                        );
                                     }
                                 } else {
                                     mode = Mode::Idle;
@@ -11638,7 +12881,7 @@ fn run_loop(
                                     "请输入 yes 或 no",
                                 );
                             }
-                        } else if mode == Mode::Idle {
+                        } else if is_idle_like(mode) {
                             let context_used = context_usage.tokens();
                             let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
                             let ctx_pct = calc_pct(context_used, ctx_limit);
@@ -11755,8 +12998,10 @@ fn run_loop(
                                 || looks_like_paste
                                 || multi_line_guard
                                 || guard_active;
+                            // 强制发送快捷键：Alt+Enter
                             let force_send = alt && !ctrl;
                             if paste_context && !force_send {
+                                // 粘贴期间：Enter 一律视为换行（不发送），避免把注入的 Enter 误当作“提交”。
                                 last_input_at = Some(now);
                                 paste_guard_until =
                                     Some(now + Duration::from_millis(config.paste_send_inhibit_ms));
@@ -11766,6 +13011,7 @@ fn run_loop(
                                     cursor: &mut cursor,
                                     input_chars: &mut input_chars,
                                     pending_pastes: &mut pending_pastes,
+                                    pending_pty_snapshot: &mut pending_pty_snapshot,
                                     toast: &mut toast,
                                     max_input_chars,
                                     command_menu_suppress: None,
@@ -11934,8 +13180,15 @@ fn run_loop(
                         if let Some(c) = paste_capture.as_mut() {
                             cursor =
                                 snap_cursor_out_of_placeholder(&input, &pending_pastes, cursor);
+                            cursor = snap_cursor_out_of_pty_snapshot_placeholder(
+                                &input,
+                                &pending_pty_snapshot,
+                                cursor,
+                            );
                             c.buf.push(ch);
                             c.last_at = now;
+                            paste_guard_until =
+                                Some(now + Duration::from_millis(config.paste_send_inhibit_ms));
                             if flush_paste_capture_if_overflow(FlushPasteCaptureOverflowArgs {
                                 now,
                                 config: &config,
@@ -11968,6 +13221,7 @@ fn run_loop(
                                 cursor: &mut cursor,
                                 input_chars: &mut input_chars,
                                 pending_pastes: &mut pending_pastes,
+                                pending_pty_snapshot: &mut pending_pty_snapshot,
                                 toast: &mut toast,
                                 max_input_chars,
                                 burst_count: &mut burst_count,
@@ -12035,18 +13289,18 @@ fn run_loop(
                         paste_guard_until: &mut paste_guard_until,
                     });
                     continue;
+                } else {
+                    paste_capture = Some(PasteCapture {
+                        last_at: now,
+                        buf: pasted,
+                    });
+                    reset_paste_burst(
+                        &mut burst_count,
+                        &mut burst_last_at,
+                        &mut burst_started_at,
+                        &mut burst_start_cursor,
+                    );
                 }
-
-                paste_capture = Some(PasteCapture {
-                    last_at: now,
-                    buf: pasted,
-                });
-                reset_paste_burst(
-                    &mut burst_count,
-                    &mut burst_last_at,
-                    &mut burst_started_at,
-                    &mut burst_start_cursor,
-                );
                 flush_paste_capture_if_overflow(FlushPasteCaptureOverflowArgs {
                     now,
                     config: &config,
@@ -12096,10 +13350,10 @@ struct DrainAsyncEventsArgs<'a> {
     pty_tabs: &'a mut Vec<PtyUiState>,
     pty_active_idx: &'a mut usize,
     pty_handles: &'a mut HashMap<u64, mpsc::Sender<PtyControl>>,
-    pty_view: &'a mut bool,
-    pty_done_batches: &'a mut PtyDoneBatches,
-    pty_done_followups: &'a mut VecDeque<PtyDoneFollowup>,
-    mode: &'a mut Mode,
+	pty_view: &'a mut bool,
+	pty_done_batches: &'a mut PtyDoneBatches,
+	pty_done_followups: &'a mut VecDeque<PtyDoneFollowup>,
+	mode: &'a mut Mode,
     scroll: &'a mut u16,
     follow_bottom: &'a mut bool,
     active_kind: &'a mut MindKind,
@@ -12140,7 +13394,7 @@ struct DrainAsyncEventsArgs<'a> {
     cursor: &'a mut usize,
     input_chars: &'a mut usize,
     last_input_at: &'a mut Option<Instant>,
-    pending_pty_snapshot: &'a mut Option<(u64, String)>,
+    pending_pty_snapshot: &'a mut Option<PendingPtySnapshot>,
     active_request_is_mind: &'a mut bool,
     active_request_is_fastmemo_compact: &'a mut bool,
     streaming_state: &'a mut StreamingState,
@@ -12154,6 +13408,7 @@ struct DrainAsyncEventsArgs<'a> {
     pty_help_prompt_text: &'a str,
     pty_started_notice_prompt_text: &'a str,
     mcp_messages: &'a McpMessages,
+    pty_messages: &'a PtyMessages,
     auto_fastmemo_compact: &'a mut bool,
     fastmemo_compact_inflight: &'a mut bool,
     fastmemo_compact_edit_mask: &'a mut u8,
@@ -12267,8 +13522,7 @@ fn handle_model_stream_chunk(args: ModelStreamChunkArgs<'_>, content: &str, reas
 
     if sse_enabled {
         if streaming_state.tool_start.is_none()
-            && let Some(tool_name) = extract_tool_name_hint(&streaming_state.text)
-            && let Some(start) = find_tool_start(&streaming_state.text)
+            && let Some(start) = streaming_state.text.find("<tool>")
         {
             let prefix = safe_prefix(&streaming_state.text, start);
             let prefix_chars = prefix.trim().chars().count();
@@ -12285,6 +13539,8 @@ fn handle_model_stream_chunk(args: ModelStreamChunkArgs<'_>, content: &str, reas
                     if let Some(entry) = core.history.get_mut(idx) {
                         entry.role = Role::Tool;
                         // 工具 JSON 预览阶段：不显示原始 JSON，只给一个可读占位，等 ToolStreamStart 再补齐详情。
+                        let tool_name = extract_tool_name_hint(&streaming_state.text[start..])
+                            .unwrap_or_else(|| "tool".to_string());
                         let label = crate::mcp::tool_display_label(tool_name.trim());
                         entry.text = format!(
                             "操作: {label}\nexplain: 解析工具调用\ninput: ...\noutput:\n```text\n...\n```\nmeta:\n```text\n状态:parsing\n```\n"
@@ -12396,6 +13652,7 @@ struct ModelStreamEndArgs<'a> {
     fastmemo_compact_prompt_text: &'a str,
     pty_started_notice_prompt_text: &'a str,
     mcp_messages: &'a McpMessages,
+    pty_messages: &'a PtyMessages,
     auto_fastmemo_compact: &'a mut bool,
     fastmemo_compact_inflight: &'a mut bool,
     fastmemo_compact_edit_mask: &'a mut u8,
@@ -12465,6 +13722,7 @@ fn handle_model_stream_end(
         fastmemo_compact_prompt_text,
         pty_started_notice_prompt_text,
         mcp_messages,
+        pty_messages,
         auto_fastmemo_compact,
         fastmemo_compact_inflight,
         fastmemo_compact_edit_mask,
@@ -12627,7 +13885,7 @@ fn handle_model_stream_end(
                     meta,
                     context_usage,
                     Some("tool"),
-                    "工具调用格式错误：检测到 <tool>…</tool> 但未能解析执行。通常原因：JSON 中字符串未转义（例如 input 内含未转义的双引号）。建议让模型改用单引号或对 \\\" 做转义后重试。",
+                    "检测到疑似工具调用，但因格式错误并未执行。",
                 );
                 push_sys_log(sys_log, sys_log_limit, "工具 JSON 解析失败：未执行");
             }
@@ -12647,19 +13905,11 @@ fn handle_model_stream_end(
                 context_usage,
                 Some("tool"),
                 &format!(
-                    "工具调用过多：检测到 {n} 个工具调用（上限 {TOOL_CALLS_MAX_PER_ASSISTANT_MSG}）。已拒绝本轮工具执行，请拆分为多轮，每轮最多 {TOOL_CALLS_MAX_PER_ASSISTANT_MSG} 个。",
+                    "工具调用过多：本轮检测到 {n} 个（上限 {TOOL_CALLS_MAX_PER_ASSISTANT_MSG}），已拒绝执行。请拆分多轮。",
                 ),
             );
             push_sys_log(sys_log, sys_log_limit, "工具调用过多：已拒绝执行");
         }
-        let (assistant_clean, tool_echo_blocks) =
-            extract_internal_tool_echo_blocks(&assistant_text);
-        assistant_text = assistant_clean;
-        let tool_echo_msgs: Vec<String> = tool_echo_blocks
-            .into_iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|b| wrap_tool_echo_block_as_tool_message(&b))
-            .collect();
         if extracted_from_assistant && !extracted.is_empty() {
             let mut preview = tool_block_from_assistant.take().unwrap_or_else(|| {
                 extracted
@@ -12845,6 +14095,7 @@ fn handle_model_stream_end(
                 sys_cfg,
                 owner: *active_kind,
                 mcp_messages,
+                pty_messages,
                 pty_started_notice_prompt_text,
             });
         }
@@ -12862,12 +14113,6 @@ fn handle_model_stream_end(
             );
             push_sys_log(sys_log, sys_log_limit, "日记工具缺失");
         }
-        if !tool_echo_msgs.is_empty() {
-            for msg in tool_echo_msgs {
-                core.push_tool(msg);
-            }
-            jump_to_bottom(scroll, follow_bottom);
-        }
     } else {
         let raw_assistant = streaming_state.raw_text.trim_end().to_string();
         let mut assistant_text = raw_assistant.clone();
@@ -12884,14 +14129,6 @@ fn handle_model_stream_end(
         // 心跳场景：DeepSeek 偶发把“答复”放进 reasoning（thinking_full_text）而 content 为空。
         // 若本次 content 为空，则用 thinking 内容回填到正文，避免只看到心跳 banner。
         assistant_text = heartbeat_reply_text(assistant_text, thinking_full_text);
-        let (assistant_clean, tool_echo_blocks) =
-            extract_internal_tool_echo_blocks(&assistant_text);
-        assistant_text = assistant_clean;
-        let tool_echo_msgs: Vec<String> = tool_echo_blocks
-            .into_iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|b| wrap_tool_echo_block_as_tool_message(&b))
-            .collect();
         runlog_event(
             "INFO",
             "model.response.end",
@@ -12969,12 +14206,6 @@ fn handle_model_stream_end(
         if out_tokens > 0 || !assistant_text.trim().is_empty() {
             let _ = store_token_totals(token_total_path, token_totals);
         }
-        if !tool_echo_msgs.is_empty() {
-            for msg in tool_echo_msgs {
-                core.push_tool(msg);
-            }
-            jump_to_bottom(scroll, follow_bottom);
-        }
     }
     {
         let has_thinking = !thinking_full_text.trim().is_empty();
@@ -13023,7 +14254,8 @@ fn handle_model_stream_end(
     if !keep_busy && !matches!(*mode, Mode::ApprovingTool | Mode::ExecutingTool) {
         *mode = Mode::Idle;
     }
-    if let Some(target) = auto_context_compact
+    if sys_cfg.context_compact_enabled
+        && let Some(target) = auto_context_compact
         && !is_heartbeat
         && pending_tools.is_empty()
         && pending_tool_confirm.is_none()
@@ -13036,10 +14268,12 @@ fn handle_model_stream_end(
         };
         if begin_ok {
             // 刷新 fastmemo（尽量保证压缩请求包含最新摘要）。
-            let fastmemo = read_fastmemo_for_context();
-            match target {
-                MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
-                MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
+            if sys_cfg.fastmemo_inject_enabled {
+                let fastmemo = read_fastmemo_for_context();
+                match target {
+                    MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
+                    MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
+                }
             }
             push_sys_log(sys_log, sys_log_limit, "↻ Context Summary 压缩中");
             let extra_system = Some(render_context_compact_prompt(
@@ -13105,7 +14339,8 @@ fn handle_model_stream_end(
         .as_ref()
         .map(|t| Instant::now() >= *t)
         .unwrap_or(true);
-    if *auto_fastmemo_compact
+    if sys_cfg.fastmemo_compact_enabled
+        && *auto_fastmemo_compact
         && fastmemo_retry_ready
         && !*fastmemo_compact_inflight
         && !is_heartbeat
@@ -13116,8 +14351,10 @@ fn handle_model_stream_end(
     {
         if dog_client.is_some() {
             // 刷新 fastmemo（尽量保证 DOG 在压缩前看到最新内容）。
-            let fastmemo = read_fastmemo_for_context();
-            dog_state.refresh_fastmemo_system(&fastmemo);
+            if sys_cfg.fastmemo_inject_enabled {
+                let fastmemo = read_fastmemo_for_context();
+                dog_state.refresh_fastmemo_system(&fastmemo);
+            }
             push_sys_log(sys_log, sys_log_limit, "fastmemo 自动压缩中");
             *active_request_is_fastmemo_compact = true;
             let extra_system = Some(fastmemo_compact_prompt_text.to_string());
@@ -13166,10 +14403,10 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         pty_tabs,
         pty_active_idx,
         pty_handles,
-        pty_view,
-        pty_done_batches,
-        pty_done_followups,
-        mode,
+	        pty_view,
+	        pty_done_batches,
+	        pty_done_followups,
+	        mode,
         scroll,
         follow_bottom,
         active_kind,
@@ -13224,6 +14461,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         pty_help_prompt_text,
         pty_started_notice_prompt_text,
         mcp_messages,
+        pty_messages,
         auto_fastmemo_compact,
         fastmemo_compact_inflight,
         fastmemo_compact_edit_mask,
@@ -13355,6 +14593,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         fastmemo_compact_prompt_text,
                         pty_started_notice_prompt_text,
                         mcp_messages,
+                        pty_messages,
                         auto_fastmemo_compact,
                         fastmemo_compact_inflight,
                         fastmemo_compact_edit_mask,
@@ -13413,6 +14652,17 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 saved_path,
                 status_path,
             } => {
+                runlog_event(
+                    "INFO",
+                    "pty.ready",
+                    json!({
+                        "owner": mind_label(owner),
+                        "job_id": job_id,
+                        "cmd": crate::truncate_with_suffix(cmd.as_str(), 300),
+                        "log": saved_path,
+                        "status": status_path,
+                    }),
+                );
                 let cols = cols.max(1);
                 let rows = rows.max(1);
                 let was_empty = pty_tabs.is_empty();
@@ -13443,10 +14693,17 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 *pty_view = true;
                 let batch = pty_done_batches.batch_mut(owner);
                 batch.total_started = batch.total_started.saturating_add(1);
+	                // 不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
             }
             AsyncEvent::PtyOutput { job_id, bytes } => {
                 if let Some(state) = pty_tabs.iter_mut().find(|s| s.job_id == job_id) {
                     state.process_output(&bytes);
+                }
+            }
+            AsyncEvent::PtySpawned { job_id, pid, pgrp } => {
+                if let Some(state) = pty_tabs.iter_mut().find(|s| s.job_id == job_id) {
+                    state.pid = pid;
+                    state.pgrp = pgrp;
                 }
             }
             AsyncEvent::PtyJobDone {
@@ -13462,11 +14719,28 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 bytes,
                 lines,
             } => {
+                runlog_event(
+                    "INFO",
+                    "pty.done",
+                    json!({
+                        "owner": mind_label(owner),
+                        "job_id": job_id,
+                        "exit_code": exit_code,
+                        "timed_out": timed_out,
+                        "user_exit": user_exit,
+                        "elapsed_ms": elapsed_ms,
+                        "bytes": bytes,
+                        "lines": lines,
+                        "cmd": crate::truncate_with_suffix(cmd.as_str(), 300),
+                        "log": saved_path,
+                        "status": status_path,
+                    }),
+                );
                 pty_handles.remove(&job_id);
-                if let Some((snap_job_id, snap_block)) = pending_pty_snapshot.take() {
-                    if snap_job_id == job_id {
-                        if let Some(pos) = input.find(&snap_block) {
-                            input.replace_range(pos..pos + snap_block.len(), "");
+                if let Some(snap) = pending_pty_snapshot.take() {
+                    if snap.job_id == job_id {
+                        if let Some(pos) = input.find(snap.placeholder.as_str()) {
+                            input.replace_range(pos..pos + snap.placeholder.len(), "");
                             *cursor = (*cursor).min(input.len());
                             *input_chars = count_chars(input.as_str());
                             if input.is_empty() {
@@ -13474,7 +14748,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             }
                         }
                     } else {
-                        *pending_pty_snapshot = Some((snap_job_id, snap_block));
+                        *pending_pty_snapshot = Some(snap);
                     }
                 }
                 // DONE 先“缓存聚合”，避免多 tab 结束时连发多条 Tool result。
@@ -13482,7 +14756,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     // timeout 属于“结束方式”，不一定是错误：用 ok_ 前缀避免 UI 显示“执行失败：timeout”。
                     "ok_timeout".to_string()
                 } else if user_exit {
-                    "done".to_string()
+                    "user_exit".to_string()
                 } else {
                     exit_code.to_string()
                 };
@@ -13517,9 +14791,13 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     render_cache.invalidate(core.history.len().saturating_sub(1));
                 } else {
                     let jobs = batch.jobs.clone();
-                    let tool_text = format_pty_done_batch_tool_text(owner, &jobs);
+                    let full = format_pty_done_batch_tool_text_unlimited(owner, &jobs, None);
+                    let batch_saved = export_pty_done_batch_summary(owner, &full);
+                    let tool_text =
+                        format_pty_done_batch_tool_text(owner, &jobs, batch_saved.as_deref());
                     pty_done_followups.push_back(PtyDoneFollowup {
                         owner,
+                        jobs: jobs.len(),
                         tool_text,
                         pushed: false,
                     });
@@ -13538,6 +14816,221 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         *pty_active_idx = (*pty_active_idx).min(pty_tabs.len().saturating_sub(1));
                     }
                 }
+	                // 不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
+            }
+	            AsyncEvent::PtyToolRequest { owner, call } => {
+	                let op = call.op.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+	                let mut outcome = ToolOutcome {
+	                    user_message: String::new(),
+	                    log_lines: vec!["状态:0".to_string()],
+	                };
+	                let mut sys_msg = Some("工具执行完成".to_string());
+	                match op.as_str() {
+                    "list" => {
+                        let now = Instant::now();
+                        let mut items: Vec<&PtyUiState> =
+                            pty_tabs.iter().filter(|s| s.owner == owner).collect();
+                        items.sort_by_key(|s| s.job_id);
+                        let mut lines_out: Vec<String> = Vec::new();
+                        lines_out.push(format!("pty.list running={}", items.len()));
+                        for s in items {
+                            let elapsed = now.saturating_duration_since(s.started_at).as_secs();
+                            let pid = s
+                                .pid
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "(pending)".to_string());
+                            let pgrp = s
+                                .pgrp
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "(pending)".to_string());
+                            let mut cmd = s.cmd.trim().replace('\n', " ⏎ ").replace('\t', " ");
+                            cmd = truncate_with_suffix(&cmd, 72);
+                            lines_out.push(format!(
+                                "- job:{} pid:{} pgrp:{} {}s cmd:{}\n  log:{}\n  status:{}",
+                                s.job_id, pid, pgrp, elapsed, cmd, s.saved_path, s.status_path
+                            ));
+                        }
+                        outcome.user_message = lines_out.join("\n");
+                    }
+                    "kill" => {
+                        let mut job_ids: Vec<u64> = Vec::new();
+                        if let Some(id) = call.job_id.filter(|v| *v > 0) {
+                            job_ids.push(id);
+                        }
+                        if let Some(ids) = call.job_ids.as_ref() {
+                            for id in ids {
+                                if *id > 0 {
+                                    job_ids.push(*id);
+                                }
+                            }
+                        }
+                        job_ids.sort_unstable();
+                        job_ids.dedup();
+                        if job_ids.is_empty() {
+                            outcome.user_message = "pty.kill 缺少 job_id/job_ids".to_string();
+                            outcome.log_lines = vec!["状态:fail".to_string()];
+                            sys_msg = Some("工具执行失败".to_string());
+                            let _ = tx.send(AsyncEvent::ToolStreamEnd { outcome, sys_msg });
+                            continue;
+                        };
+                        let mut found = 0usize;
+                        for job_id in &job_ids {
+                            let mut hit = false;
+                            if let Some(ctrl) = pty_handles.get(job_id) {
+                                let _ = ctrl.send(PtyControl::Kill);
+                                hit = true;
+                            } else if let Some(state) =
+                                pty_tabs.iter().find(|s| &s.job_id == job_id)
+                            {
+                                let _ = state.ctrl_tx.send(PtyControl::Kill);
+                                hit = true;
+                            }
+                            if hit {
+                                found = found.saturating_add(1);
+                            }
+                            pty_handles.remove(job_id);
+                            if let Some(pos) = pty_tabs.iter().position(|s| &s.job_id == job_id) {
+                                pty_tabs.remove(pos);
+                            }
+                        }
+                        if pty_tabs.is_empty() {
+                            *pty_view = false;
+                            *pty_active_idx = 0;
+                        } else {
+                            *pty_active_idx =
+                                (*pty_active_idx).min(pty_tabs.len().saturating_sub(1));
+                        }
+	                        // 不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
+                        outcome.user_message = if job_ids.len() == 1 {
+                            let job_id = job_ids[0];
+                            if found == 1 {
+                                format!("pty.kill requested job_id={job_id}")
+                            } else {
+                                format!("pty.kill job_id={job_id} not found (ignored)")
+                            }
+                        } else {
+                            format!(
+                                "pty.kill requested jobs={:?} (found:{}/{})",
+                                job_ids,
+                                found,
+                                job_ids.len()
+                            )
+                        };
+                    }
+	                    "run" => {
+	                        let mode = call
+	                            .mode
+	                            .as_deref()
+	                            .unwrap_or("")
+	                            .trim()
+	                            .to_ascii_lowercase();
+	                        let keep_session =
+	                            matches!(mode.as_str(), "session" | "persist" | "keep" | "shell");
+	                        // 注意：此处是在事件循环中“快速回执”，新 PTY 的 PtyReady 事件尚未被消费，
+	                        // pty_tabs 里的 running 数量可能还未包含本次启动的任务；因此这里用估算值。
+	                        let running_before =
+	                            pty_tabs.iter().filter(|s| s.owner == owner).count();
+	                        let mut cmds: Vec<String> = Vec::new();
+	                        if let Some(list) = call.commands.clone() {
+	                            for c in list {
+	                                let t = c.trim();
+                                if !t.is_empty() {
+                                    cmds.push(t.to_string());
+                                }
+                            }
+                        } else {
+                            for line in call.input.lines() {
+                                let t = line.trim();
+                                if !t.is_empty() {
+                                    cmds.push(t.to_string());
+                                }
+                            }
+                        }
+                        if cmds.is_empty() {
+                            outcome.user_message = "pty.run 缺少 commands/input".to_string();
+                            outcome.log_lines = vec!["状态:fail".to_string()];
+                            sys_msg = Some("工具执行失败".to_string());
+                            let _ = tx.send(AsyncEvent::ToolStreamEnd { outcome, sys_msg });
+                            continue;
+                        }
+                        let max = 5usize;
+                        let total = cmds.len();
+                        cmds.truncate(max);
+	                        // 背景 PTY 任务上限：避免 UI/模型陷入“多任务风暴”。
+	                        const PTY_TASKS_MAX: usize = 6;
+	                        let running_now = pty_tabs.len();
+	                        if running_now + cmds.len() > PTY_TASKS_MAX {
+	                            let running_owner = running_before;
+	                            outcome.user_message = format!(
+	                                "pty.run status=fail reason=too_many_running running_total={} running_owner={} add={} limit={PTY_TASKS_MAX}",
+	                                running_now,
+	                                running_owner,
+	                                cmds.len()
+	                            );
+	                            outcome.log_lines = vec!["状态:fail".to_string()];
+	                            outcome.log_lines.push(format!(
+	                                "{MODEL_NOTE_PREFIX}[sys:PTY启动]启动失败：任务过多（running_total={running_now} running_owner={running_owner} add={} limit={PTY_TASKS_MAX}）。请向用户汇报；等待 PTY Done 或先 pty(kill) 再重试（最多 1 次）；不要立刻连发重试。",
+	                                cmds.len()
+	                            ));
+	                            sys_msg = Some("工具执行失败".to_string());
+	                            let _ = tx.send(AsyncEvent::ToolStreamEnd { outcome, sys_msg });
+	                            continue;
+	                        }
+                        for cmd in &cmds {
+                            let cmd = if keep_session {
+                                format!("{cmd}\nexec bash -li")
+                            } else {
+                                cmd.to_string()
+                            };
+                            let job_call = ToolCall {
+                                tool: "bash".to_string(),
+                                input: cmd,
+                                brief: Some("pty.run".to_string()),
+                                interactive: Some(true),
+                                cwd: call.cwd.clone(),
+                                timeout_secs: call.timeout_secs,
+                                timeout_ms: call.timeout_ms,
+                                ..ToolCall::default()
+                            };
+                            spawn_interactive_bash_execution(
+                                job_call,
+                                owner,
+                                (*tx).clone(),
+                                pty_started_notice_prompt_text.to_string(),
+                                pty_messages.pty_started_model_note.clone(),
+	                                false,
+	                            );
+	                        }
+	                        let running_est = running_before.saturating_add(cmds.len());
+	                        let mut lines_out: Vec<String> = Vec::new();
+	                        lines_out.push(format!(
+	                            "pty.run status=accepted started={} running_owner≈{}{}",
+	                            cmds.len(),
+	                            running_est,
+	                            if keep_session { " mode=session" } else { "" }
+	                        ));
+                        for (idx, cmd) in cmds.iter().enumerate() {
+                            let mut preview = cmd.replace('\n', " ⏎ ").replace('\t', " ");
+                            preview = truncate_with_suffix(preview.trim(), 72);
+                            lines_out.push(format!("- {} {}", idx + 1, preview));
+                        }
+	                        if total > max {
+	                            lines_out.push(format!("- … +{}", total - max));
+	                        }
+	                        outcome.user_message = lines_out.join("\n");
+	                        outcome
+	                            .log_lines
+	                            .push(format!("pty_running_est:{running_est}"));
+	                        outcome.log_lines.push(format!("pty_started:{}", cmds.len()));
+	                        sys_msg = Some("PTY 已启动（等待完成/交互）".to_string());
+	                    }
+                    _ => {
+                        outcome.user_message = "pty 工具 op 仅支持 run/list/kill".to_string();
+                        outcome.log_lines = vec!["状态:fail".to_string()];
+                        sys_msg = Some("工具执行失败".to_string());
+                    }
+                }
+                let _ = tx.send(AsyncEvent::ToolStreamEnd { outcome, sys_msg });
             }
             AsyncEvent::ToolStreamEnd {
                 mut outcome,
@@ -13631,18 +15124,41 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 }
                 let mut tool_message = None;
                 let mut tool_message_raw = None;
+                let mut tool_message_model = None;
                 let mut saw_diary_add = false;
                 let mut reload_sys_cfg = false;
                 let mut skip_owner_resume = false;
-                let mut skip_tool_context = false;
-                let mut mind_transfer: Option<(MindKind, MindKind, String, String)> = None;
-                let mut mind_pulse_dir: Option<PulseDir> = None;
-                if let Some(state) = active_tool_stream.as_mut() {
-                    if matches!(diary_state.stage, DiaryStage::WaitingMain)
-                        && is_datememo_add(&state.call)
-                    {
-                        saw_diary_add = true;
-                    }
+	                let mut skip_tool_context = false;
+	                let mut mind_transfer: Option<(MindKind, MindKind, String, String)> = None;
+	                let mut mind_pulse_dir: Option<PulseDir> = None;
+	                if let Some(state) = active_tool_stream.as_mut() {
+	                    // 交互式 bash（PTY）在“启动阶段”提前结束工具调用：不向模型注入、也不继续自动生成。
+	                    // 退出策略：等待 PTY Done 或 PTY 审计 tick（由系统注入），用户可在 UI 里交互。
+	                    if is_interactive_bash && is_pty_started {
+	                        skip_tool_context = true;
+	                        skip_owner_resume = true;
+	                    }
+	                    // PTY 启动（accepted）不回注给模型：避免模型把“启动回执”当作下一步触发点导致 PTY 风暴。
+	                    // 退出策略：等待 PTY Done 或 PTY 自动审计 tick。
+	                    if state.call.tool == "pty"
+	                        && state
+	                            .call
+	                            .op
+	                            .as_deref()
+	                            .is_some_and(|op| op.trim().eq_ignore_ascii_case("run"))
+	                        && outcome
+	                            .user_message
+	                            .trim_start()
+	                            .starts_with("pty.run status=accepted")
+	                    {
+	                        skip_tool_context = true;
+	                        skip_owner_resume = true;
+	                    }
+	                    if matches!(diary_state.stage, DiaryStage::WaitingMain)
+	                        && is_datememo_add(&state.call)
+	                    {
+	                        saw_diary_add = true;
+	                    }
                     if state.call.tool == "system_config" {
                         reload_sys_cfg = true;
                     }
@@ -13660,7 +15176,9 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             render_cache,
                             ctx_compact_notice_idx,
                         });
-                        if main_state.fastmemo_compact_pending || dog_state.fastmemo_compact_pending
+                        if sys_cfg.fastmemo_compact_enabled
+                            && (main_state.fastmemo_compact_pending
+                                || dog_state.fastmemo_compact_pending)
                         {
                             *auto_fastmemo_compact = true;
                             push_sys_log(sys_log, sys_log_limit, "fastmemo: 已达阈值，待压缩");
@@ -13683,7 +15201,9 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             mind_transfer = Some((from, target, brief, content));
                             mind_pulse_dir = Some(pulse_dir(from, target));
                         }
-                        if main_state.fastmemo_compact_pending || dog_state.fastmemo_compact_pending
+                        if sys_cfg.fastmemo_compact_enabled
+                            && (main_state.fastmemo_compact_pending
+                                || dog_state.fastmemo_compact_pending)
                         {
                             *auto_fastmemo_compact = true;
                             push_sys_log(sys_log, sys_log_limit, "fastmemo: 已达阈值，待压缩");
@@ -13701,7 +15221,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             .log_lines
                             .iter()
                             .any(|l| l.trim() == "fastmemo_compact_pending:1");
-                        if is_fastmemo && pending {
+                        if sys_cfg.fastmemo_compact_enabled && is_fastmemo && pending {
                             *auto_fastmemo_compact = true;
                             main_state.fastmemo_compact_pending = true;
                             push_sys_log(sys_log, sys_log_limit, "fastmemo: 已达阈值，待压缩");
@@ -13716,9 +15236,11 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             .unwrap_or(state.call.input.trim())
                             .to_ascii_lowercase();
                         if raw.contains("fastmemo") {
-                            let fastmemo = read_fastmemo_for_context();
-                            main_state.refresh_fastmemo_system(&fastmemo);
-                            dog_state.refresh_fastmemo_system(&fastmemo);
+                            if sys_cfg.fastmemo_inject_enabled {
+                                let fastmemo = read_fastmemo_for_context();
+                                main_state.refresh_fastmemo_system(&fastmemo);
+                                dog_state.refresh_fastmemo_system(&fastmemo);
+                            }
                         }
                     }
                     if state.call.tool == "memory_edit"
@@ -13752,6 +15274,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         }
                     }
                     tool_message_raw = Some(format_tool_message_raw(&state.call, &outcome));
+                    tool_message_model = Some(format_tool_message_for_model(&state.call, &outcome));
                     if outcome.user_message.contains("工具执行失败")
                         || outcome
                             .log_lines
@@ -13835,7 +15358,10 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     push_sys_log(sys_log, sys_log_limit, "日记压缩完成");
                 }
                 if !skip_tool_context
-                    && let Some(msg) = tool_message_raw.as_ref().or(tool_message.as_ref())
+                    && let Some(msg) = tool_message_model
+                        .as_ref()
+                        .or(tool_message_raw.as_ref())
+                        .or(tool_message.as_ref())
                 {
                     match owner {
                         MindKind::Sub => dog_state.push_tool(msg),
@@ -13867,6 +15393,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     owner,
                     pty_started_notice_prompt_text,
                     mcp_messages,
+                    pty_messages,
                 });
                 if !has_next && !skip_owner_resume && matches!(owner, MindKind::Sub) {
                     // fastmemo 自动压缩：工具链结束后不再让 DOG 输出正文，保持“静默维护”。
@@ -13889,12 +15416,24 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             *fastmemo_compact_inflight = false;
                             *fastmemo_compact_edit_mask = 0;
                             *active_request_is_fastmemo_compact = false;
-                            *auto_fastmemo_compact = true;
-                            main_state.fastmemo_compact_pending = true;
-                            dog_state.fastmemo_compact_pending = true;
-                            *fastmemo_compact_retry_at =
-                                Some(Instant::now() + Duration::from_secs(12));
-                            push_sys_log(sys_log, sys_log_limit, "fastmemo 仍超阈值：稍后重试");
+                            if sys_cfg.fastmemo_compact_enabled {
+                                *auto_fastmemo_compact = true;
+                                main_state.fastmemo_compact_pending = true;
+                                dog_state.fastmemo_compact_pending = true;
+                                *fastmemo_compact_retry_at =
+                                    Some(Instant::now() + Duration::from_secs(12));
+                                push_sys_log(sys_log, sys_log_limit, "fastmemo 仍超阈值：稍后重试");
+                            } else {
+                                *auto_fastmemo_compact = false;
+                                main_state.fastmemo_compact_pending = false;
+                                dog_state.fastmemo_compact_pending = false;
+                                *fastmemo_compact_retry_at = None;
+                                push_sys_log(
+                                    sys_log,
+                                    sys_log_limit,
+                                    "fastmemo 压缩已停用：跳过重试",
+                                );
+                            }
                         }
                     } else {
                         let extra_system = if *fastmemo_compact_inflight {
@@ -13947,41 +15486,42 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     && matches!(owner, MindKind::Main)
                     && !saw_diary_add
                 {
-                    if let Some(in_tokens) = try_start_main_generation(TryStartMainGenerationArgs {
-                        main_client,
-                        main_state,
-                        extra_system: None,
-                        tx,
-                        config,
-                        mode,
-                        active_kind,
-                        sending_until,
-                        sys_log,
-                        sys_log_limit,
-                        streaming_state,
-                        request_seq,
-                        active_request_id,
-                        active_cancel,
-                        sse_enabled,
-                    }) {
-                        record_request_in_tokens(
-                            core,
-                            token_totals,
-                            token_total_path,
-                            context_usage,
-                            active_request_in_tokens,
-                            in_tokens,
-                        );
-                    } else {
-                        push_sys_log(sys_log, sys_log_limit, "MAIN: API 未就绪，工具链暂停");
-                        push_system_and_log(
-                            core,
-                            meta,
-                            context_usage,
-                            Some("main"),
-                            "MAIN: API 未就绪，工具链暂停",
-                        );
-                    }
+                        let extra_system = None;
+                        if let Some(in_tokens) = try_start_main_generation(TryStartMainGenerationArgs {
+                            main_client,
+                            main_state,
+                            extra_system,
+                            tx,
+                            config,
+                            mode,
+                            active_kind,
+                            sending_until,
+                            sys_log,
+                            sys_log_limit,
+                            streaming_state,
+                            request_seq,
+                            active_request_id,
+                            active_cancel,
+                            sse_enabled,
+                        }) {
+                            record_request_in_tokens(
+                                core,
+                                token_totals,
+                                token_total_path,
+                                context_usage,
+                                active_request_in_tokens,
+                                in_tokens,
+                            );
+                        } else {
+                            push_sys_log(sys_log, sys_log_limit, "MAIN: API 未就绪，工具链暂停");
+                            push_system_and_log(
+                                core,
+                                meta,
+                                context_usage,
+                                Some("main"),
+                                "MAIN: API 未就绪，工具链暂停",
+                            );
+                        }
                 }
                 if !has_next
                     && skip_owner_resume
@@ -14298,7 +15838,7 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
                 mind_ctx_idx_main,
                 mind_ctx_idx_dog,
             );
-            if matches!(*mode, Mode::Idle) {
+            if is_idle_like(*mode) {
                 *active_kind = target;
             }
             let msg = build_switch_prompt(target);
@@ -14717,6 +16257,18 @@ fn main() -> anyhow::Result<()> {
     trace_startup("main: start");
 
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .iter()
+        .any(|a| a == "--diag-runtime" || a == "diag-runtime")
+    {
+        let path = args
+            .iter()
+            .position(|a| a == "--path")
+            .and_then(|i| args.get(i.saturating_add(1)))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "log/runtime.log".to_string());
+        return run_diag_runtime(&path);
+    }
     if args.iter().any(|a| a == "--selfcheck" || a == "selfcheck") {
         return run_selfcheck();
     }
@@ -14816,7 +16368,7 @@ fn run_selfcheck() -> anyhow::Result<()> {
         },
         ToolCall {
             tool: "read_file".to_string(),
-            path: Some("src/main.rs".to_string()),
+            path: Some("src/core.rs".to_string()),
             tail: Some(true),
             max_lines: Some(40),
             brief: Some("selfcheck: tail".to_string()),
@@ -14879,6 +16431,95 @@ fn run_selfcheck() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
+    use chrono::NaiveDateTime;
+
+    let path = path.trim();
+    if path.is_empty() {
+        anyhow::bail!("diag-runtime: path 为空");
+    }
+    let text = std::fs::read_to_string(path).context("读取 runtime log 失败")?;
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut pty_ready: Vec<(NaiveDateTime, u64, String)> = Vec::new();
+    let mut pty_done: Vec<(NaiveDateTime, u64)> = Vec::new();
+
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ts = v
+            .get("ts")
+            .and_then(|x| x.as_str())
+            .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
+        let event = v
+            .get("event")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(unknown)")
+            .to_string();
+        *counts.entry(event.clone()).or_default() += 1;
+
+        if let Some(ts) = ts {
+            if event == "pty.ready" {
+                let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let job_id = data.get("job_id").and_then(|x| x.as_u64()).unwrap_or(0);
+                let cmd = data
+                    .get("cmd")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                pty_ready.push((ts, job_id, cmd));
+            } else if event == "pty.done" {
+                let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let job_id = data.get("job_id").and_then(|x| x.as_u64()).unwrap_or(0);
+                pty_done.push((ts, job_id));
+            }
+        } else if lineno < 3 {
+            // 避免完全静默：若头几行格式不符合预期，给一点提示。
+            // 但不当作错误：runtime.log 可能混有旧格式/其它日志。
+        }
+    }
+
+    println!("diag-runtime: {path}");
+    println!("events:");
+    for (k, v) in counts.iter() {
+        println!("  - {k}: {v}");
+    }
+
+    // PTY storm：30s 内启动 >=4 个 PTY
+    if !pty_ready.is_empty() {
+        pty_ready.sort_by_key(|(ts, _, _)| *ts);
+        let mut storm_found = false;
+        for i in 0..pty_ready.len() {
+            let (t0, _, _) = pty_ready[i];
+            let mut j = i;
+            while j < pty_ready.len() && (pty_ready[j].0 - t0).num_seconds().abs() <= 30 {
+                j += 1;
+            }
+            let n = j.saturating_sub(i);
+            if n >= 4 {
+                storm_found = true;
+                println!("\nwarn: PTY storm detected ({n} starts within 30s)");
+                for k in i..j {
+                    let (ts, job_id, cmd) = &pty_ready[k];
+                    let cmd = crate::truncate_with_suffix(cmd.as_str(), 120);
+                    println!("  - {ts} job_id={job_id} cmd={cmd}");
+                }
+                break;
+            }
+        }
+        if !storm_found {
+            println!("\npty: ready={} done={}", pty_ready.len(), pty_done.len());
+        }
+    }
+
+    Ok(())
+}
+
 mod types {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Mode {
@@ -14911,6 +16552,7 @@ mod types {
     }
 
     pub const THINKING_MARKER: &str = "[thinking]";
+    pub const THINK_TOOL_MARKER: &str = "[AITERMUX_THINK]";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum MindKind {
@@ -15187,14 +16829,36 @@ mod config {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     #[serde(default)]
+    pub struct ApiProviderProfile {
+        pub base_url: String,
+        pub api_key: Option<String>,
+        pub model: String,
+        pub reasoning_effort: Option<String>,
+        pub temperature: Option<f32>,
+        pub max_tokens: Option<u32>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct ApiProviderProfiles {
+        pub deepseek: ApiProviderProfile,
+        pub codex: ApiProviderProfile,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(default)]
     pub struct DogApiConfig {
         pub api_key: Option<String>,
         pub provider: String,
         pub base_url: String,
         pub model: String,
+        #[serde(default = "default_reasoning_effort")]
+        pub reasoning_effort: Option<String>,
         pub temperature: Option<f32>,
         pub timeout_secs: u64,
         pub max_tokens: Option<u32>,
+        #[serde(default)]
+        pub provider_profiles: ApiProviderProfiles,
         pub prompt_path: String,
         pub prompt_reinject_pct: u8,
         pub token_total_path: String,
@@ -15207,9 +16871,13 @@ mod config {
         pub provider: String,
         pub base_url: String,
         pub model: String,
+        #[serde(default = "default_reasoning_effort")]
+        pub reasoning_effort: Option<String>,
         pub temperature: Option<f32>,
         pub timeout_secs: u64,
         pub max_tokens: Option<u32>,
+        #[serde(default)]
+        pub provider_profiles: ApiProviderProfiles,
         pub prompt_path: String,
     }
 
@@ -15228,22 +16896,23 @@ mod config {
         pub sse_enabled: bool,
         #[serde(default)]
         pub tool_full_access: bool,
+        #[serde(default)]
+        pub paste_cache_enabled: bool,
+        #[serde(default)]
+        pub fastmemo_inject_enabled: bool,
+        // 开发期：先聚焦 MCP 软件本身，暂时关闭自动压缩相关链路（可在配置中重新开启）。
+        #[serde(default)]
+        pub context_compact_enabled: bool,
+        #[serde(default)]
+        pub fastmemo_compact_enabled: bool,
         #[serde(default = "default_ctx_recent_max_tokens")]
         pub ctx_recent_max_tokens: usize,
         #[serde(default = "default_ctx_pool_max_items")]
         pub ctx_pool_max_items: usize,
         #[serde(default = "default_context_compact_prompt_path")]
         pub context_compact_prompt_path: String,
-        #[serde(default = "default_pty_audit_prompt_path")]
-        pub pty_audit_prompt_path: String,
         #[serde(default = "default_pty_help_prompt_path")]
         pub pty_help_prompt_path: String,
-        #[serde(default = "default_pty_started_notice_prompt_path")]
-        pub pty_started_notice_prompt_path: String,
-        #[serde(default = "default_mcp_messages_path")]
-        pub mcp_messages_path: String,
-        #[serde(default = "default_tool_messages_path")]
-        pub tool_messages_path: String,
         #[serde(default = "default_welcome_shortcuts_prompt_path")]
         pub welcome_shortcuts_prompt_path: String,
         #[serde(default)]
@@ -15256,6 +16925,18 @@ mod config {
         true
     }
 
+    fn default_reasoning_effort() -> Option<String> {
+        Some("high".to_string())
+    }
+
+    fn default_deepseek_base_url() -> String {
+        "https://api.deepseek.com/v1".to_string()
+    }
+
+    fn default_codex_base_url() -> String {
+        "http://154.44.8.149:3500/openai".to_string()
+    }
+
     fn default_ctx_recent_max_tokens() -> usize {
         3000
     }
@@ -15265,31 +16946,15 @@ mod config {
     }
 
     fn default_context_compact_prompt_path() -> String {
-        "config/prompt/memory/context_compact.txt".to_string()
-    }
-
-    fn default_pty_audit_prompt_path() -> String {
-        "config/prompt/mcp/pty_audit.txt".to_string()
+        "prompt/contextsummary.txt".to_string()
     }
 
     fn default_pty_help_prompt_path() -> String {
-        "config/prompt/mcp/pty_help.txt".to_string()
-    }
-
-    fn default_pty_started_notice_prompt_path() -> String {
-        "config/prompt/mcp/pty_started_notice.txt".to_string()
-    }
-
-    fn default_mcp_messages_path() -> String {
-        "config/prompt/mcp/mcp_messages.json".to_string()
-    }
-
-    fn default_tool_messages_path() -> String {
-        "config/prompt/mcp/tool_messages.json".to_string()
+        "prompt/Terminalwelcome.txt".to_string()
     }
 
     fn default_welcome_shortcuts_prompt_path() -> String {
-        "config/prompt/system/welcome_shortcuts.txt".to_string()
+        "prompt/Systemwelcome.txt".to_string()
     }
 
     impl AppConfig {
@@ -15313,8 +16978,8 @@ mod config {
             Self {
                 max_input_chars,
                 paste_capture_max_bytes,
-                paste_placeholder_char_threshold: 100,
-                paste_placeholder_line_threshold: 5,
+                paste_placeholder_char_threshold: 300,
+                paste_placeholder_line_threshold: 10,
                 paste_send_inhibit_ms: 360,
                 paste_capture_flush_gap_ms: 160,
                 paste_drop_cooldown_ms: 1200,
@@ -15351,7 +17016,7 @@ mod config {
                 contextmemo_path: std::env::var("YING_CONTEXTMEMO_PATH")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "memory/contextmemo.jsonl".to_string()),
+                    .unwrap_or_else(|| "memory/fastcontext.jsonl".to_string()),
                 run_log_path: std::env::var("YING_RUN_LOG_PATH")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
@@ -15359,9 +17024,52 @@ mod config {
                 memo_db_path: std::env::var("YING_MEMO_DB_PATH")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "memory/memo.db".to_string()),
+                    .unwrap_or_else(|| "memory/metamemory.db".to_string()),
             }
         }
+    }
+
+    impl Default for ApiProviderProfile {
+        fn default() -> Self {
+            Self {
+                base_url: default_deepseek_base_url(),
+                api_key: None,
+                model: "deepseek-reasoner".to_string(),
+                reasoning_effort: default_reasoning_effort(),
+                temperature: Some(1.0),
+                max_tokens: Some(5_000),
+            }
+        }
+    }
+
+    impl Default for ApiProviderProfiles {
+        fn default() -> Self {
+            Self {
+                deepseek: ApiProviderProfile::default(),
+                codex: ApiProviderProfile {
+                    base_url: default_codex_base_url(),
+                    api_key: None,
+                    model: "gpt-5.3-codex".to_string(),
+                    reasoning_effort: default_reasoning_effort(),
+                    temperature: Some(1.0),
+                    max_tokens: Some(5_000),
+                },
+            }
+        }
+    }
+
+    fn default_dog_provider_profiles() -> ApiProviderProfiles {
+        let mut profiles = ApiProviderProfiles::default();
+        profiles.deepseek.model = "deepseek-reasoner".to_string();
+        profiles.deepseek.max_tokens = Some(5_000);
+        profiles
+    }
+
+    fn default_main_provider_profiles() -> ApiProviderProfiles {
+        let mut profiles = ApiProviderProfiles::default();
+        profiles.deepseek.model = "deepseek-chat".to_string();
+        profiles.deepseek.max_tokens = Some(5_000);
+        profiles
     }
 
     impl Default for DogApiConfig {
@@ -15369,14 +17077,16 @@ mod config {
             Self {
                 api_key: None,
                 provider: "deepseek".to_string(),
-                base_url: "https://api.deepseek.com/v1".to_string(),
+                base_url: default_deepseek_base_url(),
                 model: "deepseek-reasoner".to_string(),
-                temperature: Some(0.6),
+                reasoning_effort: default_reasoning_effort(),
+                temperature: Some(1.0),
                 timeout_secs: 60,
                 max_tokens: Some(5_000),
-                prompt_path: "config/prompt/agent/dog.txt".to_string(),
+                provider_profiles: default_dog_provider_profiles(),
+                prompt_path: "prompt/dogprompt.txt".to_string(),
                 prompt_reinject_pct: 80,
-                token_total_path: "memory/token_total.json".to_string(),
+                token_total_path: "config/Tokencount.json".to_string(),
             }
         }
     }
@@ -15386,12 +17096,14 @@ mod config {
             Self {
                 api_key: None,
                 provider: "deepseek".to_string(),
-                base_url: "https://api.deepseek.com/v1".to_string(),
+                base_url: default_deepseek_base_url(),
                 model: "deepseek-chat".to_string(),
-                temperature: Some(0.6),
+                reasoning_effort: default_reasoning_effort(),
+                temperature: Some(1.0),
                 timeout_secs: 60,
                 max_tokens: Some(5_000),
-                prompt_path: "config/prompt/agent/main.txt".to_string(),
+                provider_profiles: default_main_provider_profiles(),
+                prompt_path: "prompt/mainprompt.txt".to_string(),
             }
         }
     }
@@ -15415,14 +17127,14 @@ mod config {
                 heartbeat_minutes: 5,
                 sse_enabled: true,
                 tool_full_access: false,
+                paste_cache_enabled: false,
+                fastmemo_inject_enabled: false,
+                context_compact_enabled: false,
+                fastmemo_compact_enabled: false,
                 ctx_recent_max_tokens: default_ctx_recent_max_tokens(),
                 ctx_pool_max_items: default_ctx_pool_max_items(),
                 context_compact_prompt_path: default_context_compact_prompt_path(),
-                pty_audit_prompt_path: default_pty_audit_prompt_path(),
                 pty_help_prompt_path: default_pty_help_prompt_path(),
-                pty_started_notice_prompt_path: default_pty_started_notice_prompt_path(),
-                mcp_messages_path: default_mcp_messages_path(),
-                tool_messages_path: default_tool_messages_path(),
                 welcome_shortcuts_prompt_path: default_welcome_shortcuts_prompt_path(),
                 pty_audit_enabled: false,
                 chat_target: "dog".to_string(),

@@ -6,7 +6,7 @@ use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use std::time::Duration;
 
-pub const DEFAULT_MEMO_DB_PATH: &str = "memory/memo.db";
+pub const DEFAULT_MEMO_DB_PATH: &str = "memory/metamemory.db";
 pub const DEFAULT_METAMEMO_PATH: &str = "memory/metamemo.jsonl";
 pub const DEFAULT_DATEMEMO_PATH: &str = "memory/datememo.jsonl";
 

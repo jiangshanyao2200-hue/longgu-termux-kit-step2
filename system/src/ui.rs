@@ -47,8 +47,6 @@ pub fn fill_background(f: &mut ratatui::Frame, theme: &Theme, area: Rect) {
 }
 
 const MAX_CHAT_BYTES: usize = 12_000;
-const USER_SUMMARY_LINE_THRESHOLD: usize = 5;
-const USER_SUMMARY_CHAR_THRESHOLD: usize = 800;
 // 系统消息统一“浅粉”显示：不跟随心跳 pulse，避免视觉语义混淆。
 const SYSTEM_PINK: Color = Color::Rgb(255, 160, 210);
 
@@ -267,36 +265,87 @@ fn truncate_for_ui(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn should_compact_user_message(text: &str) -> bool {
-    let lines = text.lines().count().max(1);
-    let chars = text.chars().count();
-    lines >= USER_SUMMARY_LINE_THRESHOLD || chars >= USER_SUMMARY_CHAR_THRESHOLD
-}
-
 const USER_PASTE_MARKER_BEGIN: &str = "[[AITERMUX_PASTE_BEGIN|";
 const USER_PASTE_MARKER_END: &str = "[[AITERMUX_PASTE_END|";
+const USER_PTY_SNAPSHOT_MARKER_BEGIN: &str = "[[AITERMUX_PTY_SNAPSHOT_BEGIN|";
+const USER_PTY_SNAPSHOT_MARKER_END: &str = "[[AITERMUX_PTY_SNAPSHOT_END|";
+
+fn strip_timeline_footer_for_ui(text: &str) -> &str {
+    // UI 层不展示“模型上下文时间线尾注”，避免污染对话内容。
+    // 形如：`\n[[t:HHMMSS]]`，且必须是最后一行（尾注内不得再包含换行）。
+    const MARK_LINE: &str = "\n[[t:";
+    if let Some(pos) = text.rfind(MARK_LINE) {
+        let tail = &text[pos + 1..]; // skip leading '\n'
+        if !tail.contains('\n') && tail.ends_with("]]") {
+            return &text[..pos];
+        }
+    }
+    // 兜底：模型偶尔会“学着”把 `[[t:...]]` 原样输出到正文末尾（不带换行）。
+    // 这种情况也不应该出现在 UI。
+    const MARK: &str = "[[t:";
+    let Some(pos) = text.rfind(MARK) else {
+        return text;
+    };
+    let tail = &text[pos..];
+    if tail.contains('\n') || !tail.ends_with("]]") {
+        return text;
+    }
+    if pos > 0 {
+        let prev = text[..pos].chars().rev().next().unwrap_or('x');
+        if !prev.is_whitespace() {
+            return text;
+        }
+    }
+    let mut cut = pos;
+    while cut > 0 {
+        let prev = text[..cut].chars().rev().next().unwrap_or('x');
+        if !prev.is_whitespace() {
+            break;
+        }
+        cut = cut.saturating_sub(prev.len_utf8());
+    }
+    &text[..cut]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserHiddenBlockKind {
+    Paste,
+    PtySnapshot,
+}
 
 #[derive(Debug, Clone)]
-struct UserPasteBlock {
+struct UserHiddenBlock {
+    kind: UserHiddenBlockKind,
     id: String,
     saved: String,
+    job_id: Option<u64>,
     lines: usize,
     chars: usize,
     content: String,
 }
 
-fn split_user_paste_blocks(text: &str) -> (String, Vec<UserPasteBlock>) {
+fn split_user_paste_blocks(text: &str) -> (String, Vec<UserHiddenBlock>) {
     let mut base_lines: Vec<String> = Vec::new();
-    let mut blocks: Vec<UserPasteBlock> = Vec::new();
-    let mut cur: Option<UserPasteBlock> = None;
+    let mut blocks: Vec<UserHiddenBlock> = Vec::new();
+    let mut cur: Option<UserHiddenBlock> = None;
 
     for raw in text.lines() {
         let line = raw.trim_end_matches('\r');
         if cur.is_none() {
-            if let Some(rest) = line.strip_prefix(USER_PASTE_MARKER_BEGIN) {
+            let mut kind: Option<UserHiddenBlockKind> = None;
+            let mut rest: Option<&str> = None;
+            if let Some(r) = line.strip_prefix(USER_PASTE_MARKER_BEGIN) {
+                kind = Some(UserHiddenBlockKind::Paste);
+                rest = Some(r);
+            } else if let Some(r) = line.strip_prefix(USER_PTY_SNAPSHOT_MARKER_BEGIN) {
+                kind = Some(UserHiddenBlockKind::PtySnapshot);
+                rest = Some(r);
+            }
+            if let (Some(kind), Some(rest)) = (kind, rest) {
                 if let Some(meta) = rest.strip_suffix("]]") {
                     let mut id = String::new();
                     let mut saved = String::new();
+                    let mut job_id: Option<u64> = None;
                     let mut lines_n: usize = 0;
                     let mut chars_n: usize = 0;
                     for part in meta.split('|') {
@@ -304,15 +353,18 @@ fn split_user_paste_blocks(text: &str) -> (String, Vec<UserPasteBlock>) {
                         match k.trim() {
                             "id" => id = v.trim().to_string(),
                             "saved" => saved = v.trim().to_string(),
+                            "job_id" => job_id = v.trim().parse::<u64>().ok(),
                             "lines" => lines_n = v.trim().parse().unwrap_or(0),
                             "chars" => chars_n = v.trim().parse().unwrap_or(0),
                             _ => {}
                         }
                     }
                     if !id.is_empty() {
-                        cur = Some(UserPasteBlock {
+                        cur = Some(UserHiddenBlock {
+                            kind,
                             id,
                             saved,
+                            job_id,
                             lines: lines_n,
                             chars: chars_n,
                             content: String::new(),
@@ -330,7 +382,12 @@ fn split_user_paste_blocks(text: &str) -> (String, Vec<UserPasteBlock>) {
             base_lines.push(line.to_string());
             continue;
         };
-        let end_marker = format!("{USER_PASTE_MARKER_END}id={}]]", block.id);
+        let end_marker = match block.kind {
+            UserHiddenBlockKind::Paste => format!("{USER_PASTE_MARKER_END}id={}]]", block.id),
+            UserHiddenBlockKind::PtySnapshot => {
+                format!("{USER_PTY_SNAPSHOT_MARKER_END}id={}]]", block.id)
+            }
+        };
         if line.trim() == end_marker {
             blocks.push(block);
             continue;
@@ -343,10 +400,21 @@ fn split_user_paste_blocks(text: &str) -> (String, Vec<UserPasteBlock>) {
     }
     // 未闭合的块：当作普通文本回退（避免“永远消失”）。
     if let Some(block) = cur {
-        base_lines.push(format!(
-            "{USER_PASTE_MARKER_BEGIN}id={}|lines={}|chars={}|saved={}]]",
-            block.id, block.lines, block.chars, block.saved
-        ));
+        let head = match block.kind {
+            UserHiddenBlockKind::Paste => format!(
+                "{USER_PASTE_MARKER_BEGIN}id={}|lines={}|chars={}|saved={}]]",
+                block.id, block.lines, block.chars, block.saved
+            ),
+            UserHiddenBlockKind::PtySnapshot => format!(
+                "{USER_PTY_SNAPSHOT_MARKER_BEGIN}id={}|job_id={}|lines={}|chars={}|saved={}]]",
+                block.id,
+                block.job_id.unwrap_or(0),
+                block.lines,
+                block.chars,
+                block.saved
+            ),
+        };
+        base_lines.push(head);
         if !block.content.is_empty() {
             base_lines.extend(block.content.lines().map(|s| s.to_string()));
         }
@@ -357,27 +425,6 @@ fn split_user_paste_blocks(text: &str) -> (String, Vec<UserPasteBlock>) {
 fn render_user_preview_lines(text: &str, width: usize) -> Vec<String> {
     const MAX_LINES: usize = 3;
     let width = width.max(1);
-    let lines_total = text.lines().count().max(1);
-    let chars_total = text.chars().count();
-    let is_paste = should_compact_user_message(text);
-
-    // paste/长文本：折叠时用一行摘要（避免把原文塞进聊天区）。
-    if is_paste {
-        let src = format!("[Pasted Content {chars_total} chars / {lines_total} lines]");
-        let mut out: Vec<String> = Vec::new();
-        for line in src.lines() {
-            for wrapped in wrap_plain_line(line, width) {
-                out.push(wrapped);
-                if out.len() >= MAX_LINES {
-                    return out;
-                }
-            }
-        }
-        if out.is_empty() {
-            out.push(String::new());
-        }
-        return out;
-    }
 
     // 普通用户消息：最多显示 3 行。
     let content_max = 3;
@@ -1374,7 +1421,12 @@ fn maybe_unescape_tool_text(text: &str) -> Cow<'_, str> {
 fn summarize_tool_message(text: &str) -> String {
     let text = maybe_unescape_tool_text(text);
     let text = text.as_ref();
-    let mut tool = "tool";
+    let is_think_msg = text
+        .trim_start()
+        .get(..crate::types::THINK_TOOL_MARKER.len())
+        .unwrap_or("")
+        .eq_ignore_ascii_case(crate::types::THINK_TOOL_MARKER);
+    let mut tool = if is_think_msg { "think" } else { "tool" };
     let mut input = None;
     let mut raw_input = None;
     let mut brief = None;
@@ -1382,22 +1434,24 @@ fn summarize_tool_message(text: &str) -> String {
     for line in text.lines() {
         let trimmed = line.trim_start();
         let lower = trimmed.to_ascii_lowercase();
-        if let Some(val) = trimmed.strip_prefix("[tool:") {
-            let val = val.trim_end_matches(']').trim();
-            if !val.is_empty() {
-                tool = val;
+        if !is_think_msg {
+            if let Some(val) = trimmed.strip_prefix("[tool:") {
+                let val = val.trim_end_matches(']').trim();
+                if !val.is_empty() {
+                    tool = val;
+                }
             }
-        }
-        if lower.starts_with("tool:") {
-            let val = trimmed[5..].trim();
-            if !val.is_empty() {
-                tool = val;
+            if lower.starts_with("tool:") {
+                let val = trimmed[5..].trim();
+                if !val.is_empty() {
+                    tool = val;
+                }
             }
-        }
-        if trimmed.starts_with("操作:") {
-            let val = trimmed.trim_start_matches("操作:").trim();
-            if !val.is_empty() {
-                tool = val;
+            if trimmed.starts_with("操作:") {
+                let val = trimmed.trim_start_matches("操作:").trim();
+                if !val.is_empty() {
+                    tool = val;
+                }
             }
         }
         if input.is_none() && lower.starts_with("input:") {
@@ -1511,9 +1565,9 @@ fn normalize_memory_target(raw: &str) -> String {
         .map(|(a, b)| (a.trim(), Some(b.trim())))
         .unwrap_or((trimmed, None));
     let mapped = match head {
-        "fastmemo" => "fastmemo.jsonl",
-        "contextmemo" => "contextmemo.jsonl",
-        "memo.db" | "memo" => "memo.db",
+        "fastmemo" | "fastmemory" => "fastmemory.jsonl",
+        "contextmemo" | "fastcontext" => "fastcontext.jsonl",
+        "memo.db" | "memo" | "metamemory.db" => "metamemory.db",
         other => other,
     };
     if let Some(t) = tail.filter(|s| !s.is_empty()) {
@@ -3266,6 +3320,7 @@ fn render_message_lines(
     reveal_len: Option<usize>,
     user_expanded: bool,
 ) -> Vec<Line<'static>> {
+    let text = strip_timeline_footer_for_ui(&msg.text);
     let prefix = format!("{dot} ");
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
     let prefix_style = if matches!(msg.role, Role::User | Role::System) {
@@ -3278,7 +3333,7 @@ fn render_message_lines(
     };
     if msg.role == Role::User {
         let content_width = width.saturating_sub(prefix_width).max(1);
-        let (base_text, paste_blocks) = split_user_paste_blocks(&msg.text);
+        let (base_text, paste_blocks) = split_user_paste_blocks(text);
         let display_text = if user_expanded && !paste_blocks.is_empty() {
             let mut out = String::new();
             out.push_str(base_text.trim_end());
@@ -3288,14 +3343,24 @@ fn render_message_lines(
                 } else {
                     out.push_str("\n");
                 }
-                let mut head = format!(
-                    "[Pasted Content {}: {} chars / {} lines]",
-                    b.id, b.chars, b.lines
-                );
-                if !b.saved.trim().is_empty() {
-                    head.push_str(&format!(" saved:{}", b.saved.trim()));
-                }
+                let head = match b.kind {
+                    UserHiddenBlockKind::Paste => format!(
+                        "[Pasted Content {}: {} chars / {} lines]",
+                        b.id, b.chars, b.lines
+                    ),
+                    UserHiddenBlockKind::PtySnapshot => {
+                        let jid = b.job_id.unwrap_or(0);
+                        format!(
+                            "[Terminal Snapshot {}: {} chars / {} lines] job_id:{}",
+                            b.id, b.chars, b.lines, jid
+                        )
+                    }
+                };
                 out.push_str(&head);
+                if b.kind == UserHiddenBlockKind::Paste && !b.saved.trim().is_empty() {
+                    out.push('\n');
+                    out.push_str(&format!("saved:{}", b.saved.trim()));
+                }
                 if !b.content.trim().is_empty() {
                     out.push('\n');
                     out.push_str(b.content.trim_end());
@@ -3344,9 +3409,9 @@ fn render_message_lines(
         return out;
     }
     let display = if let Some(reveal_len) = reveal_len {
-        Cow::Owned(truncate_by_chars(&msg.text, reveal_len))
+        Cow::Owned(truncate_by_chars(text, reveal_len))
     } else {
-        truncate_for_ui(&msg.text)
+        truncate_for_ui(text)
     };
 
     // system：统一“左对齐”的排版（避免长前缀导致正文被缩进到屏幕中间）。
@@ -3356,8 +3421,12 @@ fn render_message_lines(
         let label = "♡ · 系统信息";
         let indent = "  ";
         let indent_w = UnicodeWidthStr::width(indent);
-        let rendered =
-            render_markdown_to_lines(&display, width.saturating_sub(indent_w).max(1), base_style);
+        let rendered = render_markdown_to_lines_ex(
+            &display,
+            width.saturating_sub(indent_w).max(1),
+            base_style,
+            false,
+        );
         if rendered.is_empty() {
             return vec![Line::from(vec![Span::styled(
                 label.to_string(),
@@ -3381,8 +3450,20 @@ fn render_message_lines(
         return out;
     }
 
-    let rendered =
-        render_markdown_to_lines(&display, width.saturating_sub(prefix_width), base_style);
+    let token_highlight = msg.role == Role::Assistant
+        || (msg.role == Role::Tool
+            && msg
+                .text
+                .trim_start()
+                .get(..crate::types::THINK_TOOL_MARKER.len())
+                .unwrap_or("")
+                .eq_ignore_ascii_case(crate::types::THINK_TOOL_MARKER));
+    let rendered = render_markdown_to_lines_ex(
+        &display,
+        width.saturating_sub(prefix_width),
+        base_style,
+        token_highlight,
+    );
     if rendered.is_empty() {
         return Vec::new();
     }
@@ -3749,7 +3830,9 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 let avail = w.saturating_sub(indent_w).max(1);
 
                 // 第二行：command（↳ 斜体）
-                if !target_disp.trim().is_empty() {
+                // 特例：PTY Done 的 input 往往是冗长的 job/exit/cmd 汇总；简约态只看 brief 即可，细节留给详情态。
+                let hide_target_line = tool_raw.eq_ignore_ascii_case("pty done");
+                if !hide_target_line && !target_disp.trim().is_empty() {
                     let arrow_style = Style::default()
                         .fg(theme.dim)
                         .bg(theme.bg)
@@ -3822,7 +3905,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             let mind = extract_tool_mind(tool_text);
             let dot = if mind == Some("dog") { "○" } else { "●" };
             let (prefix, tool_name, suffix) = tool_compact_title_parts(&tool_raw);
-            let head = format!("{dot} {prefix}");
+            let head = format!("{dot} 工具回执 · {prefix}");
             let sep = " · ";
             let target_raw = input_raw.as_deref().unwrap_or("");
             let (_disp, target_disp) = normalize_tool_display(&tool_raw, target_raw);
@@ -4162,7 +4245,7 @@ mod tests {
         let theme = Theme::cyberpunk();
         let mut core = Core::new();
         core.push_tool(
-            "操作: Think\ninput: \nmind: main\noutput:\n```text\nTHINK_DETAIL\n```\nmeta:\n```text\n状态:done\n```\n"
+            "[AITERMUX_THINK]\ninput: \nmind: main\noutput:\n```text\nTHINK_DETAIL\n```\nmeta:\n```text\n状态:done\n```\n"
                 .to_string(),
         );
         core.history.push(Message {
@@ -4196,15 +4279,19 @@ mod tests {
             pulse_style: None,
         });
         let lines = layout.lines;
-
-        // 展开思考时：Think 正文应出现在 assistant 正文之前，且不带“操作/Think”等标签。
+        // THINK 在详情模式应可回看，并且位于 assistant 正文之前。
         let joined = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
-            .join("\n");
+            .join(
+                "
+",
+            );
         assert!(joined.contains("THINK_DETAIL"));
-        assert!(joined.contains("● hello"));
+        let think_pos = joined.find("THINK_DETAIL").unwrap();
+        let hello_pos = joined.find("● hello").unwrap();
+        assert!(think_pos < hello_pos);
     }
 
     #[test]
@@ -4271,16 +4358,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("Worked with ADB"));
-        assert!(joined.contains("shell ls"));
-        assert!(joined.contains("安全测试"));
-        assert!(joined.contains("换行"));
         assert!(!joined.contains("saved:log/adb-"));
         let joined_no_ws = joined
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>()
             .to_ascii_lowercase();
-        assert!(joined_no_ws.contains("outputexported"));
+        assert!(joined_no_ws.contains("安全测试"));
+        assert!(joined_no_ws.contains("△output"));
     }
 
     #[test]
@@ -4334,6 +4419,79 @@ mod tests {
         assert!(expanded.contains("line1"));
         assert!(expanded.contains("line2"));
         assert!(expanded.contains("saved:log/paste-cache/paste_1.txt"));
+    }
+
+    #[test]
+    fn user_pty_snapshot_blocks_are_hidden_until_expanded() {
+        let theme = Theme::cyberpunk();
+        let text = concat!(
+            "〔PTY,Terminal快照〕\n",
+            "[[AITERMUX_PTY_SNAPSHOT_BEGIN|id=pty_1|job_id=7|lines=2|chars=10|saved=]]\n",
+            "x\ny\n",
+            "[[AITERMUX_PTY_SNAPSHOT_END|id=pty_1]]\n"
+        )
+        .to_string();
+        let msg = crate::Message {
+            role: Role::User,
+            text,
+            mind: None,
+        };
+
+        let collapsed = render_message_lines(
+            &theme,
+            &msg,
+            80,
+            "○",
+            theme.cyan,
+            Style::default().fg(theme.fg).bg(theme.bg),
+            None,
+            false,
+        )
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(collapsed.contains("〔PTY,Terminal快照〕"));
+        assert!(!collapsed.contains("x"));
+
+        let expanded = render_message_lines(
+            &theme,
+            &msg,
+            80,
+            "○",
+            theme.cyan,
+            Style::default().fg(theme.fg).bg(theme.bg),
+            None,
+            true,
+        )
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(expanded.contains("x"));
+        assert!(expanded.contains("job_id:7"));
+    }
+
+    #[test]
+    fn markdown_unpaired_backtick_does_not_turn_rest_into_highlighted_code() {
+        // 复现：日志里常见 `EOF' 这类“孤立反引号”会让 markdown parser 误把后文当成 code span。
+        // 期望：对异常长/跨行的 inline code span 降级为普通文本，不出现黄底 code 高亮。
+        let base = Style::default().fg(Color::White).bg(Color::Rgb(1, 2, 3));
+        let text = "warning: here-document (wanted `EOF') 后面是一大段中文说明，为了触发误解析我们再加一些内容：aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let lines = render_markdown_to_lines(text, 200, base);
+        assert!(!lines.is_empty());
+        let mut saw_code_style = false;
+        for line in &lines {
+            for sp in &line.spans {
+                if sp.style.bg == Some(Color::Black) && sp.style.fg == Some(Color::Yellow) {
+                    saw_code_style = true;
+                }
+            }
+        }
+        assert!(
+            !saw_code_style,
+            "should not render huge code span as yellow-on-black"
+        );
     }
 }
 
@@ -4493,6 +4651,85 @@ fn push_text(line: &mut StyledLogicalLine, s: &str, style: Style) {
     });
 }
 
+fn is_ascii_word_start(b: u8) -> bool {
+    (b'A'..=b'Z').contains(&b) || (b'a'..=b'z').contains(&b) || b == b'_'
+}
+
+fn is_ascii_word_cont(b: u8) -> bool {
+    is_ascii_word_start(b)
+        || (b'0'..=b'9').contains(&b)
+        || matches!(b, b'-' | b'.' | b'/' | b':' | b'@' | b'+' | b'=')
+}
+
+fn is_ascii_number_cont(b: u8) -> bool {
+    (b'0'..=b'9').contains(&b) || matches!(b, b'.' | b'-' | b'_' | b':' | b'/' | b'%')
+}
+
+fn push_text_token_highlight(line: &mut StyledLogicalLine, s: &str, style: Style, enabled: bool) {
+    if !enabled || s.is_empty() {
+        push_text(line, s, style);
+        return;
+    }
+    // 防止对超大块文本做过细 token 切分（性能与内存）。
+    if s.len() > 4096 {
+        push_text(line, s, style);
+        return;
+    }
+
+    let bytes = s.as_bytes();
+    let mut i: usize = 0;
+    let mut last: usize = 0;
+    let mut token_count: usize = 0;
+    const MAX_TOKENS: usize = 600;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ascii_number_cont(bytes[i]) {
+                i += 1;
+            }
+            if start > last {
+                push_text(line, &s[last..start], style);
+            }
+            let num_style = style.fg(Color::LightCyan);
+            push_text(line, &s[start..i], num_style);
+            last = i;
+            token_count += 1;
+        } else if is_ascii_word_start(b) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ascii_word_cont(bytes[i]) {
+                i += 1;
+            }
+            if start > last {
+                push_text(line, &s[last..start], style);
+            }
+            let word_style = style.fg(Color::LightBlue);
+            push_text(line, &s[start..i], word_style);
+            last = i;
+            token_count += 1;
+        } else if b.is_ascii() {
+            i += 1;
+        } else {
+            // 非 ASCII：按 char 边界前进，保持 UTF-8 安全。
+            let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            i = (i + ch_len).min(bytes.len());
+        }
+
+        if token_count > MAX_TOKENS {
+            // 太多 token：认为文本过“代码化”，降级为原样，避免 span 爆炸。
+            push_text(line, &s[last..], style);
+            return;
+        }
+    }
+
+    if last < s.len() {
+        push_text(line, &s[last..], style);
+    }
+}
+
 #[derive(Default)]
 struct InlineStyle {
     strong: usize,
@@ -4513,8 +4750,17 @@ struct ListState {
 }
 
 pub fn render_markdown_to_lines(text: &str, width: usize, base_style: Style) -> Vec<Line<'static>> {
+    render_markdown_to_lines_ex(text, width, base_style, false)
+}
+
+fn render_markdown_to_lines_ex(
+    text: &str,
+    width: usize,
+    base_style: Style,
+    token_highlight: bool,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let logical = markdown_to_logical_lines(text, base_style);
+    let logical = markdown_to_logical_lines(text, base_style, token_highlight);
     let mut out: Vec<Line<'static>> = Vec::new();
     for line in logical {
         out.extend(wrap_styled_line(&line, width));
@@ -4522,7 +4768,11 @@ pub fn render_markdown_to_lines(text: &str, width: usize, base_style: Style) -> 
     out
 }
 
-fn markdown_to_logical_lines(text: &str, base_style: Style) -> Vec<StyledLogicalLine> {
+fn markdown_to_logical_lines(
+    text: &str,
+    base_style: Style,
+    token_highlight: bool,
+) -> Vec<StyledLogicalLine> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
@@ -4769,7 +5019,7 @@ fn markdown_to_logical_lines(text: &str, base_style: Style) -> Vec<StyledLogical
                         &item_cont_prefix,
                     );
                     let style = inline_style(base_style, &inline, heading_level);
-                    push_text(&mut current, t.as_ref(), style);
+                    push_text_token_highlight(&mut current, t.as_ref(), style, token_highlight);
                 }
             }
             Event::Code(code) => {
@@ -4786,11 +5036,23 @@ fn markdown_to_logical_lines(text: &str, base_style: Style) -> Vec<StyledLogical
                     &item_prefix,
                     &item_cont_prefix,
                 );
-                let style = base_style
-                    .fg(Color::Yellow)
-                    .bg(Color::Black)
-                    .add_modifier(Modifier::BOLD);
-                push_text(&mut current, code.as_ref(), style);
+                let raw = code.as_ref();
+                let raw_len = raw.chars().count();
+                // 经验阈值：正常 inline code 不应跨行，且通常不会“吞掉”大段正文。
+                // 过长的 code span 常来自“孤立的 `”误触发（例如日志里的 `EOF'），会把后续文本全变成 code。
+                let suspicious = raw.contains('\n') || raw_len > 120;
+                if suspicious {
+                    // 防御：部分日志/终端输出可能包含“孤立的 `”等字符，导致 markdown 解析产出超长 Code span；
+                    // 这里将“异常长/跨行”的 code span 降级为普通文本，避免整段被高亮成黄底黄字。
+                    let style = inline_style(base_style, &inline, heading_level);
+                    push_text(&mut current, raw, style);
+                } else {
+                    let style = base_style
+                        .fg(Color::Yellow)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD);
+                    push_text(&mut current, raw, style);
+                }
             }
             Event::SoftBreak => {
                 if let Some(tb) = table.as_mut() {

@@ -66,7 +66,7 @@
 推荐格式（实际调用时包裹在 `<tool>...</tool>` 中）：
 
 ```json
-{"tool":"read_file","path":"src/main.rs","start_line":1,"max_lines":80,"brief":"读取入口逻辑"}
+{"tool":"read_file","path":"src/core.rs","start_line":1,"max_lines":80,"brief":"读取入口逻辑"}
 ```
 
 ### 路径规则
@@ -117,11 +117,11 @@
 推荐流程：先 `search` 定位，再分段读取。
 
 ```json
-{"tool":"read_file","path":"src/main.rs","brief":"读取入口函数附近内容"}
+{"tool":"read_file","path":"src/core.rs","brief":"读取入口函数附近内容"}
 ```
 
 ```json
-{"tool":"read_file","path":"src/main.rs","start_line":200,"max_lines":120,"brief":"读取 200-319 行"}
+{"tool":"read_file","path":"src/core.rs","start_line":200,"max_lines":120,"brief":"读取 200-319 行"}
 ```
 
 #### search
@@ -166,7 +166,7 @@
 - `brief`: 一句话目的
 
 ```json
-{"tool":"edit_file","path":"src/main.rs","find":"old","replace":"new","count":1,"brief":"替换片段"}
+{"tool":"edit_file","path":"src/core.rs","find":"old","replace":"new","count":1,"brief":"替换片段"}
 ```
 
 #### apply_patch
@@ -180,7 +180,7 @@
 - `brief`: 一句话目的
 
 ```json
-{"tool":"apply_patch","patch":"--- a/src/main.rs\n+++ b/src/main.rs\n@@\n- old\n+ new\n","strict":false,"brief":"应用补丁"}
+{"tool":"apply_patch","patch":"--- a/src/core.rs\n+++ b/src/core.rs\n@@\n- old\n+ new\n","strict":false,"brief":"应用补丁"}
 ```
 
 #### bash

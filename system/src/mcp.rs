@@ -13,7 +13,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::memorydb::{DEFAULT_MEMO_DB_PATH, MemoDb, MemoKind, MemoRow};
+use crate::memory::{DEFAULT_MEMO_DB_PATH, MemoDb, MemoKind, MemoRow};
 
 const BASH_SHELL: &str = "/data/data/com.termux/files/usr/bin/bash";
 const ADB_SERIAL: &str = "127.0.0.1:5555";
@@ -225,11 +225,6 @@ fn tool_tag_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?is)<tool>([\s\S]*?)</tool>").expect("tool regex"))
 }
 
-fn json_fence_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)```(?:json)?\s*(\{[\s\S]*?\})\s*```").expect("fence regex"))
-}
-
 fn parse_usize_value(v: &Value) -> Option<usize> {
     v.as_u64()
         .map(|n| n as usize)
@@ -304,6 +299,15 @@ pub struct ToolCall {
     pub heartbeat_minutes: Option<usize>,
     #[serde(default)]
     pub interactive: Option<bool>,
+    // pty tool：目标 job_id（kill 等）
+    #[serde(default)]
+    pub job_id: Option<u64>,
+    // pty tool：批量目标 job_ids（kill 等）
+    #[serde(default)]
+    pub job_ids: Option<Vec<u64>>,
+    // pty tool：批量启动命令（run）
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
@@ -601,6 +605,47 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "cwd" | "workdir" | "work_dir" | "dir" => {
                 call.cwd = s;
             }
+            "op" | "operation" | "action" => {
+                call.op = s;
+            }
+            "job_id" | "job" => {
+                call.job_id = val
+                    .as_u64()
+                    .or_else(|| val.as_str().and_then(|x| x.trim().parse::<u64>().ok()));
+            }
+            "commands" | "cmds" => {
+                let mut out: Vec<String> = Vec::new();
+                match val {
+                    Value::Array(arr) => {
+                        for x in arr {
+                            if let Some(t) = x.as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                                out.push(t.to_string());
+                            }
+                        }
+                    }
+                    Value::String(text) => {
+                        for line in text.lines() {
+                            let t = line.trim();
+                            if !t.is_empty() {
+                                out.push(t.to_string());
+                            }
+                        }
+                    }
+                    other => {
+                        if let Some(text) = value_to_nonempty_string(&other) {
+                            for line in text.lines() {
+                                let t = line.trim();
+                                if !t.is_empty() {
+                                    out.push(t.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    call.commands = Some(out);
+                }
+            }
             "save" | "export" | "capture" => {
                 call.save = s;
             }
@@ -768,6 +813,7 @@ fn normalize_tool_name(name: &str) -> String {
             "system_config"
         }
         "skills" | "skills_mcp" | "skill" | "skill_mcp" => "skills_mcp",
+        "pty" | "terminal" | "term" => "pty",
         _ => n,
     }
     .to_string()
@@ -1142,33 +1188,6 @@ pub fn extract_tool_calls(text: &str) -> anyhow::Result<(Vec<ToolCall>, String)>
         }
     }
 
-    let fence_re = json_fence_re();
-    for caps in fence_re.captures_iter(text) {
-        let Some(block) = caps.get(0) else {
-            continue;
-        };
-        if spans_overlap(&spans, block.start(), block.end()) {
-            continue;
-        }
-        let Some(payload) = caps.get(1).map(|m| m.as_str()) else {
-            continue;
-        };
-        if let Some(call) = parse_tool_call_payload(payload) {
-            calls.push(call);
-            spans.push((block.start(), block.end()));
-        }
-    }
-
-    for (start, end, payload) in extract_json_objects(text) {
-        if spans_overlap(&spans, start, end) {
-            continue;
-        }
-        if let Some(call) = parse_tool_call_payload(&payload) {
-            calls.push(call);
-            spans.push((start, end));
-        }
-    }
-
     let cleaned = remove_spans(text, &spans);
     Ok((calls, cleaned.trim().to_string()))
 }
@@ -1194,10 +1213,6 @@ fn normalize_tool_payload(payload: &str) -> String {
     body.trim().to_string()
 }
 
-fn spans_overlap(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
-    spans.iter().any(|(s, e)| start < *e && end > *s)
-}
-
 fn remove_spans(text: &str, spans: &[(usize, usize)]) -> String {
     if spans.is_empty() {
         return text.to_string();
@@ -1216,52 +1231,6 @@ fn remove_spans(text: &str, spans: &[(usize, usize)]) -> String {
     }
     if last < text.len() {
         out.push_str(&text[last..]);
-    }
-    out
-}
-
-fn extract_json_objects(text: &str) -> Vec<(usize, usize, String)> {
-    let mut out = Vec::new();
-    let mut in_str = false;
-    let mut escape = false;
-    let mut depth = 0usize;
-    let mut start: Option<usize> = None;
-
-    for (idx, ch) in text.char_indices() {
-        if start.is_none() {
-            if ch == '{' {
-                start = Some(idx);
-                depth = 1;
-                in_str = false;
-                escape = false;
-            }
-            continue;
-        }
-        if in_str {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_str = true,
-            '{' => depth = depth.saturating_add(1),
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    let s = start.take().unwrap_or(0);
-                    let e = idx + ch.len_utf8();
-                    if e > s && e <= text.len() {
-                        out.push((s, e, text[s..e].to_string()));
-                    }
-                }
-            }
-            _ => {}
-        }
     }
     out
 }
@@ -1325,6 +1294,38 @@ mod tests {
         assert_eq!(call.tool, "search");
         assert_eq!(call.memory, Some(true));
         assert_eq!(call.pattern.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn validate_pty_op_case_insensitive() {
+        let mut call = ToolCall::default();
+        call.tool = "pty".to_string();
+        call.op = Some("RUN".to_string());
+        call.input = "echo hi".to_string();
+        call.brief = Some("test".to_string());
+        assert!(validate_tool_call(&call).is_ok());
+    }
+
+    #[test]
+    fn validate_pty_kill_requires_job_id() {
+        let mut call = ToolCall::default();
+        call.tool = "pty".to_string();
+        call.op = Some("kill".to_string());
+        call.brief = Some("kill".to_string());
+        let err = validate_tool_call(&call).unwrap_err();
+        assert!(err.user_message.contains("job_id"));
+    }
+
+    #[test]
+    fn parse_tool_call_pty_commands_array() {
+        let call = parse_tool_call_payload(
+            r#"{"tool":"pty","op":"run","commands":["echo 1","echo 2"],"brief":"batch"}"#,
+        )
+        .expect("call");
+        assert_eq!(call.tool, "pty");
+        assert_eq!(call.op.as_deref(), Some("run"));
+        assert_eq!(call.commands.as_ref().map(|v| v.len()), Some(2));
+        assert_eq!(call.brief.as_deref(), Some("batch"));
     }
 
     #[test]
@@ -1564,6 +1565,42 @@ pub fn format_tool_hint(call: &ToolCall) -> String {
     }
 }
 
+struct ToolMessageTemplates {
+    tool_line: &'static str,
+    explain_line: &'static str,
+    input_line: &'static str,
+    output_header: &'static str,
+    output_footer: &'static str,
+    meta_header: &'static str,
+    meta_footer: &'static str,
+    no_output: &'static str,
+    unknown_tool: &'static str,
+    tool_failed: &'static str,
+    tool_failed_generic: &'static str,
+}
+
+const TOOL_MESSAGES: ToolMessageTemplates = ToolMessageTemplates {
+    tool_line: "TOOL: {TOOL}\n",
+    explain_line: "EXPLAIN: {BRIEF}\n",
+    input_line: "INPUT: {INPUT}\n",
+    output_header: "OUTPUT:\n```text\n",
+    output_footer: "\n```\n",
+    meta_header: "META:\n```text\n",
+    meta_footer: "\n```\n",
+    no_output: "(NO OUTPUT)",
+    unknown_tool: "UNKNOWN TOOL: {TOOL}",
+    tool_failed: "TOOL FAILED: {ERR}",
+    tool_failed_generic: "TOOL FAILED",
+};
+
+fn render_tool_template(template: &str, pairs: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (k, v) in pairs {
+        out = out.replace(&format!("{{{k}}}"), v);
+    }
+    out
+}
+
 fn format_tool_message_with_limits(
     call: &ToolCall,
     outcome: &ToolOutcome,
@@ -1572,17 +1609,21 @@ fn format_tool_message_with_limits(
     meta_max_lines: usize,
     meta_max_chars: usize,
 ) -> String {
-    let msgs = crate::tool_messages::tool_messages();
+    const MODEL_NOTE_PREFIX: &str = "[[AITERMUX_MODEL_NOTE]]";
+    let msgs = &TOOL_MESSAGES;
     let mut msg = String::new();
     let label = tool_display_label(&call.tool);
     if !label.is_empty() {
-        msg.push_str(&crate::tool_messages::render_tool_template(
-            &msgs.tool_line,
-            &[("TOOL", &label)],
-        ));
+        msg.push_str(&render_tool_template(&msgs.tool_line, &[("TOOL", &label)]));
     }
     let mut input_preview = describe_tool_input(call, 400);
-    if let Some((add, del, unit)) = extract_delta_from_log(&outcome.log_lines)
+    let log_lines_filtered: Vec<String> = outcome
+        .log_lines
+        .iter()
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.trim_start().starts_with(MODEL_NOTE_PREFIX))
+        .collect();
+    if let Some((add, del, unit)) = extract_delta_from_log(&log_lines_filtered)
         && (add > 0 || del > 0)
     {
         let suffix = if let Some(unit) = unit {
@@ -1601,20 +1642,20 @@ fn format_tool_message_with_limits(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        msg.push_str(&crate::tool_messages::render_tool_template(
+        msg.push_str(&render_tool_template(
             &msgs.explain_line,
             &[("BRIEF", brief)],
         ));
     }
     if !input_preview.is_empty() {
-        msg.push_str(&crate::tool_messages::render_tool_template(
+        msg.push_str(&render_tool_template(
             &msgs.input_line,
             &[("INPUT", &input_preview)],
         ));
     }
     msg.push_str(&msgs.output_header);
     let output = if outcome.user_message.trim().is_empty() {
-        msgs.no_output.clone()
+        msgs.no_output.to_string()
     } else {
         truncate_tool_payload(
             outcome.user_message.trim_end(),
@@ -1624,9 +1665,9 @@ fn format_tool_message_with_limits(
     };
     msg.push_str(&output);
     msg.push_str(&msgs.output_footer);
-    if !outcome.log_lines.is_empty() {
+    if !log_lines_filtered.is_empty() {
         msg.push_str(&msgs.meta_header);
-        let meta_join = outcome.log_lines.join("\n");
+        let meta_join = log_lines_filtered.join("\n");
         let meta = truncate_tool_payload(meta_join.trim_end(), meta_max_lines, meta_max_chars);
         msg.push_str(&meta);
         msg.push_str(&msgs.meta_footer);
@@ -1643,6 +1684,22 @@ pub fn format_tool_message_raw(call: &ToolCall, outcome: &ToolOutcome) -> String
         out_chars,
         TOOL_META_RAW_MAX_LINES,
         TOOL_META_RAW_MAX_CHARS,
+    )
+}
+
+pub fn format_tool_message_for_model(call: &ToolCall, outcome: &ToolOutcome) -> String {
+    const OUTPUT_MAX_LINES: usize = 18;
+    const OUTPUT_MAX_CHARS: usize = 1800;
+    const META_MAX_LINES: usize = 8;
+    const META_MAX_CHARS: usize = 380;
+
+    format_tool_message_with_limits(
+        call,
+        outcome,
+        OUTPUT_MAX_LINES,
+        OUTPUT_MAX_CHARS,
+        META_MAX_LINES,
+        META_MAX_CHARS,
     )
 }
 
@@ -1717,7 +1774,7 @@ fn tool_usage(tool: &str) -> &'static str {
         "list_dir" => r#"{"tool":"list_dir","path":".","brief":"列出目录"}"#,
         "stat_file" => r#"{"tool":"stat_file","path":"Cargo.toml","brief":"查看文件信息"}"#,
         "read_file" => {
-            r#"{"tool":"read_file","path":"src/main.rs","head":true,"max_lines":200,"brief":"读取文件开头"}"#
+            r#"{"tool":"read_file","path":"src/core.rs","head":true,"max_lines":200,"brief":"读取文件开头"}"#
         }
         "write_file" => {
             r#"{"tool":"write_file","path":"notes/demo.txt","content":"hello","overwrite":false,"brief":"写入文件（默认不覆盖非空文件）"}"#
@@ -1726,10 +1783,10 @@ fn tool_usage(tool: &str) -> &'static str {
             r#"{"tool":"search","pattern":"TODO","root":"src","memory":false,"brief":"搜索内容（可选 file:true 搜文件名；memory:true 搜记忆）"}"#
         }
         "edit_file" => {
-            r#"{"tool":"edit_file","path":"src/main.rs","find":"old","replace":"new","count":1,"brief":"替换片段"}"#
+            r#"{"tool":"edit_file","path":"src/core.rs","find":"old","replace":"new","count":1,"brief":"替换片段"}"#
         }
         "apply_patch" => {
-            r#"{"tool":"apply_patch","patch":"--- a/src/main.rs\n+++ b/src/main.rs\n@@\n- old\n+ new\n","strict":false,"brief":"应用补丁"}"#
+            r#"{"tool":"apply_patch","patch":"--- a/src/core.rs\n+++ b/src/core.rs\n@@\n- old\n+ new\n","strict":false,"brief":"应用补丁"}"#
         }
         "memory_check" => {
             r#"{"tool":"memory_check","pattern":"上次的工作","brief":"回忆最近的工作记录"}"#
@@ -1918,6 +1975,35 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
                 return Err(tool_format_error(tool, "缺少 category"));
             }
         }
+        "pty" => {
+            let op_raw = call.op.as_deref().unwrap_or("").trim();
+            if op_raw.is_empty() {
+                return Err(tool_format_error(tool, "缺少 op"));
+            }
+            let op = op_raw.to_ascii_lowercase();
+            match op.as_str() {
+                "list" => {}
+                "kill" => {
+                    let has_single = call.job_id.is_some();
+                    let has_batch = call
+                        .job_ids
+                        .as_ref()
+                        .is_some_and(|v| v.iter().any(|id| *id > 0));
+                    if !has_single && !has_batch {
+                        return Err(tool_format_error(tool, "pty.kill 缺少 job_id/job_ids"));
+                    }
+                }
+                "run" => {
+                    let has_cmds = call.commands.as_ref().is_some_and(|v| !v.is_empty());
+                    if !has_cmds && call.input.trim().is_empty() {
+                        return Err(tool_format_error(tool, "pty.run 缺少 commands/input"));
+                    }
+                }
+                _ => {
+                    return Err(tool_format_error(tool, "op 仅支持 run/list/kill"));
+                }
+            }
+        }
         "file_manager" => {
             let op = call.op.as_deref().unwrap_or("").trim();
             if op.is_empty() {
@@ -1971,7 +2057,7 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
         _ => {
             return Err(tool_format_error(
                 tool,
-                "未知工具（可用：bash/adb/termux_api/plan/list_dir/stat_file/read_file/write_file/search/edit_file/apply_patch/file_manager/memory_check/memory_read/memory_edit/memory_add/system_config/skills_mcp）",
+                "未知工具（可用：bash/adb/termux_api/pty/plan/list_dir/stat_file/read_file/write_file/search/edit_file/apply_patch/file_manager/memory_check/memory_read/memory_edit/memory_add/system_config/skills_mcp）",
             ));
         }
     }
@@ -2079,6 +2165,10 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         "bash" => run_bash(call),
         "adb" => run_adb(call),
         "termux_api" => run_termux_api(call),
+        "pty" => Ok(ToolOutcome {
+            user_message: "pty 工具由 TUI 主线程处理（不在此处执行）。".to_string(),
+            log_lines: vec!["状态:fail".to_string()],
+        }),
         "work" | "plan" => run_work(call),
         "read_file" => run_read_file(call),
         "write_file" => run_write_file(call),
@@ -2096,12 +2186,9 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         "system_config" => run_system_config(call),
         "skills_mcp" => run_skills_mcp(call),
         other => {
-            let msgs = crate::tool_messages::tool_messages();
+            let msgs = &TOOL_MESSAGES;
             Ok(ToolOutcome {
-                user_message: crate::tool_messages::render_tool_template(
-                    &msgs.unknown_tool,
-                    &[("TOOL", other)],
-                ),
+                user_message: render_tool_template(&msgs.unknown_tool, &[("TOOL", other)]),
                 log_lines: vec!["状态:fail".to_string()],
             })
         }
@@ -2148,11 +2235,8 @@ pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutco
                 last = Some(ToolOutcome {
                     user_message: {
                         let err = format!("{e:#}");
-                        let msgs = crate::tool_messages::tool_messages();
-                        crate::tool_messages::render_tool_template(
-                            &msgs.tool_failed,
-                            &[("ERR", &err)],
-                        )
+                        let msgs = &TOOL_MESSAGES;
+                        render_tool_template(&msgs.tool_failed, &[("ERR", &err)])
                     },
                     log_lines: vec!["状态:fail".to_string()],
                 });
@@ -2160,9 +2244,7 @@ pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutco
         }
     }
     let mut out = last.unwrap_or_else(|| ToolOutcome {
-        user_message: crate::tool_messages::tool_messages()
-            .tool_failed_generic
-            .clone(),
+        user_message: TOOL_MESSAGES.tool_failed_generic.to_string(),
         log_lines: vec!["状态:fail".to_string()],
     });
     ensure_outcome_status(&mut out);
@@ -2860,6 +2942,7 @@ fn run_termux_api(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 fn run_work(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     // 这是一个“纯 UI 工具”：用于在聊天区显示“开始工作/工作结束”的目标与汇报区块。
     // 不执行任何命令、无副作用。
+    const MODEL_NOTE_PREFIX: &str = "[[AITERMUX_MODEL_NOTE]]";
     let started = Instant::now();
     let phase_raw = call
         .section
@@ -2928,17 +3011,27 @@ fn run_work(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     }
 
     let body = body.trim_end().to_string();
+    let mut log_lines = vec![format!(
+        "状态:0 | 耗时:{}ms | phase:{}",
+        started.elapsed().as_millis(),
+        phase
+    )];
+    if matches!(call.tool.as_str(), "plan" | "work") {
+        // 给模型看的“低歧义指令”：避免反复 plan/work 循环。
+        let note = if phase == "start" {
+            "plan 已生成（start）。下一步：按 Steps 执行；每轮只调用 1 个实际工具（bash/pty/...）；不要重复 plan/work。完成后再用 plan(section=end) 汇报。"
+        } else {
+            "plan 汇报已记录（end）。若无进一步任务：停止调用工具，等待用户下一条消息。"
+        };
+        log_lines.push(format!("{MODEL_NOTE_PREFIX}{note}"));
+    }
     Ok(ToolOutcome {
         user_message: if body.is_empty() {
             "(empty)".to_string()
         } else {
             body
         },
-        log_lines: vec![format!(
-            "状态:0 | 耗时:{}ms | phase:{}",
-            started.elapsed().as_millis(),
-            phase
-        )],
+        log_lines,
     })
 }
 
@@ -7247,7 +7340,7 @@ fn run_skills_mcp(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         category
     };
     let started = Instant::now();
-    let path = Path::new("config/prompt/skills/index.md");
+    let path = Path::new("prompt/Agentskills.md");
     let raw = fs::read_to_string(path)
         .with_context(|| format!("读取 skills 失败：{}", path.display()))?;
     let section =
@@ -7417,7 +7510,7 @@ fn memory_path_for_key(key: &str) -> Option<String> {
     match key.trim().to_ascii_lowercase().as_str() {
         "meta" | "metamemo" => Some("memory/metamemo".to_string()),
         "date" | "datememo" => Some("memory/datememo".to_string()),
-        "fast" | "fastmemo" => Some(normalize_tool_path("memory/fastmemo.jsonl")),
+        "fast" | "fastmemo" => Some(normalize_tool_path("memory/fastmemory.jsonl")),
         _ => None,
     }
 }
@@ -7427,7 +7520,7 @@ fn system_config_path() -> PathBuf {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("config/system.json"))
+        .unwrap_or_else(|| PathBuf::from("config/System.json"))
 }
 
 fn memory_label_for_path(path: &str) -> String {
@@ -7481,7 +7574,7 @@ fn memory_paths_for_check(raw: &str) -> Vec<(String, String)> {
             ("datememo".to_string(), "memory/datememo".to_string()),
             (
                 "fastmemo".to_string(),
-                normalize_tool_path("memory/fastmemo.jsonl"),
+                normalize_tool_path("memory/fastmemory.jsonl"),
             ),
         ];
     }
@@ -7491,7 +7584,7 @@ fn memory_paths_for_check(raw: &str) -> Vec<(String, String)> {
             ("metamemo".to_string(), "memory/metamemo".to_string()),
             (
                 "fastmemo".to_string(),
-                normalize_tool_path("memory/fastmemo.jsonl"),
+                normalize_tool_path("memory/fastmemory.jsonl"),
             ),
         ];
     }
@@ -7637,6 +7730,83 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
                 } else {
                     s.push_str(&format!("ok_exit:[{}]", head.join(",")));
                 }
+            }
+            build_preview(&s, limit)
+        }
+        "pty" => {
+            let op = call.op.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+            let mut s = String::new();
+            if !op.is_empty() {
+                s.push_str(op.as_str());
+            }
+            match op.as_str() {
+                "kill" => {
+                    let mut ids: Vec<u64> = Vec::new();
+                    if let Some(id) = call.job_id.filter(|v| *v > 0) {
+                        ids.push(id);
+                    }
+                    if let Some(list) = call.job_ids.as_ref() {
+                        ids.extend(list.iter().copied().filter(|v| *v > 0));
+                    }
+                    ids.sort_unstable();
+                    ids.dedup();
+                    let job = if ids.is_empty() {
+                        "(missing job_id/job_ids)".to_string()
+                    } else if ids.len() == 1 {
+                        ids[0].to_string()
+                    } else {
+                        let head = ids
+                            .iter()
+                            .take(4)
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>();
+                        if ids.len() > 4 {
+                            format!("[{}…+{}]", head.join(","), ids.len() - 4)
+                        } else {
+                            format!("[{}]", head.join(","))
+                        }
+                    };
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    s.push_str(&format!("job:{job}"));
+                }
+                "run" => {
+                    if let Some(cmds) = call.commands.as_ref().filter(|v| !v.is_empty()) {
+                        if !s.is_empty() {
+                            s.push(' ');
+                        }
+                        s.push_str(&format!("cmds:{}", cmds.len()));
+                        if let Some(first) =
+                            cmds.first().map(|v| v.trim()).filter(|v| !v.is_empty())
+                        {
+                            let first = first.replace('\n', " ⏎ ").replace('\t', " ");
+                            s.push(' ');
+                            s.push_str(&build_preview(&first, 80));
+                        }
+                    } else if !call.input.trim().is_empty() {
+                        let cmd = call.input.trim().replace('\n', " ⏎ ").replace('\t', " ");
+                        if !s.is_empty() {
+                            s.push(' ');
+                        }
+                        s.push_str(&build_preview(&cmd, 110));
+                    }
+                    let mode = call.mode.as_deref().unwrap_or("").trim();
+                    if !mode.is_empty() {
+                        if !s.is_empty() {
+                            s.push(' ');
+                        }
+                        s.push_str(&format!("mode:{mode}"));
+                    }
+                }
+                "list" => {}
+                _ => {}
+            }
+            if let Some(cwd) = call.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                if !s.is_empty() {
+                    s.push_str(" in ");
+                }
+                s.push_str(&display_tool_path(cwd));
             }
             build_preview(&s, limit)
         }

@@ -1,0 +1,17 @@
+{
+  "context_k": 20,
+  "heartbeat_minutes": 60,
+  "sse_enabled": true,
+  "tool_full_access": false,
+  "paste_cache_enabled": false,
+  "chat_target": "main",
+  "fastmemo_inject_enabled": false,
+  "context_compact_enabled": false,
+  "fastmemo_compact_enabled": false,
+  "ctx_pool_max_items": 10,
+  "ctx_recent_max_tokens": 3000,
+  "context_compact_prompt_path": "prompt/contextsummary.txt",
+  "welcome_shortcuts_prompt_path": "prompt/Systemwelcome.txt",
+  "pty_help_prompt_path": "prompt/Terminalwelcome.txt",
+  "pty_audit_enabled": false
+}

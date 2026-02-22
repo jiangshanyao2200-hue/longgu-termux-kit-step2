@@ -10,10 +10,4 @@ cd ~/AItermux
 bash install.sh
 ```
 
-## 目录结构
-
-- `Quickinstall/`：一键覆盖部署脚本与模板（会写入 `~/.termux/` 和 `$PREFIX/...`）
-- `install.sh`：根目录安装入口（转调 `Quickinstall/install.sh`）
-- `system/`：Project Ying（萤）Rust 工程源码（详见 `system/README.md`）
-- `bin/aitermux`：启动器（由安装脚本写入/更新）
-
+我在建设中，不要用

@@ -25,3 +25,6 @@ system/src/*.bak*
 # local scratch
 system/test_file.txt
 test_patch.txt
+
+# local backups
+backup/

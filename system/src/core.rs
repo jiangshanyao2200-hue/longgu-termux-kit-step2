@@ -40,7 +40,6 @@ mod api;
 mod context;
 mod mcp;
 mod memory;
-mod memory_scope;
 mod providers;
 mod pseudo_terminal;
 mod test;
@@ -50,7 +49,6 @@ pub(crate) use context::{
     ApiMessage, ContextUsage, DogState, FASTMEMO_PATH, clear_contextmemo,
     fastmemo_event_count_and_any_ge10, load_contextmemo_tokens, log_contextmemo,
     normalize_messages_for_deepseek, read_contextmemo_text, read_fastmemo_for_context,
-    read_scopememo_for_context,
 };
 use providers::DogClient;
 
@@ -4805,21 +4803,9 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
 
     *active_kind = target;
     let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
+
     if sys_cfg.fastmemo_inject_enabled {
-        let mut fastmemo = read_fastmemo_for_context();
-        if sys_cfg.scopememo_inject_enabled {
-            let scope = sys_cfg.scopememo_scope.trim();
-            if !scope.is_empty() {
-                let scoped = read_scopememo_for_context(scope);
-                if !scoped.trim().is_empty() {
-                    if !fastmemo.trim().is_empty() {
-                        fastmemo.push_str("\n\n");
-                    }
-                    fastmemo.push_str(&format!("[专项记忆:{scope}]\n"));
-                    fastmemo.push_str(scoped.trim());
-                }
-            }
-        }
+        let fastmemo = read_fastmemo_for_context();
         match target {
             MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
             MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
@@ -5091,20 +5077,7 @@ fn handle_send_text(
     *active_kind = target;
     let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
     if sys_cfg.fastmemo_inject_enabled {
-        let mut fastmemo = read_fastmemo_for_context();
-        if sys_cfg.scopememo_inject_enabled {
-            let scope = sys_cfg.scopememo_scope.trim();
-            if !scope.is_empty() {
-                let scoped = read_scopememo_for_context(scope);
-                if !scoped.trim().is_empty() {
-                    if !fastmemo.trim().is_empty() {
-                        fastmemo.push_str("\n\n");
-                    }
-                    fastmemo.push_str(&format!("[专项记忆:{scope}]\n"));
-                    fastmemo.push_str(scoped.trim());
-                }
-            }
-        }
+        let fastmemo = read_fastmemo_for_context();
         match target {
             MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
             MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
@@ -14391,6 +14364,7 @@ fn handle_model_stream_end(
             // 刷新 fastmemo（尽量保证 DOG 在压缩前看到最新内容）。
             if sys_cfg.fastmemo_inject_enabled {
                 let fastmemo = read_fastmemo_for_context();
+                main_state.refresh_fastmemo_system(&fastmemo);
                 dog_state.refresh_fastmemo_system(&fastmemo);
             }
             push_sys_log(sys_log, sys_log_limit, "fastmemo 自动压缩中");
@@ -16758,10 +16732,6 @@ mod config {
         pub paste_cache_enabled: bool,
         #[serde(default)]
         pub fastmemo_inject_enabled: bool,
-        #[serde(default)]
-        pub scopememo_inject_enabled: bool,
-        #[serde(default)]
-        pub scopememo_scope: String,
         // 开发期：先聚焦 MCP 软件本身，暂时关闭自动压缩相关链路（可在配置中重新开启）。
         #[serde(default)]
         pub context_compact_enabled: bool,
@@ -16997,8 +16967,6 @@ mod config {
                 tool_full_access: false,
                 paste_cache_enabled: false,
                 fastmemo_inject_enabled: false,
-                scopememo_inject_enabled: false,
-                scopememo_scope: String::new(),
                 context_compact_enabled: false,
                 fastmemo_compact_enabled: false,
                 ctx_recent_max_tokens: default_ctx_recent_max_tokens(),

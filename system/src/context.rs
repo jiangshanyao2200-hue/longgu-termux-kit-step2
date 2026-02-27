@@ -311,7 +311,6 @@ pub(crate) fn score_context_health(provider: &str, messages: &[ApiMessage]) -> C
 
 pub(crate) const FASTMEMO_PATH: &str = "memory/fastmemory.jsonl";
 const FASTMEMO_MAX_INJECT_CHARS: usize = 1800;
-const SCOPEMEMO_MAX_INJECT_CHARS: usize = 1000;
 
 fn truncate_chars_safe(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
@@ -343,16 +342,6 @@ pub(crate) fn read_fastmemo_for_context() -> String {
     truncate_chars_safe(text.trim(), FASTMEMO_MAX_INJECT_CHARS)
 }
 
-pub(crate) fn read_scopememo_for_context(scope: &str) -> String {
-    crate::memory_scope::ensure_scope_dir();
-    let Some(rel) = crate::memory_scope::scopememo_rel_path(scope) else {
-        return String::new();
-    };
-    let _ = crate::mcp::ensure_memory_file("scopememo", &rel);
-    let path = Path::new(&rel);
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    truncate_chars_safe(text.trim(), SCOPEMEMO_MAX_INJECT_CHARS)
-}
 
 pub(crate) fn fastmemo_event_count_and_any_ge10(text: &str) -> (usize, bool) {
     let mut current: Option<&str> = None;

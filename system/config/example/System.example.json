@@ -6,8 +6,6 @@
   "paste_cache_enabled": false,
   "chat_target": "main",
   "fastmemo_inject_enabled": false,
-  "scopememo_inject_enabled": false,
-  "scopememo_scope": "",
   "context_compact_enabled": false,
   "fastmemo_compact_enabled": false,
   "ctx_pool_max_items": 10,

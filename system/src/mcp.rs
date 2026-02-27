@@ -4676,7 +4676,7 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
     let mut global_max: Option<NaiveDate> = None;
 
     for (label, path) in files {
-        if label == "fastmemo" || label == "scopememo" {
+        if label == "fastmemo" {
             let text = fs::read_to_string(&path).unwrap_or_default();
             let mut block_hits = 0usize;
             // fastmemo 的 block 头部是日期；memory_check/search(memory) 默认不做复杂区间筛选，避免误命中。
@@ -6154,7 +6154,7 @@ fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolO
             }
             continue;
         }
-        if label == "fastmemo" || label == "scopememo" {
+        if label == "fastmemo" {
             collected.push(line);
             collecting = true;
             continue;
@@ -6246,8 +6246,8 @@ fn run_memory_edit(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let Some((label, path)) = resolve_memory_path_label(raw) else {
         return Ok(tool_format_error("memory_edit", "缺少有效 path"));
     };
-    if label != "fastmemo" && label != "scopememo" {
-        return Ok(tool_format_error("memory_edit", "仅支持 fastmemo/scopememo"));
+    if label != "fastmemo" {
+        return Ok(tool_format_error("memory_edit", "仅支持 fastmemo"));
     }
     ensure_memory_file(&label, &path)?;
     let section_raw = call.section.as_deref().unwrap_or("").trim();
@@ -6633,8 +6633,8 @@ fn run_memory_add(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let Some((label, path)) = resolve_memory_path_label(raw) else {
         return Ok(tool_format_error("memory_add", "缺少有效 path"));
     };
-    if label != "fastmemo" && label != "scopememo" {
-        return Ok(tool_format_error("memory_add", "仅支持 fastmemo/scopememo"));
+    if label != "fastmemo" {
+        return Ok(tool_format_error("memory_add", "仅支持 fastmemo"));
     }
     let content = call.content.as_deref().unwrap_or("").trim();
     if content.is_empty() {
@@ -6767,7 +6767,7 @@ fn run_system_config(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 }
 
 pub(crate) fn ensure_memory_file(label: &str, path: &str) -> anyhow::Result<()> {
-    if label != "fastmemo" && label != "scopememo" {
+    if label != "fastmemo" {
         MemoDb::open_default().ok();
         return Ok(());
     }
@@ -6802,7 +6802,7 @@ pub(crate) fn ensure_memory_file(label: &str, path: &str) -> anyhow::Result<()> 
     }
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let header = match label {
-        "fastmemo" | "scopememo" => {
+        "fastmemo" => {
             build_fastmemo_v3_template(&now.to_string(), &std::collections::HashMap::new())
         }
         "datememo" => format!(
@@ -7040,9 +7040,8 @@ fn memory_label_for_path(path: &str) -> String {
         "metamemo".to_string()
     } else if lower.contains("datememo") {
         "datememo".to_string()
-    } else if lower.contains("scopememo") {
-        "scopememo".to_string()
-    } else if lower.contains("fastmemo") {
+    
+} else if lower.contains("fastmemo") {
         "fastmemo".to_string()
     } else {
         String::new()
@@ -7054,11 +7053,6 @@ fn resolve_memory_path_label(raw: &str) -> Option<(String, String)> {
         return None;
     }
     let lower = raw.trim().to_ascii_lowercase();
-    if lower.starts_with("scopememo:") || lower.starts_with("scope:") {
-        let name = raw.trim().splitn(2, ":").nth(1).unwrap_or("").trim();
-        let rel = crate::memory_scope::scopememo_rel_path(name)?;
-        return Some(("scopememo".to_string(), normalize_tool_path(&rel)));
-    }
     if lower.contains("metamemo") {
         return Some(("metamemo".to_string(), memory_path_for_key("metamemo")?));
     }
@@ -7087,13 +7081,6 @@ fn resolve_memory_path_label(raw: &str) -> Option<(String, String)> {
 
 fn memory_paths_for_check(raw: &str) -> Vec<(String, String)> {
     let target = raw.trim().to_ascii_lowercase();
-    if target.starts_with("scopememo:") || target.starts_with("scope:") {
-        let name = raw.trim().splitn(2, ":").nth(1).unwrap_or("").trim();
-        if let Some(rel) = crate::memory_scope::scopememo_rel_path(name) {
-            return vec![("scopememo".to_string(), normalize_tool_path(&rel))];
-        }
-        return vec![];
-    }
     if target.is_empty() {
         return vec![
             ("datememo".to_string(), "memory/datememo".to_string()),

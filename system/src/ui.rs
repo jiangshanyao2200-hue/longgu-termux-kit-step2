@@ -89,6 +89,31 @@ fn truncate_to_width_ellipsis(text: &str, max_cells: usize) -> String {
     out
 }
 
+// Middle truncation to preserve head+tail (useful for long commands/paths).
+fn truncate_to_width_middle_ellipsis(text: &str, max_cells: usize) -> String {
+    if max_cells == 0 {
+        return String::new();
+    }
+    if text.is_empty() {
+        return String::new();
+    }
+    let total = UnicodeWidthStr::width(text);
+    if total <= max_cells {
+        return text.to_string();
+    }
+    if max_cells == 1 {
+        return "…".to_string();
+    }
+    if max_cells <= 4 {
+        return truncate_to_width_ellipsis(text, max_cells);
+    }
+    let head = (max_cells.saturating_mul(2) / 3).max(1);
+    let tail = max_cells.saturating_sub(head).saturating_sub(1).max(1);
+    let head_part = slice_by_cells(text, 0, head);
+    let tail_part = slice_by_cells(text, total.saturating_sub(tail), tail);
+    format!("{head_part}…{tail_part}")
+}
+
 fn build_settings_tab_lines(
     menu_items: &[String],
     selected: usize,
@@ -514,6 +539,7 @@ struct SeparatorSpansArgs<'a> {
     mode: Mode,
     active_kind: MindKind,
     user_active: bool,
+    highlight: bool,
     tick: usize,
     theme: &'a Theme,
 }
@@ -524,6 +550,7 @@ fn build_separator_spans(args: SeparatorSpansArgs<'_>) -> Vec<Span<'static>> {
         mode,
         active_kind: _active_kind,
         user_active,
+        highlight,
         tick,
         theme,
     } = args;
@@ -539,7 +566,17 @@ fn build_separator_spans(args: SeparatorSpansArgs<'_>) -> Vec<Span<'static>> {
         Mode::Generating | Mode::ExecutingTool | Mode::ApprovingTool
     );
     let use_user = user_active && !active;
-    let base_style = Style::default().fg(theme.border_idle).bg(theme.bg);
+    let base_style = Style::default()
+        .fg(if highlight {
+            theme.border_active
+        } else {
+            theme.border_idle
+        })
+        .bg(theme.bg);
+    let hi_style_focus = Style::default()
+        .fg(theme.border_active)
+        .bg(theme.bg)
+        .add_modifier(Modifier::BOLD);
     let hi_style_user = Style::default()
         .fg(theme.fg)
         .bg(theme.bg)
@@ -547,6 +584,9 @@ fn build_separator_spans(args: SeparatorSpansArgs<'_>) -> Vec<Span<'static>> {
     let hi_style_active = Style::default()
         .fg(if mode == Mode::ApprovingTool {
             theme.border_warn
+        } else if highlight {
+            // 生成/执行工具时也要保留“焦点高亮”，否则动画会把高亮视觉吞掉（小屏特别明显）。
+            theme.border_active
         } else {
             theme.fg
         })
@@ -565,6 +605,10 @@ fn build_separator_spans(args: SeparatorSpansArgs<'_>) -> Vec<Span<'static>> {
             spans.push(Span::styled("─".repeat(rest), base_style));
         }
         return spans;
+    }
+    if highlight && !active {
+        // focus 高亮：整条横杠更亮，强调“当前焦点在哪”。
+        return vec![Span::styled("━".repeat(len), hi_style_focus)];
     }
     if active {
         // “中间呼吸”：宽度在 1/3/5 之间变化，避免跑马。
@@ -678,241 +722,6 @@ fn extract_tool_sections(text: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     (output_lines, meta_lines)
-}
-
-fn extract_tool_kv_token(text: &str, key: &str) -> Option<String> {
-    let needle = format!("{key}:");
-    let needle_lower = needle.to_ascii_lowercase();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        let Some(pos) = lower.find(&needle_lower) else {
-            continue;
-        };
-        let rest = trimmed[pos + needle.len()..].trim();
-        let token = rest
-            .split(|c: char| c.is_whitespace() || c == '|' || c == ',' || c == ')')
-            .next()
-            .unwrap_or("")
-            .trim();
-        if !token.is_empty() {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
-fn parse_plan_fields(raw: &str) -> (Option<String>, Vec<String>, Option<String>, Vec<String>) {
-    #[derive(Clone, Copy)]
-    enum Mode {
-        None,
-        Steps,
-    }
-    fn split_kv(line: &str) -> Option<(&'static str, String)> {
-        let t = line.trim();
-        if t.is_empty() {
-            return None;
-        }
-        let lower = t.to_ascii_lowercase();
-        for (k, key, zh_key) in [
-            ("target", "target:", "目标:"),
-            ("steps", "steps:", "步骤:"),
-            ("time", "time:", "预计耗时:"),
-            ("time", "time:", "耗时:"),
-        ] {
-            if lower.starts_with(key) {
-                return Some((k, t[key.len()..].trim().to_string()));
-            }
-            if t.starts_with(zh_key) || t.starts_with(&zh_key.replace(':', "：")) {
-                let rest = t
-                    .trim_start_matches(zh_key)
-                    .trim_start_matches(&zh_key.replace(':', "："))
-                    .trim();
-                return Some((k, rest.to_string()));
-            }
-        }
-        None
-    }
-
-    let mut target: Option<String> = None;
-    let mut steps: Vec<String> = Vec::new();
-    let mut time: Option<String> = None;
-    let mut report: Vec<String> = Vec::new();
-    let mut mode = Mode::None;
-
-    for line in raw.lines() {
-        if let Some((k, v)) = split_kv(line) {
-            match k {
-                "target" => {
-                    mode = Mode::None;
-                    if !v.trim().is_empty() {
-                        target = Some(v);
-                    }
-                }
-                "steps" => {
-                    mode = Mode::Steps;
-                    if !v.trim().is_empty() {
-                        steps.push(v);
-                    }
-                }
-                "time" => {
-                    mode = Mode::None;
-                    if !v.trim().is_empty() {
-                        time = Some(v);
-                    }
-                }
-                _ => {}
-            }
-            continue;
-        }
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        match mode {
-            Mode::Steps => steps.push(t.to_string()),
-            Mode::None => report.push(t.to_string()),
-        }
-    }
-    (target, steps, time, report)
-}
-
-fn format_plan_display(raw_body: &str, is_end: bool) -> String {
-    let (target, steps, time, report) = parse_plan_fields(raw_body);
-    let mut out = String::new();
-    if is_end {
-        if !report.is_empty() {
-            out.push_str("工作结果汇报：\n");
-            for line in report {
-                out.push_str(&format!("  {line}\n"));
-            }
-        } else if target.is_some() || !steps.is_empty() {
-            // 兜底：如果用户把汇报写成了 target/steps 结构，也能展示出来。
-            if let Some(t) = target {
-                out.push_str(&format!("工作结果：{t}\n"));
-            }
-            if !steps.is_empty() {
-                for s in steps {
-                    out.push_str(&format!("  {s}\n"));
-                }
-            }
-        }
-        if let Some(t) = time.filter(|s| !s.trim().is_empty()) {
-            out.push_str(&format!("工作耗时：{t}\n"));
-        }
-        return out.trim_end().to_string();
-    }
-
-    if let Some(t) = target.filter(|s| !s.trim().is_empty()) {
-        out.push_str(&format!("目标：{t}\n"));
-    } else if !report.is_empty() {
-        out.push_str(&format!("目标：{}\n", report[0]));
-    }
-
-    let effective_steps = if !steps.is_empty() {
-        steps
-    } else if report.len() > 1 {
-        report[1..].iter().map(|s| s.to_string()).collect()
-    } else {
-        Vec::new()
-    };
-    if !effective_steps.is_empty() {
-        out.push_str("步骤：\n");
-        for s in effective_steps {
-            out.push_str(&format!("  - {s}\n"));
-        }
-    }
-    if let Some(t) = time.filter(|s| !s.trim().is_empty()) {
-        out.push_str(&format!("预计耗时：{t}\n"));
-    }
-    out.trim_end().to_string()
-}
-
-fn build_plan_panel_lines(
-    theme: &Theme,
-    width: usize,
-    is_end: bool,
-    running: bool,
-    body: &str,
-    tick: usize,
-) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    let title = if is_end {
-        "Working finished"
-    } else {
-        "Start to working"
-    };
-    let w = width.max(1);
-    let dim_style = Style::default().fg(theme.dim).bg(theme.bg);
-    let label_style = Style::default()
-        .fg(theme.fg)
-        .bg(theme.bg)
-        .add_modifier(Modifier::BOLD);
-
-    // Plan 渲染节奏：
-    // - tool stub / parsing / running 阶段：只显示 “● Planning...” 占位，避免先出现上下横线再补正文的跳动感。
-    // - 完整态：一次性绘制框架（标题 + 正文 + 底横线），正文仍可由 plan_reveal 做“打字机”渐显。
-    if running {
-        let dots = match tick % 3 {
-            0 => ".",
-            1 => "..",
-            _ => "...",
-        };
-        let stub = truncate_to_width(&format!("● Planning{dots}"), w);
-        lines.push(Line::from(Span::styled(stub, dim_style)));
-        return lines;
-    }
-
-    // 标题左侧增加两段横线，视觉更稳：`──○ Start... ○────`
-    let header = format!("──○ {title} ○");
-    let header_w = UnicodeWidthStr::width(header.as_str());
-    // 顶部：居左固定标题，右侧用浅色横线补齐（更稳定，不会随宽度抖动居中）。
-    let mut top_spans: Vec<Span<'static>> = Vec::new();
-    top_spans.push(Span::styled(truncate_to_width(&header, w), label_style));
-    if header_w < w {
-        top_spans.push(Span::styled(
-            "─".repeat(w.saturating_sub(header_w)),
-            dim_style,
-        ));
-    }
-    lines.push(Line::from(top_spans));
-
-    let avail = w.saturating_sub(2).max(1);
-    let body = body.trim_end();
-    let mut any = false;
-    for raw in body.lines() {
-        let t = raw.trim_end();
-        if t.trim().is_empty() {
-            continue;
-        }
-        any = true;
-        for chunk in wrap_plain_line(t, avail) {
-            lines.push(Line::from(vec![
-                Span::styled("  ", Style::default().fg(theme.dim).bg(theme.bg)),
-                Span::styled(chunk, Style::default().fg(theme.fg).bg(theme.bg)),
-            ]));
-        }
-    }
-    if !any {
-        let stub = if running {
-            let dots = match tick % 3 {
-                0 => ".",
-                1 => "..",
-                _ => "...",
-            };
-            format!("准备中{dots}")
-        } else {
-            "(无内容)".to_string()
-        };
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default().fg(theme.dim).bg(theme.bg)),
-            Span::styled(stub, Style::default().fg(theme.dim).bg(theme.bg)),
-        ]));
-    }
-    // 底部分隔线：纯横杠、浅色，形成区域隔离（开始/结束都保留）。
-    lines.push(Line::from(Span::styled("─".repeat(w), dim_style)));
-    lines
 }
 
 fn extract_brief_value(line: &str) -> Option<String> {
@@ -1426,7 +1235,18 @@ fn summarize_tool_message(text: &str) -> String {
         .get(..crate::types::THINK_TOOL_MARKER.len())
         .unwrap_or("")
         .eq_ignore_ascii_case(crate::types::THINK_TOOL_MARKER);
-    let mut tool = if is_think_msg { "think" } else { "tool" };
+    let is_brief_msg = text
+        .trim_start()
+        .get(..crate::types::BRIEF_TOOL_MARKER.len())
+        .unwrap_or("")
+        .eq_ignore_ascii_case(crate::types::BRIEF_TOOL_MARKER);
+    let mut tool = if is_think_msg {
+        "think"
+    } else if is_brief_msg {
+        "brief"
+    } else {
+        "tool"
+    };
     let mut input = None;
     let mut raw_input = None;
     let mut brief = None;
@@ -1434,7 +1254,7 @@ fn summarize_tool_message(text: &str) -> String {
     for line in text.lines() {
         let trimmed = line.trim_start();
         let lower = trimmed.to_ascii_lowercase();
-        if !is_think_msg {
+        if !is_think_msg && !is_brief_msg {
             if let Some(val) = trimmed.strip_prefix("[tool:") {
                 let val = val.trim_end_matches(']').trim();
                 if !val.is_empty() {
@@ -1481,9 +1301,6 @@ fn summarize_tool_message(text: &str) -> String {
     // canonicalize tool display label → stable key
     if tool.eq_ignore_ascii_case("bash") {
         tool = "bash";
-    }
-    if tool.eq_ignore_ascii_case("plan") || tool.eq_ignore_ascii_case("work") {
-        tool = "plan";
     }
     if tool.eq_ignore_ascii_case("search") {
         let pattern = raw_input
@@ -1597,6 +1414,18 @@ fn compact_ws_inline(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn strip_ok_exit_tokens(raw: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for tok in raw.split_whitespace() {
+        let t = tok.trim();
+        if t.starts_with("ok_exit:[") || t.starts_with("ok_exit_codes:[") {
+            continue;
+        }
+        out.push(tok);
+    }
+    out.join(" ")
+}
+
 fn normalize_tool_display(tool: &str, raw_cmd: &str) -> (String, String) {
     let tool_key = tool.trim();
     let tool_name = match tool_key {
@@ -1609,7 +1438,9 @@ fn normalize_tool_display(tool: &str, raw_cmd: &str) -> (String, String) {
     }
     .to_string();
 
-    let cmd = compact_ws_inline(raw_cmd);
+    let mut cmd = compact_ws_inline(raw_cmd);
+    // UI 展示层：隐藏 ok_exit[...]（避免噪音挤占一行），但不影响协议层/上下文原文。
+    cmd = strip_ok_exit_tokens(&cmd);
     if cmd.is_empty() {
         return (tool_name, String::new());
     }
@@ -1741,9 +1572,10 @@ fn tool_compact_title_parts(tool_raw: &str) -> (String, String, String) {
     let key = tool_raw.trim();
     match key {
         "Shell" => ("Worked with ".to_string(), "ADB".to_string(), String::new()),
-        "Run" | "bash" | "Bash" | "BASH" => ("Ran ".to_string(), "CMD".to_string(), String::new()),
-        "Termux" => (String::new(), "Termux".to_string(), " API".to_string()),
-        "Plan" | "plan" => (String::new(), "Plan".to_string(), String::new()),
+        "Run" => ("Ran ".to_string(), "CMD".to_string(), String::new()),
+        "bash" | "Bash" | "BASH" => ("Ran ".to_string(), "Bash".to_string(), String::new()),
+        "adb" | "ADB" => ("Ran ".to_string(), "ADB".to_string(), String::new()),
+        "termux_api" | "Termux" => (String::new(), "Termux".to_string(), " API".to_string()),
         "MAdd" => (String::new(), "Memory".to_string(), " Add".to_string()),
         "MEdit" => (String::new(), "Memory".to_string(), " Edit".to_string()),
         "MRead" => (String::new(), "Memory".to_string(), " Read".to_string()),
@@ -1755,6 +1587,9 @@ fn tool_compact_title_parts(tool_raw: &str) -> (String, String, String) {
         "List" => (String::new(), "Listed".to_string(), String::new()),
         "Search" => (String::new(), "Search".to_string(), String::new()),
         "Info" => (String::new(), "Info".to_string(), String::new()),
+        "pty" | "PTY" | "Terminal" | "TERMINAL" => {
+            (String::new(), "Terminal".to_string(), String::new())
+        }
         other => (String::new(), other.to_string(), String::new()),
     }
 }
@@ -1966,22 +1801,130 @@ fn render_tool_detail_lines(
     out
 }
 
-fn render_think_output_lines(theme: &Theme, text: &str, width: usize) -> Vec<Line<'static>> {
+fn render_shell_tool_detail_lines(theme: &Theme, text: &str, width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();
     }
-    let (output_lines, _meta_lines) = extract_tool_sections(text);
-    if output_lines.is_empty() {
+    let (output_lines, meta_lines) = extract_tool_sections(text);
+    if output_lines.is_empty() && meta_lines.is_empty() {
         return Vec::new();
     }
-    let avail = width.max(1);
-    let style = Style::default().fg(theme.dim).bg(theme.bg);
-    let mut out = Vec::new();
-    for line in output_lines {
-        for chunk in wrap_plain_line(&line, avail) {
-            out.push(Line::from(vec![Span::styled(chunk, style)]));
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let heading_style = Style::default().fg(theme.dim).bg(theme.bg);
+    let pipe_style = Style::default().fg(theme.dim).bg(theme.bg);
+    let content_style = Style::default().fg(theme.fg).bg(theme.bg);
+
+    // output：最多 7 行，超出则保留头尾并在中间插入提示行。
+    let filtered: Vec<String> = output_lines
+        .iter()
+        .map(|raw| sanitize_tool_detail_line(raw))
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !is_tool_progress_noise_line(s))
+        // UI 层：去掉冗长的截断提示与重复的 saved 行（协议层原文仍保留，用于模型上下文）。
+        .filter(|s| !s.contains("[输出已截断"))
+        .filter(|s| !s.trim_start().starts_with("[saved:"))
+        .collect();
+    if !filtered.is_empty() {
+        out.push(Line::from(vec![Span::styled("  ● output:", heading_style)]));
+        let prefix = "  ┆ ";
+        let prefix_w = UnicodeWidthStr::width(prefix);
+        let avail = width.saturating_sub(prefix_w).max(1);
+        const MAX_LINES: usize = 7;
+        const HEAD: usize = 3;
+        const TAIL: usize = 3;
+        if filtered.len() <= MAX_LINES {
+            for line in &filtered {
+                for chunk in wrap_plain_line(line, avail) {
+                    if chunk.trim().is_empty() {
+                        continue;
+                    }
+                    out.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), pipe_style),
+                        Span::styled(chunk, content_style),
+                    ]));
+                }
+            }
+        } else {
+            for line in filtered.iter().take(HEAD) {
+                for chunk in wrap_plain_line(line, avail) {
+                    if chunk.trim().is_empty() {
+                        continue;
+                    }
+                    out.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), pipe_style),
+                        Span::styled(chunk, content_style),
+                    ]));
+                }
+            }
+            let omitted = filtered.len().saturating_sub(HEAD + TAIL);
+            let note = format!("... [truncated {omitted} lines]");
+            for chunk in wrap_plain_line(&note, avail) {
+                out.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), pipe_style),
+                    Span::styled(chunk, heading_style),
+                ]));
+            }
+            for line in filtered.iter().skip(filtered.len().saturating_sub(TAIL)) {
+                for chunk in wrap_plain_line(line, avail) {
+                    if chunk.trim().is_empty() {
+                        continue;
+                    }
+                    out.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), pipe_style),
+                        Span::styled(chunk, content_style),
+                    ]));
+                }
+            }
         }
     }
+
+    // meta：shell 类工具不展示整块 meta，只保留必要状态/耗时（降低噪音与重复）。
+    let status_line = tool_status_result_line(text);
+    if let Some(line) = status_line {
+        let prefix = "  ┆ ";
+        let prefix_w = UnicodeWidthStr::width(prefix);
+        let avail = width.saturating_sub(prefix_w).max(1);
+        for chunk in wrap_plain_line(&line, avail) {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            out.push(Line::from(vec![
+                Span::styled(prefix.to_string(), pipe_style),
+                Span::styled(chunk, heading_style),
+            ]));
+        }
+    }
+    let elapsed = meta_lines.iter().find_map(|raw| {
+        let line = sanitize_tool_detail_line(raw);
+        let line = line.trim();
+        let Some(pos) = line.find("耗时:") else {
+            return None;
+        };
+        let rest = line[pos + "耗时:".len()..].trim_start();
+        let token = rest
+            .split(|c: char| c.is_whitespace() || c == '|' || c == ',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        (!token.is_empty()).then(|| token.to_string())
+    });
+    if let Some(elapsed) = elapsed {
+        let prefix = "  ┆ ";
+        let prefix_w = UnicodeWidthStr::width(prefix);
+        let avail = width.saturating_sub(prefix_w).max(1);
+        let line = format!("耗时:{elapsed}");
+        for chunk in wrap_plain_line(&line, avail) {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            out.push(Line::from(vec![
+                Span::styled(prefix.to_string(), pipe_style),
+                Span::styled(chunk, heading_style),
+            ]));
+        }
+    }
+
     out
 }
 
@@ -2257,9 +2200,13 @@ pub fn draw_settings(f: &mut ratatui::Frame, args: DrawSettingsArgs<'_>) -> Sett
     for (idx, (label, value)) in fields.iter().take(max_fields).enumerate() {
         let is_sel = idx == field_selected;
         let is_focus = matches!(focus, SettingsFocus::Fields | SettingsFocus::Input);
-        let label_pad = pad_to_width(label, label_w);
-        let base = format!("{label_pad} : {value}");
-        let text = truncate_to_width(&base, field_w);
+        let text = if label.is_empty() {
+            truncate_to_width(value, field_w)
+        } else {
+            let label_pad = pad_to_width(label, label_w);
+            let base = format!("{label_pad} : {value}");
+            truncate_to_width(&base, field_w)
+        };
         let style = if is_sel && is_focus {
             Style::default()
                 .fg(theme.sel_fg)
@@ -2287,6 +2234,7 @@ pub fn draw_settings_status(
     focus: SettingsFocus,
     tick: usize,
     hint: &str,
+    right_hint: &str,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -2311,11 +2259,44 @@ pub fn draw_settings_status(
     let dot = "";
     let left_pad = 1usize;
     let dot_w = UnicodeWidthStr::width(dot);
-    let avail = max_w
+    // 右侧动作提示：仅用于人类观测。
+    let mut rhs = compact_ws(right_hint).trim().to_string();
+    let rhs_style = Style::default()
+        .fg(theme.cyan)
+        .bg(theme.bg)
+        .add_modifier(Modifier::BOLD);
+    let mut rhs_w = 0usize;
+    let mut rhs_gap = 0usize;
+    if !rhs.is_empty() {
+        let cap = (max_w / 3).clamp(8, 28).min(max_w);
+        rhs = truncate_to_width_ellipsis(&rhs, cap);
+        rhs_w = UnicodeWidthStr::width(rhs.as_str());
+        rhs_gap = 2;
+    }
+    let mut avail = max_w
         .saturating_sub(left_pad)
         .saturating_sub(dot_w.saturating_add(1))
         .max(1);
+    if rhs_w > 0 {
+        let reserve = rhs_w.saturating_add(rhs_gap);
+        let min_left = 6usize;
+        if reserve.saturating_add(min_left) > avail {
+            let cap2 = avail.saturating_sub(min_left);
+            if cap2 >= 6 {
+                rhs = truncate_to_width_ellipsis(&rhs, cap2);
+                rhs_w = UnicodeWidthStr::width(rhs.as_str());
+            } else {
+                rhs.clear();
+                rhs_w = 0;
+                rhs_gap = 0;
+            }
+        }
+        if rhs_w > 0 {
+            avail = avail.saturating_sub(rhs_w.saturating_add(rhs_gap)).max(1);
+        }
+    }
     let text = truncate_to_width(display, avail);
+    let text_w = UnicodeWidthStr::width(text.as_str());
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
         " ".repeat(left_pad),
@@ -2336,6 +2317,24 @@ pub fn draw_settings_status(
             .bg(theme.bg)
             .add_modifier(Modifier::BOLD),
     ));
+    let used_w = left_pad
+        .saturating_add(dot_w)
+        .saturating_add(1)
+        .saturating_add(text_w);
+    if rhs_w == 0 {
+        if used_w < max_w {
+            spans.push(Span::styled(
+                " ".repeat(max_w.saturating_sub(used_w)),
+                Style::default().bg(theme.bg),
+            ));
+        }
+    } else {
+        let pad = max_w.saturating_sub(rhs_w).saturating_sub(used_w);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(theme.bg)));
+        }
+        spans.push(Span::styled(rhs, rhs_style));
+    }
     let line = Line::from(spans);
     let p = Paragraph::new(Text::from(line))
         .block(Block::default().borders(Borders::NONE))
@@ -2348,14 +2347,15 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
     let DrawHeaderArgs {
         theme,
         area,
-        main_mode,
-        dog_mode,
+        main_mode: _main_mode,
+        dog_mode: _dog_mode,
         user_active: _user_active,
-        pulse_dir,
+        pulse_dir: _pulse_dir,
         tick: _tick,
         run_secs,
     } = args;
-    // 顶栏一行：左（系统状态）/中（运行时间）/右（品牌）
+    // 顶栏一行：左（品牌静态）/右（运行时间）
+    // 约束：顶栏不要展示 Working/Connecting/Ready 等动态状态（避免噪声与误导）。
     let block = Block::default()
         .borders(Borders::NONE)
         .style(Style::default().bg(theme.bg));
@@ -2373,43 +2373,28 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
         height: 1,
     };
 
-    let main_active = matches!(
-        main_mode,
-        Mode::Generating | Mode::ExecutingTool | Mode::ApprovingTool
-    );
-    let dog_active = matches!(
-        dog_mode,
-        Mode::Generating | Mode::ExecutingTool | Mode::ApprovingTool
-    );
-
-    // 左侧：系统状态（优先显示“沟通”）。
-    let (status_icon, status_text) = match pulse_dir {
-        Some(PulseDir::MainToDog) => ("", "萤 → 记忆 同步"),
-        Some(PulseDir::DogToMain) => ("", "记忆 → 萤 同步"),
-        None if main_active && dog_active => ("", "双核·Working"),
-        None if main_active => ("", "萤·Working"),
-        None if dog_active => ("", "记忆·Working"),
-        None => ("", "就绪"),
-    };
+    // 左侧：品牌（静态）。
+    let brand_icon = "";
+    let brand = "Powered by AItermux";
     let left_line = Line::from(vec![
         Span::styled(
-            status_icon,
+            brand_icon,
             Style::default()
-                .fg(theme.cyan)
+                .fg(theme.dim)
                 .bg(theme.bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("·", Style::default().fg(theme.dim).bg(theme.bg)),
         Span::styled(
-            status_text,
+            brand,
             Style::default()
-                .fg(theme.fg)
+                .fg(theme.dim)
                 .bg(theme.bg)
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
 
-    // 中间：运行时间（days>0 时显示 Days；其它 0 值段不显示）。
+    // 右侧：运行时间（days>0 时显示 Days；其它 0 值段不显示）。不加图标，减少视觉噪声。
     let uptime = {
         let days = (run_secs / 86_400).min(999);
         let rem = run_secs % 86_400;
@@ -2426,8 +2411,8 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
             format!("{s}s")
         }
     };
-    let center_w = UnicodeWidthStr::width(uptime.as_str()).min(max_w).max(1) as u16;
-    let center_line = Line::from(Span::styled(
+    let uptime_w = UnicodeWidthStr::width(uptime.as_str()).min(max_w).max(1) as u16;
+    let right_line = Line::from(Span::styled(
         uptime,
         Style::default()
             .fg(theme.dim)
@@ -2435,62 +2420,40 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
             .add_modifier(Modifier::BOLD),
     ));
 
-    // 右侧：品牌（静态）。小屏信息密度高，避免额外动画干扰。
-    let brand_icon = "";
-    let brand = "AItermux";
-    let brand_color = theme.dim;
-    let right_line = Line::from(vec![
-        Span::styled(
-            brand_icon,
-            Style::default()
-                .fg(brand_color)
-                .bg(theme.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("·", Style::default().fg(theme.dim).bg(theme.bg)),
-        Span::styled(
-            brand,
-            Style::default()
-                .fg(theme.fg)
-                .bg(theme.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    let center_x = line_area
-        .x
-        .saturating_add(line_area.width.saturating_sub(center_w) / 2);
-    let center_area = Rect {
-        x: center_x,
+    let line_w = line_area.width.max(1);
+    if uptime_w >= line_w {
+        // 极窄屏：只显示右侧运行时间（其它信息无空间）。
+        let right_p = Paragraph::new(Text::from(right_line))
+            .block(Block::default().borders(Borders::NONE))
+            .style(Style::default().bg(theme.bg))
+            .alignment(ratatui::layout::Alignment::Right);
+        f.render_widget(right_p, line_area);
+        return;
+    }
+    let right_area = Rect {
+        x: line_area.x.saturating_add(line_w.saturating_sub(uptime_w)),
         y: line_area.y,
-        width: center_w,
+        width: uptime_w,
         height: 1,
     };
+
+    let left_text = format!("{brand_icon}·{brand}");
+    let left_w_full = UnicodeWidthStr::width(left_text.as_str()).min(max_w) as u16;
+    let max_left = line_w.saturating_sub(uptime_w).saturating_sub(1);
+    let left_w = left_w_full.min(max_left);
     let left_area = Rect {
         x: line_area.x,
         y: line_area.y,
-        width: center_area.x.saturating_sub(line_area.x),
-        height: 1,
-    };
-    let right_area = Rect {
-        x: center_area.x.saturating_add(center_area.width),
-        y: line_area.y,
-        width: line_area
-            .width
-            .saturating_sub(center_area.width)
-            .saturating_sub(left_area.width),
+        width: left_w,
         height: 1,
     };
 
-    let left_p = Paragraph::new(Text::from(left_line))
-        .block(Block::default().borders(Borders::NONE))
-        .style(Style::default().bg(theme.bg));
-    f.render_widget(left_p, left_area);
-    let center_p = Paragraph::new(Text::from(center_line))
-        .block(Block::default().borders(Borders::NONE))
-        .style(Style::default().bg(theme.bg))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(center_p, center_area);
+    if left_area.width > 0 {
+        let left_p = Paragraph::new(Text::from(left_line))
+            .block(Block::default().borders(Borders::NONE))
+            .style(Style::default().bg(theme.bg));
+        f.render_widget(left_p, left_area);
+    }
     let right_p = Paragraph::new(Text::from(right_line))
         .block(Block::default().borders(Borders::NONE))
         .style(Style::default().bg(theme.bg))
@@ -2527,6 +2490,7 @@ pub struct DrawHintLineArgs<'a> {
     pub theme: &'a Theme,
     pub area: Rect,
     pub hint: &'a str,
+    pub right_hint: &'a str,
     pub mode: Mode,
     pub active_kind: MindKind,
     pub user_active: bool,
@@ -2540,6 +2504,7 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         theme,
         area,
         hint,
+        right_hint,
         mode,
         active_kind: _active_kind,
         user_active,
@@ -2554,6 +2519,14 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
     let dot = "";
     let dot_w = UnicodeWidthStr::width(dot);
     let max_w = area.width.max(1) as usize;
+
+    // 右侧动作提示（仅用于人类观测，不影响上下文/协议层）。
+    // 例如：Tab/Shift+Tab/焦点切换/置底/回溯等。
+    let mut rhs = compact_ws(right_hint).trim().to_string();
+    let rhs_style = Style::default()
+        .fg(theme.cyan)
+        .bg(theme.bg)
+        .add_modifier(Modifier::BOLD);
 
     let mut body = compact_ws(hint);
     let raw = body.trim_start();
@@ -2582,6 +2555,10 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         if b.eq_ignore_ascii_case("ready") {
             return false;
         }
+        // brief 可能带 markdown 粗体（**...**），不对其追加点号，避免破坏可读性与解析。
+        if b.contains("**") {
+            return false;
+        }
         // 菜单与设置说明（不做动效）
         if b.starts_with('/') {
             return false;
@@ -2603,9 +2580,11 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         let keywords = [
             "thinking",
             "sending",
+            "working",
             "requesting",
             "connecting",
             "streaming",
+            "typing",
             "retry",
             "running",
             "executing",
@@ -2662,12 +2641,106 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
     // 乱码展开动画：● 闪烁三次 → 乱码收敛到正文。
     const BLINK_FRAMES: usize = 4; // 2 次（亮/灭），更快进入可读文本
     const HOLD_FRAMES: usize = 1;
-    let avail_text_w = max_w
+    // 为右侧动作提示预留空间：优先保证左侧状态可读（至少 6 cells），其余才给 RHS。
+    // RHS 过长会被截断或直接隐藏（窄屏优先左侧）。
+    let mut rhs_w = 0usize;
+    let mut rhs_gap = 0usize;
+    if !rhs.is_empty() {
+        // RHS 上限：避免过长影响左侧状态/brief 的可读性。
+        let cap = (max_w / 3).clamp(8, 28).min(max_w);
+        rhs = truncate_to_width_ellipsis(&rhs, cap);
+        rhs_w = UnicodeWidthStr::width(rhs.as_str());
+        rhs_gap = 2;
+    }
+    let mut avail_text_w = max_w
         .saturating_sub(left_pad)
         .saturating_sub(dot_w.saturating_add(1))
         .max(1);
-    let sys_text = truncate_to_width(&body, avail_text_w);
-    let total_cells = UnicodeWidthStr::width(sys_text.as_str()).max(1);
+    if rhs_w > 0 {
+        let reserve = rhs_w.saturating_add(rhs_gap);
+        let min_left = 6usize;
+        if reserve.saturating_add(min_left) > avail_text_w {
+            // 尝试进一步压缩 RHS；若仍不够，直接隐藏 RHS。
+            let cap2 = avail_text_w.saturating_sub(min_left);
+            if cap2 >= 6 {
+                rhs = truncate_to_width_ellipsis(&rhs, cap2);
+                rhs_w = UnicodeWidthStr::width(rhs.as_str());
+            } else {
+                rhs.clear();
+                rhs_w = 0;
+                rhs_gap = 0;
+            }
+        }
+        if rhs_w > 0 {
+            avail_text_w = avail_text_w
+                .saturating_sub(rhs_w.saturating_add(rhs_gap))
+                .max(1);
+        }
+    }
+    // 状态栏支持极简 Markdown：只解析 `**bold**`。
+    // 目标：
+    // - brief 往往带 `**标题**`，需要在状态栏突出
+    // - 严格只做展示层解析，不改写上下文/协议层
+    fn split_md_bold_segments(s: &str) -> Vec<(String, bool)> {
+        let mut segs: Vec<(String, bool)> = Vec::new();
+        let bytes = s.as_bytes();
+        let mut i = 0usize;
+        let mut last = 0usize;
+        let mut bold = false;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'*' && bytes[i + 1] == b'*' {
+                if last < i {
+                    segs.push((s[last..i].to_string(), bold));
+                }
+                bold = !bold;
+                i += 2;
+                last = i;
+                continue;
+            }
+            i += 1;
+        }
+        if last < s.len() {
+            segs.push((s[last..].to_string(), bold));
+        }
+        if segs.is_empty() {
+            segs.push((s.to_string(), false));
+        }
+        segs
+    }
+    fn truncate_md_segments_to_width(segs: &[(String, bool)], max_w: usize) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = Vec::new();
+        let mut used = 0usize;
+        for (text, bold) in segs {
+            if used >= max_w {
+                break;
+            }
+            let mut chunk = String::new();
+            for ch in text.chars() {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+                if used + w > max_w {
+                    break;
+                }
+                chunk.push(ch);
+                used = used.saturating_add(w);
+            }
+            if !chunk.is_empty() {
+                out.push((chunk, *bold));
+            }
+        }
+        out
+    }
+    fn md_segments_to_string(segs: &[(String, bool)]) -> String {
+        let mut out = String::new();
+        for (t, _) in segs {
+            out.push_str(t);
+        }
+        out
+    }
+
+    let segs_full = split_md_bold_segments(&body);
+    let segs = truncate_md_segments_to_width(&segs_full, avail_text_w);
+    let sys_text_plain = md_segments_to_string(&segs);
+    let total_cells = UnicodeWidthStr::width(sys_text_plain.as_str()).max(1);
     let reveal_frames = ((total_cells + 2) / 4).clamp(3, 9);
     let reveal_start = BLINK_FRAMES + HOLD_FRAMES;
     let reveal_end = reveal_start + reveal_frames;
@@ -2682,7 +2755,7 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
     };
 
     let render_text = if !anim {
-        sys_text.clone()
+        sys_text_plain.clone()
     } else if phase < reveal_start {
         String::new()
     } else if phase < reveal_end {
@@ -2696,7 +2769,7 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         ];
         let mut out = String::new();
         let mut used = 0usize;
-        for (i, ch) in sys_text.chars().enumerate() {
+        for (i, ch) in sys_text_plain.chars().enumerate() {
             let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
             let m = mix64(
                 anim_seed
@@ -2715,7 +2788,7 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         }
         out
     } else {
-        sys_text.clone()
+        sys_text_plain.clone()
     };
 
     let dot_char = if dot_visible { dot } else { " " };
@@ -2728,16 +2801,45 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
     }
     spans.push(Span::styled(dot_char, dot_style));
     spans.push(Span::styled(" ", Style::default().bg(theme.bg)));
-    spans.push(Span::styled(render_text.clone(), text_style));
+    if !anim || phase >= reveal_end {
+        // 动画结束后才展示 markdown 高亮，避免 `**` 影响动画宽度计算。
+        let normal = Style::default()
+            .fg(theme.dim)
+            .bg(theme.bg)
+            .add_modifier(Modifier::BOLD);
+        let bold = Style::default()
+            .fg(theme.fg)
+            .bg(theme.bg)
+            .add_modifier(Modifier::BOLD);
+        for (t, is_bold) in segs.iter() {
+            if t.is_empty() {
+                continue;
+            }
+            spans.push(Span::styled(
+                t.clone(),
+                if *is_bold { bold } else { normal },
+            ));
+        }
+    } else {
+        spans.push(Span::styled(render_text.clone(), text_style));
+    }
     let used_w = left_pad
         .saturating_add(dot_w)
         .saturating_add(1)
         .saturating_add(UnicodeWidthStr::width(render_text.as_str()));
-    if used_w < max_w {
-        spans.push(Span::styled(
-            " ".repeat(max_w.saturating_sub(used_w)),
-            Style::default().bg(theme.bg),
-        ));
+    if rhs_w == 0 {
+        if used_w < max_w {
+            spans.push(Span::styled(
+                " ".repeat(max_w.saturating_sub(used_w)),
+                Style::default().bg(theme.bg),
+            ));
+        }
+    } else {
+        let pad = max_w.saturating_sub(rhs_w).saturating_sub(used_w);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(theme.bg)));
+        }
+        spans.push(Span::styled(rhs, rhs_style));
     }
     let p = Paragraph::new(Text::from(Line::from(spans)))
         .block(Block::default().borders(Borders::NONE))
@@ -2802,6 +2904,7 @@ pub fn draw_separator(f: &mut ratatui::Frame, args: DrawSeparatorArgs<'_>) {
         mode,
         active_kind,
         user_active,
+        highlight,
         tick,
         hint,
     } = args;
@@ -2830,6 +2933,7 @@ pub fn draw_separator(f: &mut ratatui::Frame, args: DrawSeparatorArgs<'_>) {
             mode,
             active_kind,
             user_active,
+            highlight,
             tick,
             theme,
         }))
@@ -2903,6 +3007,7 @@ pub struct DrawSeparatorArgs<'a> {
     pub mode: Mode,
     pub active_kind: MindKind,
     pub user_active: bool,
+    pub highlight: bool,
     pub tick: usize,
     pub hint: &'a str,
 }
@@ -2998,7 +3103,6 @@ pub struct ChatRenderCache {
     per_msg: Vec<Option<Vec<Line<'static>>>>,
     tool_key: Vec<Option<u8>>,
     scramble: Vec<Option<ScrambleState>>,
-    plan_reveal: Vec<Option<PlanRevealState>>,
 }
 
 #[derive(Clone, Debug)]
@@ -3014,12 +3118,6 @@ struct ScrambleState {
     segments: Vec<ScrambleSegment>,
 }
 
-#[derive(Clone, Debug, Default)]
-struct PlanRevealState {
-    last_total_lines: usize,
-    born_tick: usize,
-}
-
 impl ChatRenderCache {
     pub fn new() -> Self {
         Self {
@@ -3027,7 +3125,6 @@ impl ChatRenderCache {
             per_msg: Vec::new(),
             tool_key: Vec::new(),
             scramble: Vec::new(),
-            plan_reveal: Vec::new(),
         }
     }
 
@@ -3041,15 +3138,11 @@ impl ChatRenderCache {
             self.per_msg.clear();
             self.tool_key.clear();
             self.scramble.clear();
-            self.plan_reveal.clear();
         }
         // 终端缩放/重排时（width 变化）不要清空 scramble：否则历史消息会“重新播放乱码动画”。
         // scramble 与换行宽度无关，只与消息增量变化有关；保留它能显著降低缩放时的干扰与卡顿。
         if self.scramble.len() > msg_len {
             self.scramble.truncate(msg_len);
-        }
-        if self.plan_reveal.len() > msg_len {
-            self.plan_reveal.truncate(msg_len);
         }
         if self.per_msg.len() < msg_len {
             self.per_msg.resize_with(msg_len, || None);
@@ -3059,9 +3152,6 @@ impl ChatRenderCache {
         }
         if self.scramble.len() < msg_len {
             self.scramble.resize_with(msg_len, || None);
-        }
-        if self.plan_reveal.len() < msg_len {
-            self.plan_reveal.resize_with(msg_len, || None);
         }
     }
 
@@ -3101,23 +3191,10 @@ impl ChatRenderCache {
         state.segments.clear();
     }
 
-    // 将指定 plan 的“打字机”推进到尾部（立刻完成）。
-    pub fn fast_forward_plan_reveal_to_tail(&mut self, idx: usize, text: &str) {
-        let total = text.lines().count().max(1);
-        let Some(slot) = self.plan_reveal.get_mut(idx) else {
-            return;
-        };
-        let state = slot.get_or_insert_with(Default::default);
-        state.last_total_lines = total;
-        state.born_tick = 0;
-    }
-
     // 将当前聊天中所有可动画项推进到尾部（立刻完成），确保“仅在流式尾部”才播放动画。
     pub fn fast_forward_all_animations_to_tail(&mut self, core: &Core) {
         for (idx, msg) in core.history.iter().enumerate() {
             self.fast_forward_scramble_to_tail(idx, &msg.text);
-            // plan 动画只对 plan 工具消息生效；此处对所有 idx 做“完成态”兜底也无害。
-            self.fast_forward_plan_reveal_to_tail(idx, &msg.text);
         }
     }
 
@@ -3225,66 +3302,6 @@ impl ChatRenderCache {
         }
         Some(out)
     }
-
-    fn update_plan_reveal_state(&mut self, idx: usize, text: &str, tick: usize, active: bool) {
-        const LINES_PER_FRAME: usize = 6;
-        let total = text.lines().count().max(1);
-        let slot = self.plan_reveal.get_mut(idx);
-        let Some(slot) = slot else {
-            return;
-        };
-        let state = slot.get_or_insert_with(Default::default);
-        // 历史消息：不触发动画，避免重绘/滚动时反复“打字机”。
-        if state.last_total_lines == 0 && !active {
-            state.last_total_lines = total;
-            state.born_tick = 0;
-            return;
-        }
-        if total != state.last_total_lines {
-            state.last_total_lines = total;
-            state.born_tick = tick;
-        }
-        // 如果已经是“历史完成态”，保持 born_tick=0，表示不需要动画。
-        if !active && state.born_tick == 0 {
-            state.last_total_lines = total;
-        }
-        // 动画完成：收敛为 born_tick=0，避免每帧都被视为“仍在动画中”。
-        if active && state.born_tick > 0 {
-            let frames = tick.saturating_sub(state.born_tick).saturating_add(1);
-            if frames.saturating_mul(LINES_PER_FRAME) >= total {
-                state.born_tick = 0;
-            }
-        }
-    }
-
-    fn plan_reveal_text(
-        &self,
-        idx: usize,
-        text: &str,
-        tick: usize,
-        active: bool,
-    ) -> Option<String> {
-        const LINES_PER_FRAME: usize = 6; // 快速“打字机”，避免突现
-        let state = self.plan_reveal.get(idx).and_then(|s| s.as_ref())?;
-        // born_tick=0 表示无需动画
-        if state.born_tick == 0 || !active {
-            return None;
-        }
-        let total = text.lines().count().max(1);
-        let frames = tick.saturating_sub(state.born_tick).saturating_add(1);
-        let shown = (frames * LINES_PER_FRAME).min(total);
-        if shown >= total {
-            return None;
-        }
-        let mut out: Vec<&str> = Vec::new();
-        for (i, line) in text.lines().enumerate() {
-            if i >= shown {
-                break;
-            }
-            out.push(line);
-        }
-        Some(out.join("\n"))
-    }
 }
 
 fn scramble_noise(ch: char, tick: usize, born_tick: usize, idx: usize) -> char {
@@ -3319,6 +3336,7 @@ fn render_message_lines(
     base_style: Style,
     reveal_len: Option<usize>,
     user_expanded: bool,
+    system_details_expanded: bool,
 ) -> Vec<Line<'static>> {
     let text = strip_timeline_footer_for_ui(&msg.text);
     let prefix = format!("{dot} ");
@@ -3415,27 +3433,48 @@ fn render_message_lines(
     };
 
     // system：统一“左对齐”的排版（避免长前缀导致正文被缩进到屏幕中间）。
-    // - 首行仅显示系统标签：`♡ · 系统信息`
-    // - 正文从下一行开始，以小缩进渲染（依然是粗体浅粉）
+    // 目标：
+    // - 任何 system 尽量“一行表达”，需要看详情时再展开
+    // - 统一折叠形态：`♡ · 系统信息 · <标题>`（简约态只显示一行；详情态才显示后续内容）
     if msg.role == Role::System {
-        let label = "♡ · 系统信息";
+        let folded_prefix = "♡ · 系统信息 · ";
+        let mut it = display.lines();
+        let first = it.next().unwrap_or("").trim_end().to_string();
+        let rest = it.collect::<Vec<_>>().join("\n").trim().to_string();
+
+        // 若已是折叠前缀：沿用第一行作为 header；否则把首行内容当作标题，统一成折叠形态。
+        let (header, details) = if first.starts_with(folded_prefix) {
+            (first, rest)
+        } else {
+            let title = first.trim();
+            let title = if title.is_empty() {
+                "系统信息"
+            } else {
+                title
+            };
+            (format!("{folded_prefix}{title}"), rest)
+        };
+
+        // 简约态：只显示 header（严格一行）。
+        if !system_details_expanded || details.trim().is_empty() {
+            return vec![Line::from(vec![Span::styled(
+                truncate_to_width_ellipsis(header.trim_end(), width.max(1)),
+                prefix_style,
+            )])];
+        }
+
+        // 详情态：header + 详情（markdown，缩进）。
         let indent = "  ";
         let indent_w = UnicodeWidthStr::width(indent);
         let rendered = render_markdown_to_lines_ex(
-            &display,
+            details.trim_end(),
             width.saturating_sub(indent_w).max(1),
             base_style,
             false,
         );
-        if rendered.is_empty() {
-            return vec![Line::from(vec![Span::styled(
-                label.to_string(),
-                prefix_style,
-            )])];
-        }
         let mut out = Vec::new();
         out.push(Line::from(vec![Span::styled(
-            label.to_string(),
+            truncate_to_width(header.trim_end(), width.max(1)),
             prefix_style,
         )]));
         for line in rendered {
@@ -3450,14 +3489,15 @@ fn render_message_lines(
         return out;
     }
 
-    let token_highlight = msg.role == Role::Assistant
-        || (msg.role == Role::Tool
-            && msg
-                .text
-                .trim_start()
-                .get(..crate::types::THINK_TOOL_MARKER.len())
-                .unwrap_or("")
-                .eq_ignore_ascii_case(crate::types::THINK_TOOL_MARKER));
+    // token_highlight 只作用于“纯正文”的 assistant 消息：
+    // - 不作用于 tool/think/brief/system/user
+    // - assistant 文本中一旦出现工具调用标记（<tool>...</tool>）也不启用（避免把工具 JSON/协议文本染成蓝色）
+    let token_highlight = msg.role == Role::Assistant && {
+        let t = display.trim();
+        let has_tool_markup = t.contains("<tool>") || t.to_ascii_lowercase().contains("</tool>");
+        let leaked_internal_marker = t.contains("[AITERMUX_");
+        !has_tool_markup && !leaked_internal_marker
+    };
     let rendered = render_markdown_to_lines_ex(
         &display,
         width.saturating_sub(prefix_width),
@@ -3504,17 +3544,40 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
         reveal_len,
         tick,
         selected_msg_idx,
+        tool_global_expanded,
         expanded_tool_idxs,
+        collapsed_tool_idxs,
+        user_global_expanded,
         expanded_user_idxs,
+        collapsed_user_idxs,
         thinking_idx,
+        thinking_global_expanded,
         expanded_thinking_idxs,
+        collapsed_thinking_idxs,
         details_mode,
         streaming_enabled,
         pulse_idx,
         pulse_style,
     } = args;
+    fn is_expanded(
+        global: bool,
+        expanded: &BTreeSet<usize>,
+        collapsed: &BTreeSet<usize>,
+        idx: usize,
+    ) -> bool {
+        if collapsed.contains(&idx) {
+            return false;
+        }
+        if expanded.contains(&idx) {
+            return true;
+        }
+        global
+    }
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut msg_line_ranges: Vec<Option<(usize, usize)>> = vec![None; core.history.len()];
+    // Codex brief 的“空 running”阶段用于表现连接/规划；
+    // 该阶段同时存在 thinking stub（为了时间线顺序），但 UI 只需要显示一个占位，避免出现两个闪点。
+    let mut planning_placeholder_active = false;
     render_cache.prepare(width, core.history.len());
     // 只用真实的 streaming_idx 作为“当前正在输出”的消息索引，避免在请求尚未开始（还没 push 占位）
     // 时误把“上一条 assistant”当作 active，导致旧消息触发乱码闪烁。
@@ -3554,6 +3617,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             .is_some_and(|st| !st.segments.is_empty());
         let scramble_enabled = streaming_enabled
             && msg.role == Role::Assistant
+            && msg.text.trim() != "Working..."
             && (scramble_active || scramble_pending);
         if scramble_enabled {
             render_cache.update_scramble_state(msg_idx, &msg.text, tick, scramble_active);
@@ -3564,11 +3628,16 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             let summary = summarize_tool_message(tool_text);
             let (tool_raw, input_raw, _note) = parse_tool_summary(&summary);
             let is_think = tool_raw.eq_ignore_ascii_case("think");
+            let is_brief = tool_raw.eq_ignore_ascii_case("brief");
             let is_mind = tool_raw.eq_ignore_ascii_case("mind");
             const DETAILS_TAIL_MAX: usize = 120;
             let details_tail_start = core.history.len().saturating_sub(DETAILS_TAIL_MAX.max(1));
-            let show_details = expanded_tool_idxs.contains(&msg_idx)
-                || (details_mode && msg_idx >= details_tail_start);
+            let show_details = is_expanded(
+                tool_global_expanded,
+                expanded_tool_idxs,
+                collapsed_tool_idxs,
+                msg_idx,
+            ) || (details_mode && msg_idx >= details_tail_start);
             let cache_key: u8 = if show_details { 1 } else { 0 };
 
             if !is_think
@@ -3591,15 +3660,133 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 continue;
             }
 
+            if is_brief {
+                let brief_running =
+                    tool_text.contains("状态:running") || tool_text.contains("状态:in_progress");
+                let is_codex = tool_text.contains("provider:codex");
+                if is_codex {
+                    // Codex：brief tool 只用于“状态栏 header”（提取最后一个 **标题**）。
+                    // 若在聊天区渲染，会造成重复/错序（例如把最后一段标题单独渲染为 “● Planning the tool calls”）。
+                    continue;
+                }
+                let mind = extract_tool_mind(tool_text);
+                let dot = if mind == Some("dog") { "○" } else { "●" };
+                let dot_color = theme.cyan;
+                let base_style = Style::default()
+                    .fg(theme.magenta)
+                    .bg(theme.bg)
+                    .add_modifier(Modifier::ITALIC);
+                let brief = extract_tool_explain(tool_text)
+                    .or_else(|| {
+                        for line in tool_text.lines() {
+                            let t = line.trim();
+                            if let Some(v) = t.strip_prefix("brief:") {
+                                let v = v.trim();
+                                if !v.is_empty() {
+                                    return Some(v.to_string());
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .unwrap_or_default();
+                let brief = compact_ws_inline(&brief);
+                if brief.trim().is_empty() && brief_running {
+                    let visible = tick.is_multiple_of(2);
+                    let glyph = if visible { dot } else { " " };
+                    let line_idx = out.len();
+                    // Planning...：brief 的 running 空窗期（等 brief）。
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            format!("{glyph} "),
+                            Style::default()
+                                .fg(dot_color)
+                                .bg(theme.bg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "Planning...".to_string(),
+                            Style::default()
+                                .fg(theme.dim)
+                                .bg(theme.bg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
+                    if selected {
+                        if let Some(l) = out.get_mut(line_idx) {
+                            highlight_line(l, theme);
+                        }
+                    }
+                    push_blank_line(&mut out);
+                    planning_placeholder_active = true;
+                    continue;
+                }
+                if brief.trim().is_empty() {
+                    continue;
+                }
+                let prefix = format!("{dot} ");
+                let prefix_w = UnicodeWidthStr::width(prefix.as_str());
+                let rendered = render_markdown_to_lines_ex(
+                    &brief,
+                    width.saturating_sub(prefix_w).max(1),
+                    base_style,
+                    false,
+                );
+                if !rendered.is_empty() {
+                    let mut it = rendered.into_iter();
+                    let line_idx = out.len();
+                    if let Some(first) = it.next() {
+                        let mut spans = Vec::new();
+                        spans.push(Span::styled(
+                            prefix,
+                            Style::default().fg(dot_color).bg(theme.bg),
+                        ));
+                        spans.extend(first.spans);
+                        out.push(Line::from(spans));
+                    }
+                    for line in it {
+                        let mut spans = Vec::new();
+                        spans.push(Span::styled(
+                            " ".repeat(prefix_w),
+                            Style::default().bg(theme.bg),
+                        ));
+                        spans.extend(line.spans);
+                        out.push(Line::from(spans));
+                    }
+                    msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
+                    if selected {
+                        if let Some(l) = out.get_mut(line_idx) {
+                            highlight_line(l, theme);
+                        }
+                    }
+                    push_blank_line(&mut out);
+                }
+                continue;
+            }
+
             if is_think {
                 let think_running =
                     tool_text.contains("状态:running") || tool_text.contains("状态:in_progress");
-                let allow_history_think = (details_mode && msg_idx >= details_tail_start)
-                    || expanded_thinking_idxs.contains(&msg_idx);
-                // 规则（简化）：
-                // - 简约模式：只显示“当前正在 running 的思考”（一旦正文开始/思考结束就立刻隐藏）
-                // - 详情模式：显示最近 N 条思考（便于回看/审计）
-                if !allow_history_think {
+                let is_codex = tool_text.contains("provider:codex");
+                // 重要：selected 不应“强制显示思考”，否则会出现“已折叠但仍显示”的悖论，
+                // 也会导致 core 侧折叠操作看似“延迟生效”（直到 selected 离开）。
+                let user_expanded = (details_mode && msg_idx >= details_tail_start)
+                    || is_expanded(
+                        thinking_global_expanded,
+                        expanded_thinking_idxs,
+                        collapsed_thinking_idxs,
+                        msg_idx,
+                    );
+                let show_full_think = user_expanded;
+                // DeepSeek/Codex：思考折叠逻辑保持一致：
+                // - 展开：显示完整思考
+                // - 折叠：仅在“本轮还在思考（running）”时显示；正文开始/思考结束即隐藏
+                if !show_full_think {
+                    // SSE 关闭时：不展示 running 思考占位（避免“非流式也闪烁/刷思考”导致混淆）。
+                    if !streaming_enabled {
+                        continue;
+                    }
                     if thinking_idx != Some(msg_idx) {
                         continue;
                     }
@@ -3611,25 +3798,51 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 let mind = extract_tool_mind(tool_text);
                 let dot = if mind == Some("dog") { "○" } else { "●" };
                 let dot_color = theme.cyan;
-                let base_style = Style::default().fg(theme.dim).bg(theme.bg);
-                let thinking_body = render_think_output_lines(theme, tool_text, width)
-                    .into_iter()
-                    .map(|l| l.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let base_style = Style::default()
+                    .fg(theme.dim)
+                    .bg(theme.bg)
+                    .add_modifier(Modifier::ITALIC);
+                let prefix = format!("{dot} ");
+                let prefix_w = UnicodeWidthStr::width(prefix.as_str());
+                let content_w = width.saturating_sub(prefix_w).max(1);
+                let (thinking_output_lines, _meta_lines) = extract_tool_sections(tool_text);
+                let thinking_body = thinking_output_lines.join("\n");
+                // 空思考：不展示（Codex/DeepSeek 一致）。running 阶段由下方的闪烁占位处理（仅 DeepSeek）。
+                if thinking_body.trim().is_empty() && (!think_running || is_codex) {
+                    continue;
+                }
                 if thinking_body.trim().is_empty() && think_running {
+                    if planning_placeholder_active {
+                        // Planning 占位已出现：避免同时显示 “Thinking” 空占位，减少视觉噪音。
+                        continue;
+                    }
                     // 未收到首包/首段 reasoning 前：在聊天区给一个“● 闪烁”占位，降低延迟感。
                     // 一旦 thinking 有输出，改为正常渲染（不再闪烁）。
                     let visible = tick.is_multiple_of(2);
                     let glyph = if visible { dot } else { " " };
+                    let dots = match tick % 3 {
+                        0 => ".  ",
+                        1 => ".. ",
+                        _ => "...",
+                    };
                     let line_idx = out.len();
-                    out.push(Line::from(vec![Span::styled(
-                        format!("{glyph}"),
-                        Style::default()
-                            .fg(dot_color)
-                            .bg(theme.bg)
-                            .add_modifier(Modifier::BOLD),
-                    )]));
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            format!("{glyph} "),
+                            Style::default()
+                                .fg(dot_color)
+                                .bg(theme.bg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            // DeepSeek：速度较快时，这里只用三点动画即可，避免“Thinking/Typing”等文案闪现造成噪音。
+                            dots.to_string(),
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(theme.bg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
                     msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
                     if selected {
                         if let Some(l) = out.get_mut(line_idx) {
@@ -3639,7 +3852,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     push_blank_line(&mut out);
                     continue;
                 }
-                let thinking_body = if think_running && streaming_enabled {
+                let thinking_body = if think_running && streaming_enabled && !is_codex {
                     render_cache.update_scramble_state(msg_idx, &thinking_body, tick, true);
                     render_cache
                         .scramble_text(msg_idx, &thinking_body, tick, false)
@@ -3647,27 +3860,58 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 } else {
                     thinking_body
                 };
-                let think_msg = crate::Message {
-                    role: Role::Assistant,
-                    text: thinking_body,
-                    mind: Some(if mind == Some("dog") {
-                        MindKind::Sub
-                    } else {
-                        MindKind::Main
-                    }),
-                };
-                let mut rendered = render_message_lines(
-                    theme, &think_msg, width, dot, dot_color, base_style, None, false,
-                );
-                if selected {
-                    if let Some(first) = rendered.get_mut(0) {
-                        highlight_line(first, theme);
+                let rendered: Vec<Line<'static>> = if is_codex {
+                    // Codex: summary/reasoning 内容可能包含 `**标题**` 结构。
+                    // 约定：strong 为“brief 标题”（不斜体），普通文本为“思维链正文”（斜体）。
+                    render_markdown_to_lines_spec(
+                        &thinking_body,
+                        content_w,
+                        Style::default().fg(SYSTEM_PINK).bg(theme.bg),
+                        MarkdownRenderSpec {
+                            token_highlight: false,
+                            default_italic: true,
+                            strong_fg: Some(SYSTEM_PINK),
+                        },
+                    )
+                } else {
+                    // DeepSeek: 纯文本渲染（不走 markdown/token_highlight），确保“浅灰 + 斜体”稳定。
+                    let mut out_lines: Vec<Line<'static>> = Vec::new();
+                    for raw_line in thinking_body.lines() {
+                        for chunk in wrap_plain_line(raw_line, content_w) {
+                            out_lines.push(Line::from(vec![Span::styled(chunk, base_style)]));
+                        }
                     }
+                    out_lines
+                };
+                if !rendered.is_empty() {
+                    let mut it = rendered.into_iter();
+                    let line_idx = out.len();
+                    if let Some(first) = it.next() {
+                        let mut spans = Vec::new();
+                        spans.push(Span::styled(
+                            prefix,
+                            Style::default().fg(dot_color).bg(theme.bg),
+                        ));
+                        spans.extend(first.spans);
+                        out.push(Line::from(spans));
+                    }
+                    for line in it {
+                        let mut spans = Vec::new();
+                        spans.push(Span::styled(
+                            " ".repeat(prefix_w),
+                            Style::default().bg(theme.bg),
+                        ));
+                        spans.extend(line.spans);
+                        out.push(Line::from(spans));
+                    }
+                    msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
+                    if selected {
+                        if let Some(l) = out.get_mut(line_idx) {
+                            highlight_line(l, theme);
+                        }
+                    }
+                    push_blank_line(&mut out);
                 }
-                let start = out.len();
-                out.extend(rendered);
-                msg_line_ranges[msg_idx] = Some((start, out.len()));
-                push_blank_line(&mut out);
                 continue;
             }
 
@@ -3678,85 +3922,6 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
 
             // 简约态：工具仅显示为一行（工具类型 + brief），避免占满屏幕。
             if !show_details {
-                // plan：特殊渲染为“开始工作/结束汇报”区块，降低视觉疲劳。
-                if tool_raw.eq_ignore_ascii_case("plan") {
-                    let line_idx = out.len();
-                    let status = extract_tool_status_token(&msg.text);
-                    let status_lower = status.as_deref().unwrap_or("").trim().to_ascii_lowercase();
-                    let mut running = matches!(
-                        status_lower.as_str(),
-                        "parsing" | "preview" | "running" | "in_progress" | "processing"
-                    );
-
-                    let phase = extract_tool_kv_token(&msg.text, "phase")
-                        .unwrap_or_else(|| "start".to_string())
-                        .to_ascii_lowercase();
-                    let is_end = matches!(phase.as_str(), "end" | "done" | "finish" | "report");
-
-                    let (output_lines, _meta_lines) = extract_tool_sections(&msg.text);
-                    let mut body_raw = output_lines.join("\n");
-                    if running {
-                        // tool stub 阶段的 "..." 占位不显示为正文：只展示分隔线即可。
-                        let t = body_raw.trim();
-                        if t == "..." || t.is_empty() {
-                            body_raw.clear();
-                        }
-                    }
-                    // 兜底：有些工具结果没有写入 meta 的“状态:running”，但 output 仍是 stub 的 "..."。
-                    // 这种情况下也应视为 running，避免先画框架再补正文造成跳动感。
-                    if !running
-                        && status_lower.trim().is_empty()
-                        && msg_idx + 1 >= core.history.len()
-                        && matches!(body_raw.trim(), "" | "...")
-                    {
-                        running = true;
-                        body_raw.clear();
-                    }
-
-                    let formatted_raw = format_plan_display(&body_raw, is_end);
-                    let plan_active =
-                        streaming_enabled && (running || msg_idx + 1 >= core.history.len());
-                    if streaming_enabled {
-                        render_cache.update_plan_reveal_state(
-                            msg_idx,
-                            &formatted_raw,
-                            tick,
-                            plan_active,
-                        );
-                    }
-                    let revealed = if streaming_enabled {
-                        render_cache.plan_reveal_text(msg_idx, &formatted_raw, tick, plan_active)
-                    } else {
-                        None
-                    };
-                    let body_display = revealed.as_deref().unwrap_or(formatted_raw.as_str());
-                    let animated_plan = revealed.is_some();
-
-                    let lines =
-                        build_plan_panel_lines(theme, width, is_end, running, body_display, tick);
-
-                    if reveal_idx != Some(msg_idx) && !animated_plan && !running {
-                        if let Some(slot) = render_cache.per_msg.get_mut(msg_idx) {
-                            *slot = Some(lines.clone());
-                        }
-                        if let Some(slot) = render_cache.tool_key.get_mut(msg_idx) {
-                            *slot = Some(cache_key);
-                        }
-                    }
-
-                    out.extend(lines);
-                    msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
-                    if selected {
-                        for idx in line_idx..out.len() {
-                            if let Some(l) = out.get_mut(idx) {
-                                highlight_line(l, theme);
-                            }
-                        }
-                    }
-                    push_blank_line(&mut out);
-                    continue;
-                }
-
                 let mind = extract_tool_mind(tool_text);
                 let dot = if mind == Some("dog") { "○" } else { "●" };
                 let brief = extract_tool_explain(tool_text)
@@ -3779,60 +3944,46 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 let line_idx = out.len();
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 let avail_inline = w.saturating_sub(fixed_w).max(1);
-                // 第一行：brief（高亮），不再展示 command（避免先显示命令再补 brief 的跳动感）
-                let brief_chunks = wrap_plain_line(&brief, avail_inline);
-                let brief_style = Style::default().fg(theme.yellow).bg(theme.bg);
-                if brief_chunks.is_empty() {
-                    lines.push(Line::from(vec![Span::styled(
-                        truncate_to_width(&fixed, w),
-                        Style::default()
-                            .fg(theme.yellow)
-                            .bg(theme.bg)
-                            .add_modifier(Modifier::BOLD),
-                    )]));
-                } else {
-                    for (idx, chunk) in brief_chunks.iter().enumerate() {
-                        if idx == 0 {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    head.clone(),
-                                    Style::default().fg(theme.fg).bg(theme.bg),
-                                ),
-                                Span::styled(
-                                    tool_name.clone(),
-                                    Style::default()
-                                        .fg(theme.yellow)
-                                        .bg(theme.bg)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                                Span::styled(
-                                    suffix.clone(),
-                                    Style::default().fg(theme.fg).bg(theme.bg),
-                                ),
-                                Span::styled(sep, Style::default().fg(theme.dim).bg(theme.bg)),
-                                Span::styled(chunk.clone(), brief_style),
-                            ]));
-                        } else {
-                            let prefix = " ".repeat(fixed_w.min(w.saturating_sub(1)).max(2));
-                            lines.push(Line::from(vec![
-                                Span::styled(prefix, Style::default().fg(theme.dim).bg(theme.bg)),
-                                Span::styled(chunk.clone(), brief_style),
-                            ]));
-                        }
-                        if idx >= 4 {
-                            break;
-                        }
-                    }
-                }
 
                 let indent_w = fixed_w.min(w.saturating_sub(1)).max(2);
                 let indent = " ".repeat(indent_w);
                 let avail = w.saturating_sub(indent_w).max(1);
 
-                // 第二行：command（↳ 斜体）
+                // 简约态：第一行展示“做什么”（brief），第二行展示“怎么做”（命令/目标）。
+                // 这样对人类更直观：先看意图，再按需展开/查看具体命令。
+                //
                 // 特例：PTY Done 的 input 往往是冗长的 job/exit/cmd 汇总；简约态只看 brief 即可，细节留给详情态。
                 let hide_target_line = tool_raw.eq_ignore_ascii_case("pty done");
-                if !hide_target_line && !target_disp.trim().is_empty() {
+                let target_for_line2 = if hide_target_line {
+                    ""
+                } else {
+                    target_disp.as_str()
+                };
+                let header_body = if !brief.trim().is_empty() {
+                    truncate_to_width_ellipsis(&brief, avail_inline)
+                } else if !target_for_line2.trim().is_empty() {
+                    truncate_to_width_middle_ellipsis(target_for_line2.trim(), avail_inline)
+                } else {
+                    String::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(head.clone(), Style::default().fg(theme.fg).bg(theme.bg)),
+                    Span::styled(
+                        tool_name.clone(),
+                        Style::default()
+                            .fg(theme.yellow)
+                            .bg(theme.bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(suffix.clone(), Style::default().fg(theme.fg).bg(theme.bg)),
+                    Span::styled(sep, Style::default().fg(theme.dim).bg(theme.bg)),
+                    // brief：浅黄色（更像“解释/意图”而非正文）
+                    Span::styled(header_body, Style::default().fg(theme.yellow).bg(theme.bg)),
+                ]));
+
+                // 第二行：命令/目标（↳）；当 header 已经展示命令（brief 为空）时，不重复展示。
+                if !target_for_line2.trim().is_empty() && !brief.trim().is_empty() {
+                    // 命令行：斜体（包含符号/箭头），避免与正文语义混淆
                     let arrow_style = Style::default()
                         .fg(theme.dim)
                         .bg(theme.bg)
@@ -3842,15 +3993,20 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         .bg(theme.bg)
                         .add_modifier(Modifier::ITALIC);
                     let cmd_avail = avail.saturating_sub(2).max(1);
-                    let cmd = truncate_to_width_ellipsis(&target_disp, cmd_avail);
-                    if !cmd.trim().is_empty() {
+                    let chunks = wrap_plain_line(target_for_line2.trim(), cmd_avail);
+                    const CMD_MAX_LINES: usize = 2;
+                    for (i, chunk) in chunks.iter().take(CMD_MAX_LINES).enumerate() {
+                        if chunk.trim().is_empty() {
+                            continue;
+                        }
+                        let prefix = if i == 0 { "↳ " } else { "  " };
                         lines.push(Line::from(vec![
                             Span::styled(
                                 indent.clone(),
                                 Style::default().fg(theme.dim).bg(theme.bg),
                             ),
-                            Span::styled("↳ ", arrow_style),
-                            Span::styled(cmd, cmd_style),
+                            Span::styled(prefix, arrow_style),
+                            Span::styled(chunk.clone(), cmd_style),
                         ]));
                     }
                 }
@@ -3905,7 +4061,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             let mind = extract_tool_mind(tool_text);
             let dot = if mind == Some("dog") { "○" } else { "●" };
             let (prefix, tool_name, suffix) = tool_compact_title_parts(&tool_raw);
-            let head = format!("{dot} 工具回执 · {prefix}");
+            let head = format!("{dot} {prefix}");
             let sep = " · ";
             let target_raw = input_raw.as_deref().unwrap_or("");
             let (_disp, target_disp) = normalize_tool_display(&tool_raw, target_raw);
@@ -3988,13 +4144,22 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     &mut lines, theme, width, &explain, reveal_idx, msg_idx, reveal_len,
                 );
             }
-            if !is_mind && let Some(result) = tool_status_result_line(tool_text) {
-                push_tool_explain_line(
-                    &mut lines, theme, width, &result, reveal_idx, msg_idx, reveal_len,
-                );
+            let is_shell_tool = tool_raw.eq_ignore_ascii_case("bash")
+                || tool_raw.eq_ignore_ascii_case("adb")
+                || tool_raw.eq_ignore_ascii_case("termux_api")
+                || tool_raw.eq_ignore_ascii_case("termux");
+            if is_shell_tool {
+                // shell 类工具：展示更精简的 output（头尾截断）+ 单行状态，不展示 meta 区块。
+                lines.extend(render_shell_tool_detail_lines(theme, tool_text, width));
+            } else {
+                if !is_mind && let Some(result) = tool_status_result_line(tool_text) {
+                    push_tool_explain_line(
+                        &mut lines, theme, width, &result, reveal_idx, msg_idx, reveal_len,
+                    );
+                }
+                let details = render_tool_detail_lines(theme, tool_text, width, true);
+                lines.extend(details);
             }
-            let details = render_tool_detail_lines(theme, tool_text, width, true);
-            lines.extend(details);
 
             if reveal_idx != Some(msg_idx) {
                 if let Some(slot) = render_cache.per_msg.get_mut(msg_idx) {
@@ -4135,6 +4300,44 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
         } else {
             Style::default().fg(fg_color).bg(theme.bg)
         };
+
+        // Codex：聊天区仅显示一个占位（Working...），且要有动画（闪烁点 + 三点循环）。
+        // 注意：这里不能走 render_cache，否则动画帧不会刷新。
+        if msg.role == Role::Assistant && msg.text.trim() == "Working..." {
+            let visible = tick.is_multiple_of(2);
+            let glyph = if visible { dot } else { " " };
+            let dots = match tick % 3 {
+                0 => ".  ",
+                1 => ".. ",
+                _ => "...",
+            };
+            let line_idx = out.len();
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("{glyph} "),
+                    Style::default()
+                        .fg(dot_color)
+                        .bg(theme.bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    // 仅三点动画：避免把 “Working” 文案暴露给用户（这是内部占位信号）。
+                    dots.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(theme.bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
+            if selected {
+                if let Some(l) = out.get_mut(line_idx) {
+                    highlight_line(l, theme);
+                }
+            }
+            push_blank_line(&mut out);
+            continue;
+        }
         let mut animated_assistant = false;
         let decorated: Option<crate::Message> = if scramble_enabled {
             if let Some(scrambled) =
@@ -4152,7 +4355,20 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
         };
         let msg_ref_base: &crate::Message = decorated.as_ref().unwrap_or(msg);
         let msg_ref: &crate::Message = msg_ref_base;
-        let user_expanded = msg.role == Role::User && expanded_user_idxs.contains(&msg_idx);
+        let user_expanded = msg.role == Role::User
+            && is_expanded(
+                user_global_expanded,
+                expanded_user_idxs,
+                collapsed_user_idxs,
+                msg_idx,
+            );
+        let system_details_expanded = msg.role == Role::System
+            && is_expanded(
+                tool_global_expanded,
+                expanded_tool_idxs,
+                collapsed_tool_idxs,
+                msg_idx,
+            );
 
         let mut rendered = if reveal_idx == Some(msg_idx) {
             render_message_lines(
@@ -4164,6 +4380,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 base_style,
                 Some(reveal_len),
                 user_expanded,
+                system_details_expanded,
             )
         } else if let Some(lines) = render_cache
             .per_msg
@@ -4172,6 +4389,8 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             && pulse.is_none()
             && !animated_assistant
             && msg.role != Role::User
+            // system 折叠/展开依赖“工具详情形态/逐条展开”(Shift+Tab/→/Tab)，不能走静态缓存。
+            && msg.role != Role::System
         {
             lines.clone()
         } else {
@@ -4184,9 +4403,11 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 base_style,
                 None,
                 user_expanded,
+                system_details_expanded,
             );
             if !animated_assistant
                 && msg.role != Role::User
+                && msg.role != Role::System
                 && let Some(slot) = render_cache.per_msg.get_mut(msg_idx)
             {
                 *slot = Some(lines.clone());
@@ -4223,10 +4444,16 @@ pub struct BuildChatLinesArgs<'a> {
     pub reveal_len: usize,
     pub tick: usize,
     pub selected_msg_idx: Option<usize>,
+    pub tool_global_expanded: bool,
     pub expanded_tool_idxs: &'a BTreeSet<usize>,
+    pub collapsed_tool_idxs: &'a BTreeSet<usize>,
+    pub user_global_expanded: bool,
     pub expanded_user_idxs: &'a BTreeSet<usize>,
+    pub collapsed_user_idxs: &'a BTreeSet<usize>,
     pub thinking_idx: Option<usize>,
+    pub thinking_global_expanded: bool,
     pub expanded_thinking_idxs: &'a BTreeSet<usize>,
+    pub collapsed_thinking_idxs: &'a BTreeSet<usize>,
     pub details_mode: bool,
     pub streaming_enabled: bool,
     pub pulse_idx: Option<usize>,
@@ -4258,6 +4485,9 @@ mod tests {
         let expanded_tools = BTreeSet::new();
         let expanded_users = BTreeSet::new();
         let expanded_thinks = BTreeSet::new();
+        let collapsed_tools = BTreeSet::new();
+        let collapsed_users = BTreeSet::new();
+        let collapsed_thinks = BTreeSet::new();
         let layout = build_chat_layout(BuildChatLinesArgs {
             theme: &theme,
             core: &core,
@@ -4268,10 +4498,16 @@ mod tests {
             reveal_len: 0,
             tick: 0,
             selected_msg_idx: None,
+            tool_global_expanded: false,
             expanded_tool_idxs: &expanded_tools,
+            collapsed_tool_idxs: &collapsed_tools,
+            user_global_expanded: false,
             expanded_user_idxs: &expanded_users,
+            collapsed_user_idxs: &collapsed_users,
             thinking_idx: Some(0),
+            thinking_global_expanded: false,
             expanded_thinking_idxs: &expanded_thinks,
+            collapsed_thinking_idxs: &collapsed_thinks,
             // 新规则：简约模式默认隐藏已完成的思考；详情模式才回看。
             details_mode: true,
             streaming_enabled: false,
@@ -4332,6 +4568,9 @@ mod tests {
         let expanded_tools = BTreeSet::new();
         let expanded_users = BTreeSet::new();
         let expanded_thinks = BTreeSet::new();
+        let collapsed_tools = BTreeSet::new();
+        let collapsed_users = BTreeSet::new();
+        let collapsed_thinks = BTreeSet::new();
         let layout = build_chat_layout(BuildChatLinesArgs {
             theme: &theme,
             core: &core,
@@ -4342,10 +4581,16 @@ mod tests {
             reveal_len: 0,
             tick: 0,
             selected_msg_idx: None,
+            tool_global_expanded: false,
             expanded_tool_idxs: &expanded_tools,
+            collapsed_tool_idxs: &collapsed_tools,
+            user_global_expanded: false,
             expanded_user_idxs: &expanded_users,
+            collapsed_user_idxs: &collapsed_users,
             thinking_idx: None,
+            thinking_global_expanded: false,
             expanded_thinking_idxs: &expanded_thinks,
+            collapsed_thinking_idxs: &collapsed_thinks,
             details_mode: false,
             streaming_enabled: false,
             pulse_idx: None,
@@ -4394,6 +4639,7 @@ mod tests {
             Style::default().fg(theme.fg).bg(theme.bg),
             None,
             false,
+            false,
         )
         .iter()
         .map(|l| l.to_string())
@@ -4411,6 +4657,7 @@ mod tests {
             Style::default().fg(theme.fg).bg(theme.bg),
             None,
             true,
+            false,
         )
         .iter()
         .map(|l| l.to_string())
@@ -4446,6 +4693,7 @@ mod tests {
             Style::default().fg(theme.fg).bg(theme.bg),
             None,
             false,
+            false,
         )
         .iter()
         .map(|l| l.to_string())
@@ -4463,6 +4711,7 @@ mod tests {
             Style::default().fg(theme.fg).bg(theme.bg),
             None,
             true,
+            false,
         )
         .iter()
         .map(|l| l.to_string())
@@ -4706,10 +4955,22 @@ fn push_text_token_highlight(line: &mut StyledLogicalLine, s: &str, style: Style
             if start > last {
                 push_text(line, &s[last..start], style);
             }
-            let word_style = style.fg(Color::LightBlue);
-            push_text(line, &s[start..i], word_style);
+            let token = &s[start..i];
+            // 仅高亮“更像代码/命令”的 token，避免把整段英文 prose 染成“全蓝”。
+            // 示例：ok_exit_codes / --flag / ~/path / foo-bar / a=b / @ref / v1.2.3
+            let codeish = token.bytes().any(|c| {
+                c == b'_'
+                    || (b'0'..=b'9').contains(&c)
+                    || matches!(c, b'-' | b'.' | b'/' | b':' | b'@' | b'+' | b'=')
+            });
+            if codeish {
+                let word_style = style.fg(Color::Cyan);
+                push_text(line, token, word_style);
+                token_count += 1;
+            } else {
+                push_text(line, token, style);
+            }
             last = i;
-            token_count += 1;
         } else if b.is_ascii() {
             i += 1;
         } else {
@@ -4753,14 +5014,37 @@ pub fn render_markdown_to_lines(text: &str, width: usize, base_style: Style) -> 
     render_markdown_to_lines_ex(text, width, base_style, false)
 }
 
+#[derive(Clone, Copy)]
+struct MarkdownRenderSpec {
+    token_highlight: bool,
+    // 若启用：默认将普通文本渲染为斜体（用于 Codex reasoning summary 这种“正文应斜体但标题不斜体”的场景）。
+    default_italic: bool,
+    // 若设置：把 `**strong**` 的前景色覆盖为指定颜色（用于 Codex brief 标题）。
+    strong_fg: Option<Color>,
+}
+
 fn render_markdown_to_lines_ex(
     text: &str,
     width: usize,
     base_style: Style,
     token_highlight: bool,
 ) -> Vec<Line<'static>> {
+    let spec = MarkdownRenderSpec {
+        token_highlight,
+        default_italic: false,
+        strong_fg: None,
+    };
+    render_markdown_to_lines_spec(text, width, base_style, spec)
+}
+
+fn render_markdown_to_lines_spec(
+    text: &str,
+    width: usize,
+    base_style: Style,
+    spec: MarkdownRenderSpec,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let logical = markdown_to_logical_lines(text, base_style, token_highlight);
+    let logical = markdown_to_logical_lines(text, base_style, spec);
     let mut out: Vec<Line<'static>> = Vec::new();
     for line in logical {
         out.extend(wrap_styled_line(&line, width));
@@ -4771,7 +5055,7 @@ fn render_markdown_to_lines_ex(
 fn markdown_to_logical_lines(
     text: &str,
     base_style: Style,
-    token_highlight: bool,
+    spec: MarkdownRenderSpec,
 ) -> Vec<StyledLogicalLine> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -5018,8 +5302,13 @@ fn markdown_to_logical_lines(
                         &item_prefix,
                         &item_cont_prefix,
                     );
-                    let style = inline_style(base_style, &inline, heading_level);
-                    push_text_token_highlight(&mut current, t.as_ref(), style, token_highlight);
+                    let style = inline_style(base_style, &inline, heading_level, spec);
+                    push_text_token_highlight(
+                        &mut current,
+                        t.as_ref(),
+                        style,
+                        spec.token_highlight,
+                    );
                 }
             }
             Event::Code(code) => {
@@ -5044,13 +5333,17 @@ fn markdown_to_logical_lines(
                 if suspicious {
                     // 防御：部分日志/终端输出可能包含“孤立的 `”等字符，导致 markdown 解析产出超长 Code span；
                     // 这里将“异常长/跨行”的 code span 降级为普通文本，避免整段被高亮成黄底黄字。
-                    let style = inline_style(base_style, &inline, heading_level);
+                    let style = inline_style(base_style, &inline, heading_level, spec);
                     push_text(&mut current, raw, style);
                 } else {
-                    let style = base_style
-                        .fg(Color::Yellow)
-                        .bg(Color::Black)
-                        .add_modifier(Modifier::BOLD);
+                    // 仅在 token_highlight 开启（纯 assistant 正文）时，把 inline code 作为“代码高亮”渲染；
+                    // 否则（tool/brief/系统等）保持同色，避免黄色高亮干扰语义/与 token_highlight 冲突。
+                    let style = if spec.token_highlight {
+                        // 不使用黄底黄字：过于突兀，且在思考/正文里都会“抢视觉焦点”。
+                        base_style.fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        base_style.add_modifier(Modifier::BOLD)
+                    };
                     push_text(&mut current, raw, style);
                 }
             }
@@ -5366,13 +5659,24 @@ fn text_width(s: &str) -> usize {
         .sum()
 }
 
-fn inline_style(base: Style, inline: &InlineStyle, heading_level: Option<u8>) -> Style {
+fn inline_style(
+    base: Style,
+    inline: &InlineStyle,
+    heading_level: Option<u8>,
+    spec: MarkdownRenderSpec,
+) -> Style {
     let mut style = base;
+    if spec.default_italic && inline.strong == 0 {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
     if inline.emph > 0 {
         style = style.add_modifier(Modifier::ITALIC);
     }
     if inline.strong > 0 {
         style = style.add_modifier(Modifier::BOLD);
+        if let Some(fg) = spec.strong_fg {
+            style = style.fg(fg);
+        }
     }
     if inline.strike > 0 {
         style = style.add_modifier(Modifier::CROSSED_OUT);

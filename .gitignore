@@ -18,3 +18,10 @@ memory/*.sqlite
 memory/*.db
 memory/*.sqlite-wal
 memory/*.sqlite-shm
+
+# local ad-hoc backups
+system/src/*.bak*
+
+# local scratch
+system/test_file.txt
+test_patch.txt

@@ -36,7 +36,7 @@ bash install.sh --quiet
 
 ## 说明
 
-- `deploy/termux/`：覆盖到 Termux 启动链路文件（motd/login/tx11start）。
+- `deploy/termux/`：覆盖到 Termux 启动链路文件（motd/login/tx11start）与配置（termux.properties）。
 - `deploy/aitermux/`：安装 `~/AItermux/bin/aitermux` 与 zsh 自动启动片段。
 - `deploy/startboot/`：开屏动画脚本池（默认随机播放，忽略 `_*.sh` 辅助脚本）。
 

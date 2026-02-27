@@ -1,7 +1,5 @@
 use std::fs;
-use std::io::{BufRead, Read, Seek, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -10,29 +8,18 @@ use std::time::Instant;
 use anyhow::{Context, anyhow};
 use chrono::{Local, NaiveDate};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::memory::{DEFAULT_MEMO_DB_PATH, MemoDb, MemoKind, MemoRow};
 
 const BASH_SHELL: &str = "/data/data/com.termux/files/usr/bin/bash";
+// 在 Termux 场景下，PATH 可能被其它软件注入导致 `rg` 解析到不可执行的 wrapper。
+// 这里优先使用 Termux 自带的绝对路径，避免 search 退化到 grep。
+const TERMUX_RG: &str = "/data/data/com.termux/files/usr/bin/rg";
 const ADB_SERIAL: &str = "127.0.0.1:5555";
-const OUTPUT_MAX_CHARS: usize = 20_000;
-const OUTPUT_MAX_LINES: usize = 400;
-const READ_MAX_BYTES: usize = 200_000;
-const READ_FULL_MAX_BYTES: usize = 300_000;
-const READ_FULL_MAX_LINES: usize = 20_000;
-const READ_PEEK_HEAD_LINES: usize = 30;
-const READ_PEEK_TAIL_LINES: usize = 10;
-const READ_PEEK_TOKEN_BUDGET: usize = 10_000;
-const READ_RANGE_TOKEN_BUDGET: usize = 20_000;
-const READ_FULL_TOKEN_BUDGET: usize = 20_000;
-const READ_MAX_LINE_CHARS: usize = 2000;
-const READ_RANGE_MAX_LINES: usize = 1000;
-const READ_SCAN_MAX_BYTES: usize = 20_000_000;
-// read_file 的 raw 输出预算：避免被全局 20k chars 二次截断导致“读不够用”。
-const READ_TOOL_RAW_MAX_LINES: usize = 1400;
-const READ_TOOL_RAW_MAX_CHARS: usize = 80_000;
+pub(crate) const OUTPUT_MAX_CHARS: usize = 20_000;
+pub(crate) const OUTPUT_MAX_LINES: usize = 400;
 const READ_MAX_LINES_CAP: usize = 1200;
 const SEARCH_DEFAULT_MAX_MATCHES: usize = 200;
 const SEARCH_MAX_MATCHES_CAP: usize = 1000;
@@ -58,13 +45,10 @@ const PATCH_TIMEOUT_MAX_SECS: u64 = 120;
 
 // bash/adb/termux_api 等 shell 类工具：输出过大时落盘到这里，避免把 TUI/上下文撑爆。
 const SHELL_CACHE_DIR: &str = "log/bash-cache";
-const SHELL_SAVE_THRESHOLD_BYTES: usize = 400_000;
 const ADB_CACHE_DIR: &str = "log/adb-cache";
-// adb 输出（尤其 logcat/dumpsys）可能更大：默认阈值略高，超出则落盘供后续按需读取。
-const ADB_SAVE_THRESHOLD_BYTES: usize = 900_000;
 const TERMUX_API_CACHE_DIR: &str = "log/termux-api-cache";
-// termux-api 输出通常偏中等，但也可能一次返回大量 JSON（如 SAF/传感器/Wi-Fi 扫描等）。
-const TERMUX_API_SAVE_THRESHOLD_BYTES: usize = 600_000;
+// 统一导出触发的字节兜底阈值：当输出极大时无论行数/字符数是否超限，都落盘。
+pub(crate) const EXPORT_SAVE_THRESHOLD_BYTES: usize = 1_000_000;
 const SEARCH_CACHE_DIR: &str = "log/search-cache";
 const SEARCH_SAVE_THRESHOLD_BYTES: usize = 400_000;
 const MEMORY_CACHE_DIR: &str = "log/memory-cache";
@@ -80,46 +64,25 @@ const EXPORTED_PREVIEW_MAX_LINES: usize = 160;
 const EXPORTED_PREVIEW_MAX_CHARS: usize = 12_000;
 
 #[derive(Debug, Clone)]
-struct ExportedOutputMeta {
-    path: String,
-    export_dir: String,
-    bytes: usize,
-    lines: usize,
+pub(crate) struct ExportedOutputMeta {
+    pub(crate) path: String,
+    pub(crate) bytes: usize,
+    pub(crate) lines: usize,
 }
 
-fn export_dir_of(path: &str) -> String {
-    Path::new(path)
-        .parent()
-        .and_then(|p| p.to_str())
-        .unwrap_or("")
-        .to_string()
+pub(crate) fn exported_meta(path: String, bytes: usize, lines: usize) -> ExportedOutputMeta {
+    ExportedOutputMeta { path, bytes, lines }
 }
 
-fn exported_meta(path: String, bytes: usize, lines: usize) -> ExportedOutputMeta {
-    ExportedOutputMeta {
-        export_dir: export_dir_of(&path),
-        path,
-        bytes,
-        lines,
-    }
-}
-
-fn format_exported_notice(meta: &ExportedOutputMeta) -> String {
+pub(crate) fn format_exported_notice(meta: &ExportedOutputMeta) -> String {
     let size = format_bytes(meta.bytes as u64);
     format!(
-        "【输出已导出】dir:{} | saved:{} | size:{} | lines:{}",
-        if meta.export_dir.trim().is_empty() {
-            "(unknown)"
-        } else {
-            meta.export_dir.as_str()
-        },
-        meta.path,
-        size,
-        meta.lines
+        "【输出已导出】saved:{} | size:{} | lines:{}",
+        meta.path, size, meta.lines
     )
 }
 
-fn truncate_export_preview(text: &str) -> String {
+pub(crate) fn truncate_export_preview(text: &str) -> String {
     truncate_tool_payload(text, EXPORTED_PREVIEW_MAX_LINES, EXPORTED_PREVIEW_MAX_CHARS)
 }
 
@@ -160,7 +123,6 @@ fn maybe_export_text(
         out.push_str("\n\n");
         out.push_str(preview.trim_end());
     }
-    out.push_str(&format!("\n\n[saved:{}]", meta.path));
     (out, Some(meta))
 }
 
@@ -190,20 +152,11 @@ fn tool_output_limits_for_history(call: &ToolCall) -> (usize, usize) {
     if call.tool == "search" {
         return pick_search_output_limits(call);
     }
-    if call.tool == "read_file" {
-        return (READ_TOOL_RAW_MAX_LINES, READ_TOOL_RAW_MAX_CHARS);
-    }
     (TOOL_OUTPUT_RAW_MAX_LINES, TOOL_OUTPUT_RAW_MAX_CHARS)
 }
-const WRITE_MAX_BYTES: usize = 50_000_000;
-const WRITE_BACKUP_DIR: &str = "log/backupcache";
-const FILE_MANAGER_RECYCLE_DIR: &str = "log/recycle";
 const PATCH_MAX_BYTES: usize = 500_000;
-const EDIT_MAX_FILE_BYTES: usize = 800_000;
-const EDIT_MAX_MATCHES: usize = 400;
-const LIST_MAX_DEPTH_CAP: usize = 4;
-const LIST_MAX_ENTRIES_DEFAULT: usize = 300;
-const LIST_MAX_ENTRIES_CAP: usize = 1200;
+pub(crate) const EDIT_MAX_FILE_BYTES: usize = 800_000;
+pub(crate) const EDIT_MAX_MATCHES: usize = 400;
 const MEMORY_CHECK_DEFAULT_RESULTS: usize = 10;
 const MEMORY_CHECK_MAX_RESULTS: usize = 20;
 const MEMORY_ADD_PREVIEW_LINES: usize = 8;
@@ -222,13 +175,60 @@ const SEARCH_EXCLUDE_DIRS: &[&str] = &[
 
 fn tool_tag_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)<tool>([\s\S]*?)</tool>").expect("tool regex"))
+    // 只匹配“独立成行”的 <tool>...</tool>：
+    // - 避免把正文里的示例（如行内代码 `...<tool>{...}</tool>...`）误判为真实工具调用
+    // - 符合协议：工具调用应单独输出，不夹杂其它文字
+    RE.get_or_init(|| {
+        Regex::new(r"(?ims)^[ \t]*<tool>([\s\S]*?)</tool>[ \t]*$").expect("tool regex")
+    })
 }
 
 fn parse_usize_value(v: &Value) -> Option<usize> {
     v.as_u64()
         .map(|n| n as usize)
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<usize>().ok()))
+}
+
+fn parse_u64_value(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|n| (n > 0).then_some(n as u64)))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
+fn parse_u64_list_value_max(v: &Value, max: usize) -> Option<Vec<u64>> {
+    match v {
+        Value::Null => None,
+        Value::Array(arr) => {
+            let mut out: Vec<u64> = Vec::new();
+            for item in arr {
+                if let Some(n) = parse_u64_value(item).filter(|x| *x > 0) {
+                    if out.contains(&n) {
+                        continue;
+                    }
+                    out.push(n);
+                    if out.len() >= max {
+                        break;
+                    }
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        other => value_to_nonempty_string(other).and_then(|s| {
+            let mut out: Vec<u64> = Vec::new();
+            for tok in parse_list_tokens(&s, max) {
+                if let Ok(n) = tok.trim().parse::<u64>() {
+                    if n == 0 || out.contains(&n) {
+                        continue;
+                    }
+                    out.push(n);
+                    if out.len() >= max {
+                        break;
+                    }
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }),
+    }
 }
 
 fn parse_toggle_input(s: &str) -> Option<bool> {
@@ -251,6 +251,12 @@ pub struct ToolCall {
     pub brief: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
+    // list：批量目标路径（优先于 path/input）
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    // list：同目录下的文件名数组（用于一次查看多个文件信息）
+    #[serde(default)]
+    pub names: Option<Vec<String>>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -278,8 +284,6 @@ pub struct ToolCall {
     #[serde(default)]
     pub file: Option<bool>,
     #[serde(default)]
-    pub strict: Option<bool>,
-    #[serde(default)]
     pub time: Option<String>,
     #[serde(default)]
     pub keywords: Option<String>,
@@ -302,9 +306,15 @@ pub struct ToolCall {
     // pty tool：目标 job_id（kill 等）
     #[serde(default)]
     pub job_id: Option<u64>,
+    // pty tool：目标 pid（kill 等）；兼容用户习惯，等价于 job_id
+    #[serde(default)]
+    pub pid: Option<u64>,
     // pty tool：批量目标 job_ids（kill 等）
     #[serde(default)]
     pub job_ids: Option<Vec<u64>>,
+    // pty tool：批量目标 pids（kill 等）；等价于 job_ids
+    #[serde(default)]
+    pub pids: Option<Vec<u64>>,
     // pty tool：批量启动命令（run）
     #[serde(default)]
     pub commands: Option<Vec<String>>,
@@ -357,31 +367,36 @@ pub struct ToolCall {
     #[serde(default)]
     pub output_level: Option<String>,
 
-    // list_dir：递归深度（1=仅当前目录）。为避免 token/性能暴涨，默认仍为 1。
+    // list：递归深度（默认 1，最大 3）。为避免 token/性能暴涨，仍受 max_entries/输出预算约束。
     #[serde(default)]
     pub depth: Option<usize>,
-    // list_dir：最多返回多少条 entry（每条一行）。超出会截断并提示。
+    // list：最多返回多少条 entry（每条一行）。超出会截断并提示。
     #[serde(default)]
     pub max_entries: Option<usize>,
     // write_file：覆盖已存在的非空文件（需要显式确认）
     #[serde(default)]
     pub overwrite: Option<bool>,
 
-    // file_manager
+    // 通用 op（用于 pty/list 等工具）
     #[serde(default)]
     pub op: Option<String>,
+    // steps：顺序执行多个子步骤（保留字段；当前未作为工具对外暴露）
+    #[serde(default)]
+    pub steps: Option<Vec<ToolCall>>,
     #[serde(default)]
     pub src: Option<String>,
     #[serde(default)]
     pub dst: Option<String>,
+    // 是否自动创建父目录（仅部分工具用到）
     #[serde(default)]
-    pub force: Option<bool>,
+    pub parents: Option<bool>,
     #[serde(default)]
     pub recursive: Option<bool>,
     #[serde(default)]
     pub mode: Option<String>,
+    // search(format)：输出格式（如 coords 只返回坐标）
     #[serde(default)]
-    pub trash_id: Option<String>,
+    pub format: Option<String>,
 }
 
 fn parse_list_tokens(raw: &str, max: usize) -> Vec<String> {
@@ -481,23 +496,72 @@ fn parse_string_list_value_max(v: &Value, max: usize) -> Option<Vec<String>> {
     }
 }
 
-fn parse_tool_call_payload(payload: &str) -> Option<ToolCall> {
-    let mut v: Value = serde_json::from_str(payload).ok()?;
-    if let Some(args_str) = v
-        .get("arguments")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && let Ok(parsed) = serde_json::from_str::<Value>(args_str)
-        && let Value::Object(mut m) = v
-    {
-        if let Value::Object(a) = parsed {
-            for (k, val) in a {
-                m.entry(k).or_insert(val);
+fn parse_steps_value_max(v: &Value, max: usize) -> Option<Vec<ToolCall>> {
+    let Value::Array(arr) = v else {
+        return None;
+    };
+    if max == 0 {
+        return None;
+    }
+    let mut out: Vec<ToolCall> = Vec::new();
+    for item in arr.iter() {
+        let Value::Object(obj) = item else {
+            continue;
+        };
+        let mut m = obj.clone();
+        let mut st = ToolCall::default();
+
+        if let Some(v) = m
+            .remove("tool")
+            .or_else(|| m.remove("name"))
+            .or_else(|| m.remove("tool_name"))
+            .and_then(|x| x.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+        {
+            st.tool = v;
+        }
+
+        if let Some(v) = m.remove("brief").or_else(|| m.remove("desc"))
+            && let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty())
+        {
+            st.brief = Some(s.to_string());
+        }
+
+        if let Some(v) = m
+            .remove("input")
+            .or_else(|| m.remove("command"))
+            .or_else(|| m.remove("cmd"))
+        {
+            match v {
+                Value::String(s) => st.input = s,
+                Value::Object(obj) => apply_args_object(&mut st, obj),
+                Value::Array(arr) => {
+                    let joined = arr
+                        .into_iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    st.input = joined;
+                }
+                other => st.input = other.to_string(),
             }
         }
-        v = Value::Object(m);
+
+        if let Some(Value::Object(obj)) = m.remove("args").or_else(|| m.remove("arguments")) {
+            apply_args_object(&mut st, obj);
+        }
+
+        apply_flat_fields(&mut st, &mut m);
+        out.push(st);
+        if out.len() >= max {
+            break;
+        }
     }
+    (!out.is_empty()).then_some(out)
+}
+
+fn parse_tool_call_payload(payload: &str) -> Option<ToolCall> {
+    let v: Value = serde_json::from_str(payload).ok()?;
     normalize_tool_call(v).ok()
 }
 
@@ -508,8 +572,6 @@ fn normalize_tool_call(v: Value) -> anyhow::Result<ToolCall> {
 
     let tool = m
         .remove("tool")
-        .or_else(|| m.remove("name"))
-        .or_else(|| m.remove("tool_name"))
         .and_then(|x| x.as_str().map(|s| s.trim().to_string()))
         .unwrap_or_default();
 
@@ -518,39 +580,21 @@ fn normalize_tool_call(v: Value) -> anyhow::Result<ToolCall> {
         ..Default::default()
     };
 
-    if let Some(v) = m.remove("brief").or_else(|| m.remove("desc"))
+    if let Some(v) = m.remove("brief")
         && let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty())
     {
         call.brief = Some(s.to_string());
     }
 
-    if let Some(v) = m
-        .remove("input")
-        .or_else(|| m.remove("command"))
-        .or_else(|| m.remove("cmd"))
-    {
+    if let Some(v) = m.remove("input") {
         match v {
             Value::String(s) => call.input = s,
-            Value::Object(obj) => apply_args_object(&mut call, obj),
-            Value::Array(arr) => {
-                let joined = arr
-                    .into_iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                call.input = joined;
-            }
             other => call.input = other.to_string(),
         }
     }
 
-    if let Some(Value::Object(obj)) = m.remove("args").or_else(|| m.remove("arguments")) {
-        apply_args_object(&mut call, obj);
-    }
-
     apply_flat_fields(&mut call, &mut m);
     let raw_tool = call.tool.clone();
-    call.tool = normalize_tool_name(&call.tool);
     apply_tool_defaults(&mut call);
     apply_mind_msg_defaults(&mut call, &raw_tool);
 
@@ -566,23 +610,29 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
         let s = value_to_nonempty_string(&val);
         match key.as_str() {
             "path" => call.path = s,
+            "paths" => {
+                call.paths = parse_string_list_value_max(&val, 64);
+            }
+            "name" => {
+                call.names = parse_string_list_value_max(&val, 64);
+            }
             "content" => call.content = s,
-            "message" | "msg" => call.content = s,
+            "message" => call.content = s,
             "pattern" => call.pattern = s,
             "root" => call.root = s,
             "patch" => call.patch = s,
             "find" => call.find = s,
             "replace" => call.replace = s,
-            "time" | "时间" => call.time = s,
-            "keywords" | "keyword" | "tags" | "关键词" => call.keywords = s,
-            "diary" | "note" | "日记" => call.diary = s,
-            "category" | "class" | "kind" | "group" | "类别" => call.category = s,
-            "section" | "slot" | "area" | "heading" => call.section = s,
+            "time" => call.time = s,
+            "keywords" => call.keywords = s,
+            "diary" => call.diary = s,
+            "category" => call.category = s,
+            "section" => call.section = s,
             "region" => call.region = s,
-            "target" | "to" | "dest" | "receiver" | "recipient" | "目标" => call.target = s,
-            "start_date" | "date_start" | "from_date" => call.date_start = s,
-            "end_date" | "date_end" | "to_date" => call.date_end = s,
-            "heartbeat_minutes" | "heartbeat_min" | "heartbeat" | "heartbeat_minute" => {
+            "target" => call.target = s,
+            "date_start" => call.date_start = s,
+            "date_end" => call.date_end = s,
+            "heartbeat_minutes" => {
                 if let Some(v) = parse_usize_value(&val) {
                     call.heartbeat_minutes = Some(v);
                 }
@@ -592,7 +642,7 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                     .as_bool()
                     .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
             }
-            "timeout_secs" | "timeout_s" | "timeout" => {
+            "timeout_secs" => {
                 call.timeout_secs = val
                     .as_u64()
                     .or_else(|| val.as_str().and_then(|x| x.trim().parse::<u64>().ok()));
@@ -602,18 +652,75 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                     .as_u64()
                     .or_else(|| val.as_str().and_then(|x| x.trim().parse::<u64>().ok()));
             }
-            "cwd" | "workdir" | "work_dir" | "dir" => {
+            "cwd" => {
                 call.cwd = s;
             }
-            "op" | "operation" | "action" => {
+            "op" => {
                 call.op = s;
             }
-            "job_id" | "job" => {
-                call.job_id = val
-                    .as_u64()
-                    .or_else(|| val.as_str().and_then(|x| x.trim().parse::<u64>().ok()));
+            "src" => {
+                call.src = s;
             }
-            "commands" | "cmds" => {
+            // `to/dest` 对 mind_msg 是 target；否则作为 dst。
+            "to" => {
+                if call.tool == "mind_msg" {
+                    call.target = s;
+                } else {
+                    call.dst = s;
+                }
+            }
+            "dst" => {
+                call.dst = s;
+            }
+            "parents" => {
+                call.parents = val
+                    .as_bool()
+                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+            }
+            "recursive" => {
+                call.recursive = val
+                    .as_bool()
+                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+            }
+            "mode" => {
+                call.mode = s;
+            }
+            "format" => {
+                call.format = s;
+            }
+            "overwrite" => {
+                call.overwrite = val
+                    .as_bool()
+                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+            }
+            "steps" => {
+                call.steps = parse_steps_value_max(&val, 64);
+            }
+            // pty kill 目标字段：兼容 snake_case 与常见 camelCase（部分模型会输出 jobId/jobIds）。
+            "job_id" => {
+                call.job_id = parse_u64_value(&val);
+            }
+            "pid" => {
+                // 兼容统一写法：pid:[1,2,3]（数组形式会归一到 pids）
+                if val.is_array() {
+                    call.pids = parse_u64_list_value_max(&val, 16);
+                } else if let Some(list) = parse_u64_list_value_max(&val, 16) {
+                    if list.len() > 1 {
+                        call.pids = Some(list);
+                    } else if let Some(first) = list.first().copied() {
+                        call.pid = Some(first);
+                    }
+                } else {
+                    call.pid = parse_u64_value(&val);
+                }
+            }
+            "job_ids" => {
+                call.job_ids = parse_u64_list_value_max(&val, 16);
+            }
+            "pids" => {
+                call.pids = parse_u64_list_value_max(&val, 16);
+            }
+            "commands" => {
                 let mut out: Vec<String> = Vec::new();
                 match val {
                     Value::Array(arr) => {
@@ -646,10 +753,10 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                     call.commands = Some(out);
                 }
             }
-            "save" | "export" | "capture" => {
+            "save" => {
                 call.save = s;
             }
-            "ok_exit_codes" | "ok_codes" | "ok_exit" | "ok_exit_code" => {
+            "ok_exit_codes" => {
                 if let Value::Array(arr) = val {
                     let mut out: Vec<i32> = Vec::new();
                     for x in arr {
@@ -674,15 +781,15 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                     }
                 }
             }
-            "memory" | "mem" | "memo" | "in_memory" => {
+            "memory" => {
                 call.memory = val
                     .as_bool()
                     .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
             }
-            "scope" | "bucket" | "zone" => {
+            "scope" => {
                 call.region = s;
             }
-            "scan_limit" | "scan_max" | "scan_cap" | "max_scan" => {
+            "scan_limit" => {
                 call.scan_limit = parse_usize_value(&val);
             }
             "full" => {
@@ -690,46 +797,46 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                     .as_bool()
                     .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
             }
-            "output_level" | "out_level" | "level" | "output" => {
+            "output_level" => {
                 call.output_level = s;
             }
-            "depth" | "max_depth" => {
+            "depth" => {
                 call.depth = parse_usize_value(&val);
             }
-            "max_entries" | "entries" | "entry_cap" => {
+            "max_entries" => {
                 call.max_entries = parse_usize_value(&val);
             }
-            "context" | "ctx" | "fast_context" => {
+            "context" => {
                 call.context = val
                     .as_bool()
                     .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
             }
-            "context_lines" | "ctx_lines" | "lines_around" | "around_lines" => {
+            "context_lines" => {
                 call.context_lines = parse_usize_value(&val);
             }
-            "context_files" | "ctx_files" | "max_files" => {
+            "context_files" => {
                 call.context_files = parse_usize_value(&val);
             }
-            "context_hits_per_file" | "ctx_hits_per_file" | "hits_per_file" => {
+            "context_hits_per_file" => {
                 call.context_hits_per_file = parse_usize_value(&val);
             }
-            "include_glob" | "include_globs" | "include" => {
+            "include_glob" => {
                 call.include_glob = parse_string_list_value_max(&val, SEARCH_MAX_GLOBS);
             }
-            "exclude_glob" | "exclude_globs" | "exclude" => {
+            "exclude_glob" => {
                 call.exclude_glob = parse_string_list_value_max(&val, SEARCH_MAX_GLOBS);
             }
-            "exclude_dirs" | "exclude_dir" => {
+            "exclude_dirs" => {
                 call.exclude_dirs = parse_string_list_value_max(&val, 32);
             }
             "count" => call.count = parse_usize_value(&val),
-            "start_line" | "start" => {
+            "start_line" => {
                 call.start_line = parse_usize_value(&val);
             }
-            "max_lines" | "lines" => {
+            "max_lines" => {
                 call.max_lines = parse_usize_value(&val);
             }
-            "max_chars" | "chars" | "max_char" => {
+            "max_chars" => {
                 call.max_chars = parse_usize_value(&val);
             }
             "head" => {
@@ -744,11 +851,6 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             }
             "file" => {
                 call.file = val
-                    .as_bool()
-                    .or_else(|| val.as_str().and_then(|v| v.trim().parse::<bool>().ok()));
-            }
-            "strict" => {
-                call.strict = val
                     .as_bool()
                     .or_else(|| val.as_str().and_then(|v| v.trim().parse::<bool>().ok()));
             }
@@ -793,40 +895,8 @@ fn value_to_nonempty_string(v: &Value) -> Option<String> {
     }
 }
 
-fn normalize_tool_name(name: &str) -> String {
-    let n = name.trim();
-    match n {
-        "ls" | "list" | "list_files" | "listdir" | "list_directory" => "list_dir",
-        "stat" | "info" | "file_info" => "stat_file",
-        "read" | "readfile" => "read_file",
-        "write" | "writefile" => "write_file",
-        "grep" | "rg" | "ripgrep" => "search",
-        "edit" => "edit_file",
-        "patch" => "apply_patch",
-        "memorycheck" | "memory_check" | "memorycheak" => "memory_check",
-        "memoryread" | "memory_read" => "memory_read",
-        "memoryedit" | "memory_edit" => "memory_edit",
-        "memoryadd" | "memory_add" => "memory_add",
-        "mind_msg" | "mindmsg" | "mind_message" | "mindmessage" | "mind" | "todog" | "to_dog"
-        | "to-dog" | "tomain" | "to_main" | "to-main" => "mind_msg",
-        "system_config" | "sys_config" | "systemcfg" | "system_setting" | "system_settings" => {
-            "system_config"
-        }
-        "skills" | "skills_mcp" | "skill" | "skill_mcp" => "skills_mcp",
-        "pty" | "terminal" | "term" => "pty",
-        _ => n,
-    }
-    .to_string()
-}
-
 fn apply_tool_defaults(call: &mut ToolCall) {
     match call.tool.as_str() {
-        "list_dir" | "stat_file" => {
-            if call.path.as_deref().unwrap_or("").trim().is_empty() && call.input.trim().is_empty()
-            {
-                call.input = ".".to_string();
-            }
-        }
         "search" => {
             if call.root.as_deref().unwrap_or("").trim().is_empty()
                 && call.path.as_deref().unwrap_or("").trim().is_empty()
@@ -1092,7 +1162,7 @@ fn parse_search_hit_line(line: &str) -> Option<(String, usize, String)> {
     Some((path, line_no, content))
 }
 
-fn sanitize_search_line(raw: &str) -> String {
+pub(crate) fn sanitize_search_line(raw: &str) -> String {
     // 防止把文件内容里的控制字符/ANSI escape 注入到 TUI，导致闪烁/乱码/震动等现象。
     // 规则：保留可见字符与 '\t'；其它控制字符全部替换为空格。
     let mut out = String::with_capacity(raw.len());
@@ -1115,7 +1185,7 @@ fn sanitize_search_line(raw: &str) -> String {
     out
 }
 
-fn is_probably_binary_file(path: &Path) -> bool {
+pub(crate) fn is_probably_binary_file(path: &Path) -> bool {
     // 快速二进制探测：存在 NUL 基本可判定为 binary。
     // 这能避免 sqlite/db 等文件被 AND/context 模式扫描后产生乱码与控制序列。
     let Ok(mut f) = fs::File::open(path) else {
@@ -1141,6 +1211,355 @@ fn resolve_search_hit_path(root: &str, hit_path: &str) -> PathBuf {
         return PathBuf::from(hit);
     }
     Path::new(root).join(hit)
+}
+
+fn run_search_coords(call: &ToolCall, pattern: &str, root: &str) -> anyhow::Result<ToolOutcome> {
+    let started = Instant::now();
+    let timeout_secs = call
+        .timeout_secs
+        .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000))
+        .or(Some(SEARCH_TIMEOUT_SECS));
+
+    let max_matches = call
+        .count
+        .unwrap_or(SEARCH_DEFAULT_MAX_MATCHES)
+        .clamp(1, SEARCH_MAX_MATCHES_CAP);
+
+    let include_globs = call.include_glob.clone().unwrap_or_default();
+    let exclude_globs = call.exclude_glob.clone().unwrap_or_default();
+    let extra_exclude_dirs = call.exclude_dirs.clone().unwrap_or_default();
+    let include_re = compile_globs(&include_globs);
+    let exclude_re = compile_globs(&exclude_globs);
+
+    let mut engine = "rg";
+    let mut rg_args: Vec<String> = vec![
+        "--line-number".to_string(),
+        "--no-heading".to_string(),
+        "-S".to_string(),
+        "--max-count".to_string(),
+        max_matches.to_string(),
+        "--max-filesize".to_string(),
+        SEARCH_MAX_FILESIZE.to_string(),
+    ];
+    for d in SEARCH_EXCLUDE_DIRS {
+        rg_args.push("--glob".to_string());
+        rg_args.push(format!("!**/{d}/**"));
+    }
+    for g in ["!**/*.db", "!**/*.sqlite", "!**/*.sqlite3"] {
+        rg_args.push("--glob".to_string());
+        rg_args.push(g.to_string());
+    }
+    for d in extra_exclude_dirs.iter() {
+        rg_args.push("--glob".to_string());
+        rg_args.push(format!("!**/{d}/**"));
+    }
+    for g in include_globs.iter() {
+        rg_args.push("--glob".to_string());
+        rg_args.push(g.to_string());
+    }
+    for g in exclude_globs.iter() {
+        rg_args.push("--glob".to_string());
+        rg_args.push(format!("!{g}"));
+    }
+    rg_args.push("--".to_string());
+    rg_args.push(pattern.to_string());
+    rg_args.push(root.to_string());
+
+    let mut grep_args: Vec<String> = vec![
+        "-RIn".to_string(),
+        "-I".to_string(),
+        "--binary-files=without-match".to_string(),
+        "-m".to_string(),
+        max_matches.to_string(),
+    ];
+    for d in SEARCH_EXCLUDE_DIRS {
+        grep_args.push("--exclude-dir".to_string());
+        grep_args.push((*d).to_string());
+    }
+    for g in ["*.db", "*.sqlite", "*.sqlite3"] {
+        grep_args.push("--exclude".to_string());
+        grep_args.push(g.to_string());
+    }
+    for d in extra_exclude_dirs.iter() {
+        grep_args.push("--exclude-dir".to_string());
+        grep_args.push(d.to_string());
+    }
+    for g in include_globs.iter() {
+        grep_args.push(format!("--include={g}"));
+    }
+    for g in exclude_globs.iter() {
+        grep_args.push(format!("--exclude={g}"));
+    }
+    grep_args.push("--".to_string());
+    grep_args.push(pattern.to_string());
+    grep_args.push(root.to_string());
+
+    let rg_refs: Vec<&str> = rg_args.iter().map(|s| s.as_str()).collect();
+    let grep_refs: Vec<&str> = grep_args.iter().map(|s| s.as_str()).collect();
+    let rg_bin = if Path::new(TERMUX_RG).is_file() {
+        TERMUX_RG
+    } else {
+        "rg"
+    };
+    let mut out = run_command_output_with_optional_timeout(rg_bin, &rg_refs, timeout_secs);
+    if out.is_err() {
+        engine = "grep";
+        out = run_command_output_with_optional_timeout("grep", &grep_refs, timeout_secs);
+    }
+    let (code, stdout, _stderr, timed_out) =
+        out.unwrap_or_else(|_| (127, String::new(), "search failed".to_string(), false));
+    let status = status_label(code, timed_out);
+
+    fn real_display_pathbuf(path: &Path) -> String {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_string()
+    }
+
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut coords: Vec<String> = Vec::new();
+    for l in stdout.lines() {
+        let Some((p, ln, _content)) = parse_search_hit_line(l) else {
+            continue;
+        };
+        let path = resolve_search_hit_path(root, &p);
+        if !search_path_allowed(&path, &include_re, &exclude_re, &extra_exclude_dirs) {
+            continue;
+        }
+        let real = real_display_pathbuf(&path);
+        let key = format!("{real}:{ln}");
+        if seen.insert(key.clone()) {
+            coords.push(key);
+        }
+        if coords.len() >= max_matches {
+            break;
+        }
+    }
+    if coords.is_empty() {
+        return Ok(ToolOutcome {
+            user_message: "未找到匹配".to_string(),
+            log_lines: vec![format!(
+                "状态:{status} | 耗时:{}ms | op:search | format:coords | engine:{} | root:{} | matches:0",
+                started.elapsed().as_millis(),
+                engine,
+                shorten_path(root),
+            )],
+        });
+    }
+
+    let mut body = coords.join("\n");
+    if timed_out {
+        body = annotate_timeout(body, true, timeout_secs);
+    }
+    let raw_lines = body.lines().count();
+    let raw_chars = body.chars().count();
+    let (out_lines, out_chars) = pick_search_output_limits(call);
+    let body2 = truncate_tool_payload(&body, out_lines, out_chars);
+    let log = format!(
+        "状态:{status} | 耗时:{}ms | op:search | format:coords | engine:{} | root:{} | matches:{} | lines:{} | chars:{}",
+        started.elapsed().as_millis(),
+        engine,
+        shorten_path(root),
+        coords.len(),
+        raw_lines,
+        raw_chars
+    );
+    Ok(ToolOutcome {
+        user_message: body2,
+        log_lines: vec![log],
+    })
+}
+
+fn run_search_ranges(call: &ToolCall, pattern: &str, root: &str) -> anyhow::Result<ToolOutcome> {
+    let started = Instant::now();
+    let timeout_secs = call
+        .timeout_secs
+        .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000))
+        .or(Some(SEARCH_TIMEOUT_SECS));
+
+    let max_matches = call
+        .count
+        .unwrap_or(SEARCH_DEFAULT_MAX_MATCHES)
+        .clamp(1, SEARCH_MAX_MATCHES_CAP);
+
+    let include_globs = call.include_glob.clone().unwrap_or_default();
+    let exclude_globs = call.exclude_glob.clone().unwrap_or_default();
+    let extra_exclude_dirs = call.exclude_dirs.clone().unwrap_or_default();
+    let include_re = compile_globs(&include_globs);
+    let exclude_re = compile_globs(&exclude_globs);
+
+    let mut engine = "rg";
+    let mut rg_args: Vec<String> = vec![
+        "--line-number".to_string(),
+        "--no-heading".to_string(),
+        "-S".to_string(),
+        "--max-count".to_string(),
+        max_matches.to_string(),
+        "--max-filesize".to_string(),
+        SEARCH_MAX_FILESIZE.to_string(),
+    ];
+    for d in SEARCH_EXCLUDE_DIRS {
+        rg_args.push("--glob".to_string());
+        rg_args.push(format!("!**/{d}/**"));
+    }
+    for g in ["!**/*.db", "!**/*.sqlite", "!**/*.sqlite3"] {
+        rg_args.push("--glob".to_string());
+        rg_args.push(g.to_string());
+    }
+    for d in extra_exclude_dirs.iter() {
+        rg_args.push("--glob".to_string());
+        rg_args.push(format!("!**/{d}/**"));
+    }
+    for g in include_globs.iter() {
+        rg_args.push("--glob".to_string());
+        rg_args.push(g.to_string());
+    }
+    for g in exclude_globs.iter() {
+        rg_args.push("--glob".to_string());
+        rg_args.push(format!("!{g}"));
+    }
+    rg_args.push("--".to_string());
+    rg_args.push(pattern.to_string());
+    rg_args.push(root.to_string());
+
+    let mut grep_args: Vec<String> = vec![
+        "-RIn".to_string(),
+        "-I".to_string(),
+        "--binary-files=without-match".to_string(),
+        "-m".to_string(),
+        max_matches.to_string(),
+    ];
+    for d in SEARCH_EXCLUDE_DIRS {
+        grep_args.push("--exclude-dir".to_string());
+        grep_args.push((*d).to_string());
+    }
+    for g in ["*.db", "*.sqlite", "*.sqlite3"] {
+        grep_args.push("--exclude".to_string());
+        grep_args.push(g.to_string());
+    }
+    for d in extra_exclude_dirs.iter() {
+        grep_args.push("--exclude-dir".to_string());
+        grep_args.push(d.to_string());
+    }
+    for g in include_globs.iter() {
+        grep_args.push(format!("--include={g}"));
+    }
+    for g in exclude_globs.iter() {
+        grep_args.push(format!("--exclude={g}"));
+    }
+    grep_args.push("--".to_string());
+    grep_args.push(pattern.to_string());
+    grep_args.push(root.to_string());
+
+    let rg_refs: Vec<&str> = rg_args.iter().map(|s| s.as_str()).collect();
+    let grep_refs: Vec<&str> = grep_args.iter().map(|s| s.as_str()).collect();
+    let rg_bin = if Path::new(TERMUX_RG).is_file() {
+        TERMUX_RG
+    } else {
+        "rg"
+    };
+    let mut out = run_command_output_with_optional_timeout(rg_bin, &rg_refs, timeout_secs);
+    if out.is_err() {
+        engine = "grep";
+        out = run_command_output_with_optional_timeout("grep", &grep_refs, timeout_secs);
+    }
+    let (code, stdout, _stderr, timed_out) =
+        out.unwrap_or_else(|_| (127, String::new(), "search failed".to_string(), false));
+    let status = status_label(code, timed_out);
+
+    fn real_display_pathbuf(path: &Path) -> String {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_string()
+    }
+
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_file: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    let mut total = 0usize;
+    for l in stdout.lines() {
+        let Some((p, ln, _content)) = parse_search_hit_line(l) else {
+            continue;
+        };
+        let path = resolve_search_hit_path(root, &p);
+        if !search_path_allowed(&path, &include_re, &exclude_re, &extra_exclude_dirs) {
+            continue;
+        }
+        let real = real_display_pathbuf(&path);
+        let set = by_file.entry(real).or_default();
+        if set.insert(ln) {
+            total = total.saturating_add(1);
+        }
+        if total >= max_matches {
+            break;
+        }
+    }
+
+    if by_file.is_empty() {
+        return Ok(ToolOutcome {
+            user_message: "未找到匹配".to_string(),
+            log_lines: vec![format!(
+                "状态:{status} | 耗时:{}ms | op:search | format:ranges | engine:{} | root:{} | matches:0",
+                started.elapsed().as_millis(),
+                engine,
+                shorten_path(root),
+            )],
+        });
+    }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut range_count = 0usize;
+    for (file, lines) in by_file.into_iter() {
+        let mut it = lines.into_iter();
+        let Some(mut start) = it.next() else { continue };
+        let mut prev = start;
+        for ln in it {
+            if ln == prev + 1 {
+                prev = ln;
+                continue;
+            }
+            // flush range
+            if start == prev {
+                out_lines.push(format!("{file}:L{start}"));
+            } else {
+                out_lines.push(format!("{file}:L{start}-L{prev}"));
+            }
+            range_count = range_count.saturating_add(1);
+            start = ln;
+            prev = ln;
+        }
+        if start == prev {
+            out_lines.push(format!("{file}:L{start}"));
+        } else {
+            out_lines.push(format!("{file}:L{start}-L{prev}"));
+        }
+        range_count = range_count.saturating_add(1);
+    }
+
+    let mut body = out_lines.join("\n");
+    if timed_out {
+        body = annotate_timeout(body, true, timeout_secs);
+    }
+    let raw_lines = body.lines().count();
+    let raw_chars = body.chars().count();
+    let (out_cap_lines, out_cap_chars) = pick_search_output_limits(call);
+    let body2 = truncate_tool_payload(&body, out_cap_lines, out_cap_chars);
+    let log = format!(
+        "状态:{status} | 耗时:{}ms | op:search | format:ranges | engine:{} | root:{} | matches:{} | ranges:{} | lines:{} | chars:{}",
+        started.elapsed().as_millis(),
+        engine,
+        shorten_path(root),
+        total,
+        range_count,
+        raw_lines,
+        raw_chars
+    );
+    Ok(ToolOutcome {
+        user_message: body2,
+        log_lines: vec![log],
+    })
 }
 
 fn resolve_mind_target(call: &ToolCall) -> Option<String> {
@@ -1170,10 +1589,39 @@ pub fn extract_tool_calls(text: &str) -> anyhow::Result<(Vec<ToolCall>, String)>
     if text.trim().is_empty() {
         return Ok((vec![], String::new()));
     }
+    // 先走严格模式：只接受“独立成行”的 <tool>...</tool>（最安全）。
+    let (mut calls, mut spans) = extract_tool_calls_strict(text);
+    if calls.is_empty() && text.contains("<tool>") && text.contains("</tool>") {
+        // 宽松兜底：某些供应商/中转会把 `<tool>` 块与其它文本拼在同一行（或尾部追加噪音），
+        // 导致严格模式 0 命中，从而误判“工具解析失败”。
+        //
+        // 注意：仍需要满足 JSON 可解析为合法 ToolCall，且避免在 ``` code fence 内触发。
+        let (calls2, spans2) = extract_tool_calls_relaxed(text);
+        if !calls2.is_empty() {
+            calls = calls2;
+            spans = spans2;
+        }
+    }
+    let cleaned = remove_spans(text, &spans);
+    Ok((calls, cleaned.trim().to_string()))
+}
+
+pub fn strip_any_tool_blocks(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let (_calls, mut spans) = extract_tool_calls_strict(text);
+    if spans.is_empty() && text.contains("<tool>") && text.contains("</tool>") {
+        let (_calls2, spans2) = extract_tool_calls_relaxed(text);
+        spans = spans2;
+    }
+    remove_spans(text, &spans).trim().to_string()
+}
+
+fn extract_tool_calls_strict(text: &str) -> (Vec<ToolCall>, Vec<(usize, usize)>) {
     let re = tool_tag_re();
     let mut calls = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
-
     for caps in re.captures_iter(text) {
         let Some(block) = caps.get(0) else {
             continue;
@@ -1187,9 +1635,71 @@ pub fn extract_tool_calls(text: &str) -> anyhow::Result<(Vec<ToolCall>, String)>
             spans.push((block.start(), block.end()));
         }
     }
+    (calls, spans)
+}
 
-    let cleaned = remove_spans(text, &spans);
-    Ok((calls, cleaned.trim().to_string()))
+fn extract_tool_calls_relaxed(text: &str) -> (Vec<ToolCall>, Vec<(usize, usize)>) {
+    // 仅做线性扫描：提取 `<tool>` 与 `</tool>` 之间的 payload 并尝试解析 JSON。
+    // 规则：
+    // - 跳过 ``` code fence 内的内容（避免示例/文档被误触发执行）。
+    // - 只有 parse 成合法 ToolCall 才算命中。
+    let mut calls: Vec<ToolCall> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+
+    // 预计算 fence 区域：任何位于奇数段 fence 内的 `<tool>` 都跳过。
+    let mut fence_starts: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while let Some(pos) = text[i..].find("```") {
+        let at = i + pos;
+        fence_starts.push(at);
+        i = at + 3;
+    }
+    fn in_code_fence(fences: &[usize], idx: usize) -> bool {
+        // fences 记录每个 ``` 的起点；偶数->进入，奇数->退出。
+        let mut n = 0usize;
+        for &p in fences {
+            if p > idx {
+                break;
+            }
+            n += 1;
+        }
+        n % 2 == 1
+    }
+
+    fn line_prefix_allows_relaxed_tool(prefix: &str) -> bool {
+        // 允许：
+        // - 行首空白
+        // - UI/文本里常见的 bullet 前缀（例如 "● " / "○ " / "- "）
+        let p = prefix.trim();
+        p.is_empty() || matches!(p, "●" | "○" | "-" | "*" | ">")
+    }
+
+    let mut cursor = 0usize;
+    while let Some(start_rel) = text[cursor..].find("<tool>") {
+        let start = cursor + start_rel;
+        if in_code_fence(&fence_starts, start) {
+            cursor = start + 6;
+            continue;
+        }
+        let line_prefix = text[..start].rsplit('\n').next().unwrap_or("");
+        if !line_prefix_allows_relaxed_tool(line_prefix) {
+            cursor = start + 6;
+            continue;
+        }
+        let after = start + "<tool>".len();
+        let Some(end_rel) = text[after..].find("</tool>") else {
+            break;
+        };
+        let end = after + end_rel + "</tool>".len();
+        let payload_raw = &text[after..(after + end_rel)];
+        let payload = normalize_tool_payload(payload_raw);
+        if let Some(call) = parse_tool_call_payload(&payload) {
+            calls.push(call);
+            spans.push((start, end));
+        }
+        cursor = end;
+    }
+    (calls, spans)
 }
 
 fn normalize_tool_payload(payload: &str) -> String {
@@ -1241,59 +1751,35 @@ mod tests {
 
     #[test]
     fn parse_tool_call_basic() {
-        let call = parse_tool_call_payload(r#"{"tool":"list_dir","input":".","brief":"列目录"}"#)
-            .expect("call");
-        assert_eq!(call.tool, "list_dir");
-        assert_eq!(call.input, ".");
+        let call =
+            parse_tool_call_payload(r#"{"tool":"list","op":"dir","cwd":".","brief":"列目录"}"#).expect("call");
+        assert_eq!(call.tool, "list");
+        assert_eq!(call.op.as_deref(), Some("dir"));
+        assert_eq!(call.cwd.as_deref(), Some("."));
         assert_eq!(call.brief.as_deref(), Some("列目录"));
     }
 
     #[test]
-    fn parse_tool_call_name_arguments_string() {
+    fn parse_tool_call_names() {
         let call = parse_tool_call_payload(
-            r#"{"name":"search","arguments":"{\"pattern\":\"foo\",\"root\":\".\"}"}"#,
+            r#"{"tool":"list","op":"files","brief":"stat","cwd":".","name":["a","b","c"]}"#,
         )
         .expect("call");
-        assert_eq!(call.tool, "search");
-        assert_eq!(call.pattern.as_deref(), Some("foo"));
-        assert_eq!(call.root.as_deref(), Some("."));
+        assert_eq!(call.tool, "list");
+        assert_eq!(call.names.as_ref().map(|v| v.len()), Some(3));
+
     }
 
     #[test]
-    fn parse_tool_call_input_object() {
-        let call = parse_tool_call_payload(
-            r#"{"tool":"search","input":{"pattern":"foo","root":"."},"brief":"搜文本"}"#,
-        )
-        .expect("call");
-        assert_eq!(call.tool, "search");
-        assert_eq!(call.pattern.as_deref(), Some("foo"));
-        assert_eq!(call.root.as_deref(), Some("."));
-        assert_eq!(call.brief.as_deref(), Some("搜文本"));
-    }
-
-    #[test]
-    fn parse_tool_call_input_object_turing_modules() {
-        let call = parse_tool_call_payload(
-            r#"{"tool":"bash","brief":"模块化参数","input":{"input":"pwd","run":{"cwd":"AItermux/system","timeout_ms":12000},"out":{"save":"always"},"expect":{"ok_exit_codes":[0,1]}}}"#,
-        )
-        .expect("call");
-        assert_eq!(call.tool, "bash");
-        assert_eq!(call.input.trim(), "pwd");
-        assert_eq!(call.cwd.as_deref(), Some("AItermux/system"));
-        assert_eq!(call.timeout_ms, Some(12000));
-        assert_eq!(call.save.as_deref(), Some("always"));
-        assert!(call.ok_exit_codes.as_ref().is_some_and(|v| v.contains(&1)));
-    }
-
-    #[test]
-    fn parse_tool_call_memory_flag() {
-        let call = parse_tool_call_payload(
-            r#"{"tool":"search","pattern":"foo","root":"all","memory":true,"brief":"搜记忆"}"#,
-        )
-        .expect("call");
-        assert_eq!(call.tool, "search");
-        assert_eq!(call.memory, Some(true));
-        assert_eq!(call.pattern.as_deref(), Some("foo"));
+    fn extract_tool_calls_multiple_blocks_and_pids() {
+        let text = "<tool>{\"tool\":\"pty\",\"op\":\"kill\",\"pids\":[8,9,10],\"brief\":\"kill batch\"}</tool>\n<tool>{\"tool\":\"bash\",\"input\":\"pwd\",\"brief\":\"cwd\"}</tool>\n[[t:123456]]";
+        let (calls, cleaned) = extract_tool_calls(text).expect("extract ok");
+        assert_eq!(calls.len(), 2);
+        let pty = calls.iter().find(|c| c.tool == "pty").expect("pty call");
+        assert_eq!(pty.op.as_deref(), Some("kill"));
+        assert!(pty.pids.as_ref().is_some_and(|v| v.contains(&8)));
+        assert!(pty.pids.as_ref().is_some_and(|v| v.contains(&10)));
+        assert!(cleaned.trim().starts_with("[[t:"));
     }
 
     #[test]
@@ -1329,11 +1815,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_call_pty_kill_pid_and_pids() {
+        let call =
+            parse_tool_call_payload(r#"{"tool":"pty","op":"kill","pid":7,"brief":"kill one"}"#)
+                .expect("call");
+        assert_eq!(call.tool, "pty");
+        assert_eq!(call.op.as_deref(), Some("kill"));
+        assert_eq!(call.pid, Some(7));
+
+        let call = parse_tool_call_payload(
+            r#"{"tool":"pty","op":"kill","pids":[1,"2",3],"brief":"kill batch"}"#,
+        )
+        .expect("call");
+        assert_eq!(call.pids.as_ref().map(|v| v.len()), Some(3));
+        assert!(call.pids.as_ref().is_some_and(|v| v.contains(&2)));
+
+        let call = parse_tool_call_payload(
+            r#"{"tool":"pty","op":"kill","job_ids":"4,5 6","brief":"kill jobs"}"#,
+        )
+        .expect("call");
+        assert!(call.job_ids.as_ref().is_some_and(|v| v.contains(&4)));
+        assert!(call.job_ids.as_ref().is_some_and(|v| v.contains(&6)));
+    }
+
+    #[test]
     fn parse_tool_call_memory_region_and_scan_limit() {
         let call = parse_tool_call_payload(
             r#"{"tool":"search","pattern":"a b","root":"datememo","memory":true,"region":"past","scan_limit":12000,"brief":"搜记忆"}"#,
         )
         .expect("call");
+        assert_eq!(call.tool, "search");
         assert_eq!(call.memory, Some(true));
         assert_eq!(call.region.as_deref(), Some("past"));
         assert_eq!(call.scan_limit, Some(12000));
@@ -1381,13 +1892,7 @@ mod tests {
     #[test]
     fn normalize_aliases() {
         let call = parse_tool_call_payload(r#"{"tool":"ls","input":"."}"#).expect("call");
-        assert_eq!(call.tool, "list_dir");
-        assert_eq!(call.input, ".");
-    }
-
-    #[test]
-    fn apply_defaults_for_list_dir() {
-        let call = parse_tool_call_payload(r#"{"tool":"list_dir"}"#).expect("call");
+        assert_eq!(call.tool, "ls");
         assert_eq!(call.input, ".");
     }
 
@@ -1403,7 +1908,6 @@ mod tests {
         assert!(out.contains("line8"));
         assert!(out.contains("line9"));
         assert!(out.contains("\n...\n"));
-        assert!(out.contains("[输出已截断"));
         assert!(!out.contains("line5"));
     }
 
@@ -1412,7 +1916,6 @@ mod tests {
         let input = "你好世界你好世界你好世界"; // 12 chars
         let out = truncate_tool_payload(input, 10, 6);
         assert!(out.contains("\n...\n"));
-        assert!(out.contains("[输出已截断"));
         assert!(!out.contains(input));
     }
 
@@ -1482,67 +1985,6 @@ fastmemo v2 | max_chars: 1800 | updated: 2026-02-01 00:00:00
         assert!(is_fastmemo_v3_struct(&repaired));
         assert!(!repaired.contains("淡化池"));
         assert!(!repaired.contains("should_drop"));
-    }
-
-    #[test]
-    fn validate_file_manager_requires_op() {
-        let call = ToolCall {
-            tool: "file_manager".to_string(),
-            brief: Some("测试".to_string()),
-            ..Default::default()
-        };
-        assert!(validate_tool_call(&call).is_err());
-    }
-
-    #[test]
-    fn file_manager_trash_restore_roundtrip_file() {
-        let pid = std::process::id();
-        let src_rel = format!("log/_test_file_manager_{pid}.txt");
-        let src = PathBuf::from(&src_rel);
-        if let Some(parent) = src.parent() {
-            fs::create_dir_all(parent).expect("mkdir log");
-        }
-        fs::write(&src, "hello").expect("write src");
-
-        let trash_call = ToolCall {
-            tool: "file_manager".to_string(),
-            brief: Some("测试回收".to_string()),
-            op: Some("trash".to_string()),
-            path: Some(src_rel.clone()),
-            ..Default::default()
-        };
-        let trashed = handle_tool_call(&trash_call).expect("trash ok");
-        assert!(!src.exists(), "src should be removed by rename-trash");
-        let meta_line = trashed
-            .log_lines
-            .iter()
-            .find(|l| l.contains("trash_id:"))
-            .cloned()
-            .unwrap_or_default();
-        let trash_id = meta_line
-            .split('|')
-            .map(|s| s.trim())
-            .find_map(|part| part.strip_prefix("trash_id:"))
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        assert!(!trash_id.is_empty(), "trash_id should be present");
-
-        let restore_call = ToolCall {
-            tool: "file_manager".to_string(),
-            brief: Some("测试恢复".to_string()),
-            op: Some("restore".to_string()),
-            trash_id: Some(trash_id.clone()),
-            force: Some(true),
-            ..Default::default()
-        };
-        let _restored = handle_tool_call(&restore_call).expect("restore ok");
-        assert!(src.exists(), "src should be restored");
-        let content = fs::read_to_string(&src).expect("read restored");
-        assert_eq!(content, "hello");
-
-        let _ = fs::remove_file(&src);
-        let _ = fs::remove_dir_all(file_manager_recycle_dir().join(&trash_id));
     }
 }
 
@@ -1688,19 +2130,51 @@ pub fn format_tool_message_raw(call: &ToolCall, outcome: &ToolOutcome) -> String
 }
 
 pub fn format_tool_message_for_model(call: &ToolCall, outcome: &ToolOutcome) -> String {
-    const OUTPUT_MAX_LINES: usize = 18;
-    const OUTPUT_MAX_CHARS: usize = 1800;
-    const META_MAX_LINES: usize = 8;
-    const META_MAX_CHARS: usize = 380;
-
-    format_tool_message_with_limits(
-        call,
-        outcome,
-        OUTPUT_MAX_LINES,
-        OUTPUT_MAX_CHARS,
-        META_MAX_LINES,
-        META_MAX_CHARS,
-    )
+    // 模型侧：只注入“工具输出 + 必要 meta”，避免把 UI/可视化用的 TOOL/INPUT/EXPLAIN 结构回灌给模型，
+    // 否则会干扰模型对 `<tool>{...}</tool>` 工具调用协议的判断（把回执误学成调用格式）。
+    //
+    // 约束：
+    // - 仍保持输出预算（避免上下文被日志撑爆）
+    // - 工具自身会在超阈值时导出到文件并返回 saved/path/lines/bytes 等信息
+    let (out_lines, out_chars) = tool_output_limits_for_history(call);
+    let output = if outcome.user_message.trim().is_empty() {
+        TOOL_MESSAGES.no_output.to_string()
+    } else {
+        truncate_tool_payload(outcome.user_message.trim_end(), out_lines, out_chars)
+    };
+    // 允许工具通过 `[[AITERMUX_MODEL_NOTE]]...` 向模型注入“低歧义提示”（不在 UI 中展示）。
+    // 为避免模型误学内部前缀，这里把它规范成 meta 的 `note:` 行。
+    const MODEL_NOTE_PREFIX: &str = "[[AITERMUX_MODEL_NOTE]]";
+    let mut log_lines_for_model: Vec<String> = Vec::new();
+    for line in &outcome.log_lines {
+        let t = line.trim_end();
+        if t.trim_start().starts_with(MODEL_NOTE_PREFIX) {
+            let rest = t.trim_start().trim_start_matches(MODEL_NOTE_PREFIX).trim();
+            if !rest.is_empty() {
+                log_lines_for_model.push(format!("note:{rest}"));
+            }
+            continue;
+        }
+        if !t.is_empty() {
+            log_lines_for_model.push(t.to_string());
+        }
+    }
+    let mut msg = String::new();
+    msg.push_str(output.trim_end());
+    if !log_lines_for_model.is_empty() {
+        let meta_join = log_lines_for_model.join("\n");
+        let meta = truncate_tool_payload(
+            meta_join.trim_end(),
+            TOOL_META_RAW_MAX_LINES,
+            TOOL_META_RAW_MAX_CHARS,
+        );
+        if !msg.trim_end().is_empty() {
+            msg.push_str("\n\n");
+        }
+        msg.push_str("meta:\n");
+        msg.push_str(meta.trim_end());
+    }
+    msg.trim_end().to_string()
 }
 
 fn extract_delta_from_log(lines: &[String]) -> Option<(usize, usize, Option<&'static str>)> {
@@ -1768,37 +2242,8 @@ fn tool_usage(tool: &str) -> &'static str {
         "termux_api" => {
             r#"{"tool":"termux_api","input":"termux-battery-status","brief":"读取电池状态"}"#
         }
-        "plan" | "work" => {
-            r#"{"tool":"plan","section":"start","input":"修复 PTY 键位冲突","time":"~5min","content":"1) 复现问题\n2) 修改映射\n3) 跑测试验证","brief":"开始工作"}"#
-        }
-        "list_dir" => r#"{"tool":"list_dir","path":".","brief":"列出目录"}"#,
-        "stat_file" => r#"{"tool":"stat_file","path":"Cargo.toml","brief":"查看文件信息"}"#,
-        "read_file" => {
-            r#"{"tool":"read_file","path":"src/core.rs","head":true,"max_lines":200,"brief":"读取文件开头"}"#
-        }
-        "write_file" => {
-            r#"{"tool":"write_file","path":"notes/demo.txt","content":"hello","overwrite":false,"brief":"写入文件（默认不覆盖非空文件）"}"#
-        }
-        "search" => {
-            r#"{"tool":"search","pattern":"TODO","root":"src","memory":false,"brief":"搜索内容（可选 file:true 搜文件名；memory:true 搜记忆）"}"#
-        }
-        "edit_file" => {
-            r#"{"tool":"edit_file","path":"src/core.rs","find":"old","replace":"new","count":1,"brief":"替换片段"}"#
-        }
         "apply_patch" => {
-            r#"{"tool":"apply_patch","patch":"--- a/src/core.rs\n+++ b/src/core.rs\n@@\n- old\n+ new\n","strict":false,"brief":"应用补丁"}"#
-        }
-        "memory_check" => {
-            r#"{"tool":"memory_check","pattern":"上次的工作","brief":"回忆最近的工作记录"}"#
-        }
-        "memory_read" => {
-            r#"{"tool":"memory_read","path":"datememo","date_start":"2026-02-13","brief":"读取指定日期的日记（sqlite）"}"#
-        }
-        "memory_edit" => {
-            r#"{"tool":"memory_edit","path":"fastmemo","find":"旧条目","replace":"新条目","count":1,"brief":"修正条目"}"#
-        }
-        "memory_add" => {
-            r#"{"tool":"memory_add","path":"fastmemo","section":"事件感知","content":"新增一条","brief":"追加 fastmemo 条目"}"#
+            r#"{"tool":"apply_patch","brief":"用 unified diff 修改文件","input":"--- a/src/main.rs\n+++ b/src/main.rs\n@@\n-old\n+new\n"}"#
         }
         "mind_msg" => {
             r#"{"tool":"mind_msg","target":"dog","content":"需要你协助检查工具结果。","brief":"同步需求"}"#
@@ -1807,14 +2252,16 @@ fn tool_usage(tool: &str) -> &'static str {
             r#"{"tool":"system_config","heartbeat_minutes":10,"brief":"调整心跳间隔"}"#
         }
         "skills_mcp" => r#"{"tool":"skills_mcp","category":"编程类","brief":"获取编程类工具说明"}"#,
-        "file_manager" => {
-            r#"{"tool":"file_manager","op":"copy","src":"a.txt","dst":"backup/a.txt","force":false,"recursive":false,"brief":"Manage·Copy"}"#
+        "list" => r#"{"tool":"list","op":"dir","cwd":".","depth":1,"brief":"列目录"}
+{"tool":"list","op":"files","cwd":".","name":["main.rs"],"brief":"查看文件信息"}"#,
+        "pty" => {
+            r#"{"tool":"pty","op":"run","commands":["long_task.sh","tail -f log.txt"],"brief":"后台终端任务（默认保持会话）"}"#
         }
         _ => r#"{"tool":"<tool>","input":"...","brief":"一句话说明"}"#,
     }
 }
 
-fn tool_format_error(tool: &str, reason: &str) -> ToolOutcome {
+pub(crate) fn tool_format_error(tool: &str, reason: &str) -> ToolOutcome {
     let usage = tool_usage(tool);
     ToolOutcome {
         // 只把“简短原因”展示给用户；具体用法放进 meta 供模型自愈，避免 UI 被大段 JSON 占满。
@@ -1846,8 +2293,8 @@ fn ensure_outcome_status(outcome: &mut ToolOutcome) {
 
 fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
     let tool = call.tool.as_str();
-    // 大多数工具必须提供 brief（审计/可视化用途）；但纯 UI 的 plan/work 允许省略。
-    if !matches!(tool, "plan" | "work") && call.brief.as_deref().unwrap_or("").trim().is_empty() {
+    // 大多数工具必须提供 brief（审计/可视化用途）。
+    if call.brief.as_deref().unwrap_or("").trim().is_empty() {
         return Err(tool_format_error(tool, "缺少 brief"));
     }
     match tool {
@@ -1856,57 +2303,30 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
                 return Err(tool_format_error(tool, "缺少 input"));
             }
         }
-        "work" | "plan" => {
-            // 纯 UI 工具：允许空 input，但至少要有一些内容能渲染。
-            let input = call.input.trim();
-            let content = call.content.as_deref().unwrap_or("").trim();
-            let time = call.time.as_deref().unwrap_or("").trim();
-            if input.is_empty() && content.is_empty() && time.is_empty() {
+        "apply_patch" => {
+            let patch_text = call
+                .patch
+                .as_deref()
+                .unwrap_or(call.content.as_deref().unwrap_or(call.input.as_str()))
+                .trim();
+            if patch_text.is_empty() {
+                return Err(tool_format_error(tool, "缺少 input（unified diff 文本）"));
+            }
+            if patch_text.contains("*** Begin Patch")
+                || patch_text.contains("*** Update File:")
+                || patch_text.contains("*** Add File:")
+                || patch_text.contains("*** Delete File:")
+            {
                 return Err(tool_format_error(
                     tool,
-                    "缺少 input/content/time（至少提供其一）",
+                    "仅支持 unified diff（含 ---/+++ 与 @@），不要使用 *** Begin Patch 格式",
                 ));
-            }
-        }
-        "list_dir" | "stat_file" | "read_file" => {
-            let path = call.path.as_deref().unwrap_or(call.input.trim()).trim();
-            if path.is_empty() {
-                return Err(tool_format_error(tool, "缺少 path"));
-            }
-        }
-        "write_file" => {
-            if call.path.as_deref().unwrap_or("").trim().is_empty() {
-                return Err(tool_format_error(tool, "缺少 path"));
-            }
-            let content = call.content.as_deref().unwrap_or(call.input.trim());
-            if content.is_empty() {
-                return Err(tool_format_error(tool, "缺少 content"));
             }
         }
         "search" => {
             let pattern = call.pattern.as_deref().unwrap_or(call.input.trim()).trim();
             if pattern.is_empty() {
                 return Err(tool_format_error(tool, "缺少 pattern"));
-            }
-        }
-        "edit_file" => {
-            let path = call.path.as_deref().unwrap_or(call.input.trim()).trim();
-            if path.is_empty() {
-                return Err(tool_format_error(tool, "缺少 path"));
-            }
-            if call.find.as_deref().unwrap_or("").trim().is_empty() {
-                return Err(tool_format_error(tool, "缺少 find"));
-            }
-        }
-        "apply_patch" => {
-            let patch = call
-                .patch
-                .as_deref()
-                .or(call.content.as_deref())
-                .unwrap_or(call.input.trim())
-                .trim();
-            if patch.is_empty() {
-                return Err(tool_format_error(tool, "缺少 patch"));
             }
         }
         "mind_msg" => {
@@ -1984,13 +2404,20 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
             match op.as_str() {
                 "list" => {}
                 "kill" => {
-                    let has_single = call.job_id.is_some();
+                    let has_single = call.job_id.is_some() || call.pid.is_some();
                     let has_batch = call
                         .job_ids
                         .as_ref()
                         .is_some_and(|v| v.iter().any(|id| *id > 0));
-                    if !has_single && !has_batch {
-                        return Err(tool_format_error(tool, "pty.kill 缺少 job_id/job_ids"));
+                    let has_batch_pid = call
+                        .pids
+                        .as_ref()
+                        .is_some_and(|v| v.iter().any(|id| *id > 0));
+                    if !has_single && !has_batch && !has_batch_pid {
+                        return Err(tool_format_error(
+                            tool,
+                            "pty.kill 缺少 pid/pids（或 job_id/job_ids）",
+                        ));
                     }
                 }
                 "run" => {
@@ -2004,60 +2431,41 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
                 }
             }
         }
-        "file_manager" => {
-            let op = call.op.as_deref().unwrap_or("").trim();
+        "list" => {
+            // list 不支持 paths（避免多路径心智负担）；path 为空时默认 "."（执行阶段兜底）。
+            if call
+                .paths
+                .as_ref()
+                .is_some_and(|v| v.iter().any(|p| !p.trim().is_empty()))
+            {
+                return Err(tool_format_error(tool, "list 不支持 paths，请用 cwd 指定目录"));
+            }
+            let op = call.op.as_deref().unwrap_or("").trim().to_ascii_lowercase();
             if op.is_empty() {
                 return Err(tool_format_error(tool, "缺少 op"));
             }
-            match op {
-                "list" | "stat" => {
-                    // path 可以为空：默认 "."；执行阶段兜底即可。
-                }
-                "search" => {
-                    let pattern = call.pattern.as_deref().unwrap_or(call.input.trim()).trim();
-                    if pattern.is_empty() {
-                        return Err(tool_format_error(tool, "search 缺少 pattern"));
-                    }
-                }
-                "copy" | "move" => {
-                    let src = call.src.as_deref().unwrap_or("").trim();
-                    let dst = call.dst.as_deref().unwrap_or("").trim();
-                    if src.is_empty() {
-                        return Err(tool_format_error(tool, "缺少 src"));
-                    }
-                    if dst.is_empty() {
-                        return Err(tool_format_error(tool, "缺少 dst"));
-                    }
-                }
-                "trash" => {
-                    let path = call
-                        .path
-                        .as_deref()
-                        .or(call.src.as_deref())
-                        .unwrap_or(call.input.trim())
-                        .trim();
-                    if path.is_empty() {
-                        return Err(tool_format_error(tool, "缺少 path/src"));
-                    }
-                }
-                "restore" => {
-                    let id = call.trash_id.as_deref().unwrap_or("").trim();
-                    if id.is_empty() {
-                        return Err(tool_format_error(tool, "缺少 trash_id"));
-                    }
-                }
-                _ => {
-                    return Err(tool_format_error(
-                        tool,
-                        "op 仅支持 list/stat/search/copy/move/trash/restore",
-                    ));
-                }
+            if !op.is_empty() && op != "dir" && op != "files" {
+                return Err(tool_format_error(tool, "list.op 仅支持 dir/files"));
+            }
+            // 收敛协议：list 只基于 cwd 工作；不要使用 path/input 指向其它目录。
+            if call.path.as_deref().unwrap_or("").trim().len() > 0 || !call.input.trim().is_empty() {
+                return Err(tool_format_error(tool, "list 不支持 path/input；请用 cwd 指定目录"));
+            }
+            let has_names = call
+                .names
+                .as_ref()
+                .is_some_and(|v| v.iter().any(|s| !s.trim().is_empty()));
+            if op == "files" && !has_names {
+                return Err(tool_format_error(tool, "list.op=files 需要 name"));
+            }
+            if op == "dir" && has_names {
+                return Err(tool_format_error(tool, "list.op=dir 不支持 name"));
             }
         }
         _ => {
             return Err(tool_format_error(
                 tool,
-                "未知工具（可用：bash/adb/termux_api/pty/plan/list_dir/stat_file/read_file/write_file/search/edit_file/apply_patch/file_manager/memory_check/memory_read/memory_edit/memory_add/system_config/skills_mcp）",
+                "未知工具（可用：bash/adb/termux_api/apply_patch/search/pty/list/memory_check/memory_read/memory_edit/memory_add/system_config/skills_mcp）",
             ));
         }
     }
@@ -2165,19 +2573,13 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         "bash" => run_bash(call),
         "adb" => run_adb(call),
         "termux_api" => run_termux_api(call),
+        "apply_patch" => run_apply_patch(call),
+        "search" => run_search(call),
         "pty" => Ok(ToolOutcome {
             user_message: "pty 工具由 TUI 主线程处理（不在此处执行）。".to_string(),
             log_lines: vec!["状态:fail".to_string()],
         }),
-        "work" | "plan" => run_work(call),
-        "read_file" => run_read_file(call),
-        "write_file" => run_write_file(call),
-        "list_dir" => run_list_dir(call),
-        "stat_file" => run_stat_file(call),
-        "search" => run_search(call),
-        "edit_file" => run_edit_file(call),
-        "apply_patch" => run_apply_patch(call),
-        "file_manager" => run_file_manager(call),
+        "list" => run_list_tool(call),
         "memory_check" => run_memory_check(call),
         "memory_read" => run_memory_read(call),
         "memory_edit" => run_memory_edit(call),
@@ -2204,16 +2606,7 @@ fn outcome_is_timeout(outcome: &ToolOutcome) -> bool {
 
 pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutcome {
     fn timeout_retry_safe(tool: &str) -> bool {
-        matches!(
-            tool,
-            "read_file"
-                | "list_dir"
-                | "stat_file"
-                | "search"
-                | "memory_check"
-                | "memory_read"
-                | "skills_mcp"
-        )
+        matches!(tool, "memory_check" | "memory_read" | "skills_mcp")
     }
     let mut last = None;
     for _ in 0..retries.max(1) {
@@ -2224,7 +2617,8 @@ pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutco
                 if outcome_is_timeout(&outcome) {
                     last = Some(outcome);
                     // 超时不一定是“错误”，更不应对有副作用的工具进行自动重试。
-                    if !timeout_retry_safe(call.tool.as_str()) {
+                    let safe = timeout_retry_safe(call.tool.as_str());
+                    if !safe {
                         break;
                     }
                     continue;
@@ -2328,9 +2722,75 @@ fn is_timeout_status(code: i32) -> bool {
 fn current_dir_display() -> String {
     std::env::current_dir()
         .ok()
-        .and_then(|p| p.to_str().map(short_display_path))
+        .and_then(|p| p.to_str().map(short_cwd_display))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(unknown)".to_owned())
+}
+
+pub(crate) fn default_workdir() -> String {
+    // 工具默认在 AItermux 工程目录执行，避免用户从其它目录启动时“相对路径”失效。
+    //
+    // 优先级：
+    // 1) AITERMUX_WORKDIR（允许用户显式覆盖）
+    // 2) $HOME/AItermux/system（若存在）
+    // 3) 当前进程 cwd
+    if let Ok(v) = std::env::var("AITERMUX_WORKDIR") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return expand_cwd_alias(t);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home.trim_end_matches('/').to_string();
+    if !home.is_empty() {
+        let p = format!("{home}/AItermux/system");
+        if std::fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
+            return p;
+        }
+    }
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn expand_cwd_alias(raw: &str) -> String {
+    // cwd 支持最少必要的别名，避免模型混淆：
+    // - . / ./... : 工程根目录 ~/AItermux
+    // - ~ / ~/... : 工程根目录 ~/AItermux
+    // - home / home/... : 工程根目录 ~/AItermux
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home.trim_end_matches('/').to_string();
+    if home.is_empty() {
+        return s.to_string();
+    }
+    let project = format!("{home}/AItermux");
+    if s == "." {
+        return project;
+    }
+    if let Some(rest) = s.strip_prefix("./") {
+        if rest.is_empty() {
+            return project;
+        }
+        return format!("{project}/{rest}");
+    }
+    if s == "~" {
+        return project;
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return format!("{project}/{rest}");
+    }
+    if s == "home" {
+        return project;
+    }
+    if let Some(rest) = s.strip_prefix("home/") {
+        return format!("{project}/{rest}");
+    }
+    s.to_string()
 }
 
 fn status_label(code: i32, timed_out: bool) -> String {
@@ -2366,7 +2826,7 @@ fn exit_is_ok(code: i32, ok_exit_codes: Option<&[i32]>) -> bool {
     ok_exit_codes.unwrap_or(&[]).iter().any(|x| *x == code)
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut idx = 0usize;
@@ -2428,10 +2888,13 @@ fn run_bash(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .env("TERM_PROGRAM", "AItermux")
         .current_dir({
             if let Some(cwd) = call.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                cwd_display = short_display_path(cwd);
+                let cwd = expand_cwd_alias(cwd);
+                cwd_display = short_cwd_display(&cwd);
                 PathBuf::from(cwd)
             } else {
-                PathBuf::from(".")
+                let cwd = default_workdir();
+                cwd_display = short_cwd_display(&cwd);
+                PathBuf::from(cwd)
             }
         })
         .output()
@@ -2449,7 +2912,12 @@ fn run_bash(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     ))
 }
 
-fn try_write_shell_cache_impl(dir: &str, path: &str, stdout: &[u8], stderr: &[u8]) -> bool {
+pub(crate) fn try_write_shell_cache_impl(
+    dir: &str,
+    path: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> bool {
     let _ = fs::create_dir_all(dir);
     let mut file = match fs::OpenOptions::new()
         .create(true)
@@ -2503,7 +2971,7 @@ fn build_shell_outcome_bash(
     let truncated_by_lines = combined_lines > OUTPUT_MAX_LINES;
     let truncated_by_chars = combined.chars().count() > OUTPUT_MAX_CHARS;
     let mut need_save =
-        total_bytes > SHELL_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+        total_bytes > EXPORT_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
     match save_mode {
         ShellSaveMode::Always => need_save = true,
         ShellSaveMode::Never => need_save = false,
@@ -2531,7 +2999,6 @@ fn build_shell_outcome_bash(
             out.push_str("\n\n");
             out.push_str(preview.trim_end());
         }
-        out.push_str(&format!("\n\n[saved:{}]", meta.path));
         out
     } else {
         truncate_command_output(combined)
@@ -2543,7 +3010,7 @@ fn build_shell_outcome_bash(
         let cmd_trim = cmd.trim();
         let looks_like_job_kill = cmd_trim.starts_with("kill %") || cmd_trim.contains(" kill %");
         if looks_like_job_kill && stderr.to_ascii_lowercase().contains("no such job") {
-            body.push_str("\n\n提示：bash 工具每次在独立的非交互 shell 中执行，`kill %1` 这类 job control 不生效。\n如需终止正在运行的 Terminal（PTY），请在 Terminal 视图 350ms 内快速连按两次 Esc（结束）。");
+            body.push_str("\n\n提示：bash 工具每次在独立的非交互 shell 中执行，`kill %1` 这类 job control 不生效。\n如需终止正在运行的 Terminal（PTY），请用 `pty.kill(job_id)`。");
         }
     }
     let mut status = if timed_out {
@@ -2569,16 +3036,18 @@ fn build_shell_outcome_bash(
             status = "ok_not_found".to_string();
         }
     }
-    let mut log_lines = vec![format!(
-        "状态:{status} | exit:{code} | 耗时:{}ms | cwd:{cwd_display} | cmd_len:{}",
+    let ok = if timed_out {
+        "timeout"
+    } else if exit_is_ok(code, ok_exit_codes) {
+        "true"
+    } else {
+        "false"
+    };
+    let log_lines = vec![format!(
+        "状态:{status} | ok:{ok} | exit:{code} | elapsed_ms:{} | cwd:{cwd_display} | cmd_chars:{}",
         elapsed.as_millis(),
         cmd.chars().count()
     )];
-    if let Some(meta) = saved_meta.as_ref() {
-        log_lines.push(format!("saved:{}", meta.path));
-        log_lines.push(format!("saved_bytes:{}", meta.bytes));
-        log_lines.push(format!("saved_lines:{}", meta.lines));
-    }
     ToolOutcome {
         user_message: if body.is_empty() {
             "(no output)".to_string()
@@ -2610,7 +3079,7 @@ fn build_shell_outcome_adb(
     let truncated_by_lines = combined_lines > OUTPUT_MAX_LINES;
     let truncated_by_chars = combined.chars().count() > OUTPUT_MAX_CHARS;
     let mut need_save =
-        total_bytes > ADB_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+        total_bytes > EXPORT_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
     match save_mode {
         ShellSaveMode::Always => need_save = true,
         ShellSaveMode::Never => need_save = false,
@@ -2638,7 +3107,6 @@ fn build_shell_outcome_adb(
             out.push_str("\n\n");
             out.push_str(preview.trim_end());
         }
-        out.push_str(&format!("\n\n[saved:{}]", meta.path));
         out
     } else {
         truncate_command_output(combined)
@@ -2652,16 +3120,18 @@ fn build_shell_outcome_adb(
     } else {
         code.to_string()
     };
-    let mut log_lines = vec![format!(
-        "状态:{status} | exit:{code} | 耗时:{}ms | cwd:{cwd_display} | cmd_len:{}",
+    let ok = if timed_out {
+        "timeout"
+    } else if exit_is_ok(code, ok_exit_codes) {
+        "true"
+    } else {
+        "false"
+    };
+    let log_lines = vec![format!(
+        "状态:{status} | ok:{ok} | exit:{code} | elapsed_ms:{} | cwd:{cwd_display} | cmd_chars:{}",
         elapsed.as_millis(),
         cmd.chars().count()
     )];
-    if let Some(meta) = saved_meta.as_ref() {
-        log_lines.push(format!("saved:{}", meta.path));
-        log_lines.push(format!("saved_bytes:{}", meta.bytes));
-        log_lines.push(format!("saved_lines:{}", meta.lines));
-    }
     ToolOutcome {
         user_message: if body.is_empty() {
             "(no output)".to_string()
@@ -2751,7 +3221,7 @@ fn run_adb(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
                     "自动连接失败，无法连接 ADB 设备 {ADB_SERIAL}。\n可手动建立连接：\n1) su -c 'setprop service.adb.tcp.port 5555; setprop persist.adb.tcp.port 5555; setprop ctl.restart adbd'\n2) adb connect {ADB_SERIAL}\n完成后重试。"
                 ),
                 log_lines: vec![format!(
-                    "状态:adb_offline | 耗时:{}ms | cwd:{cwd_display}",
+                    "ok:false | result:adb_offline | exit:0 | elapsed_ms:{} | 状态:adb_offline | cwd:{cwd_display}",
                     started.elapsed().as_millis()
                 )],
             });
@@ -2772,10 +3242,13 @@ fn run_adb(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .env("TERM_PROGRAM", "AItermux")
         .current_dir({
             if let Some(cwd) = call.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                cwd_display = short_display_path(cwd);
+                let cwd = expand_cwd_alias(cwd);
+                cwd_display = short_cwd_display(&cwd);
                 PathBuf::from(cwd)
             } else {
-                PathBuf::from(".")
+                let cwd = default_workdir();
+                cwd_display = short_cwd_display(&cwd);
+                PathBuf::from(cwd)
             }
         });
     let out = command
@@ -2825,7 +3298,7 @@ fn build_shell_outcome_termux_api(
     let truncated_by_lines = combined_lines > OUTPUT_MAX_LINES;
     let truncated_by_chars = combined.chars().count() > OUTPUT_MAX_CHARS;
     let mut need_save =
-        total_bytes > TERMUX_API_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+        total_bytes > EXPORT_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
     match save_mode {
         ShellSaveMode::Always => need_save = true,
         ShellSaveMode::Never => need_save = false,
@@ -2853,7 +3326,6 @@ fn build_shell_outcome_termux_api(
             out.push_str("\n\n");
             out.push_str(preview.trim_end());
         }
-        out.push_str(&format!("\n\n[saved:{}]", meta.path));
         out
     } else {
         truncate_command_output(combined)
@@ -2867,17 +3339,11 @@ fn build_shell_outcome_termux_api(
     } else {
         code.to_string()
     };
-    let mut log_lines = vec![format!(
+    let log_lines = vec![format!(
         "状态:{status} | exit:{code} | 耗时:{}ms | cwd:{cwd_display} | cmd_len:{}",
         elapsed.as_millis(),
         cmd.chars().count()
     )];
-    if let Some(meta) = saved_meta.as_ref() {
-        log_lines.push(format!("saved:{}", meta.path));
-        log_lines.push(format!("saved_bytes:{}", meta.bytes));
-        log_lines.push(format!("saved_lines:{}", meta.lines));
-    }
-
     ToolOutcome {
         user_message: if body.is_empty() {
             "(no output)".to_string()
@@ -2889,15 +3355,15 @@ fn build_shell_outcome_termux_api(
 }
 
 fn run_termux_api(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    let mut cwd_display = current_dir_display();
     let input = call.input.trim();
     if let Err(e) = validate_termux_api(input) {
         return Ok(ToolOutcome {
             user_message: e.to_string(),
-            log_lines: vec![format!(
-                "termux_api rejected -> {}",
-                build_preview(input, 160)
-            )],
+            log_lines: vec![
+                "ok:false | result:termux_api_rejected | exit:0 | elapsed_ms:0 | 状态:fail"
+                    .to_string(),
+                format!("termux_api rejected -> {}", build_preview(input, 160)),
+            ],
         });
     }
 
@@ -2909,20 +3375,23 @@ fn run_termux_api(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let timeout_hint = timeout_secs;
     let (mut command, timeout_used) =
         build_command_with_optional_timeout(BASH_SHELL, &["-lc", input], timeout_secs);
+    let (cwd_exec, cwd_display) =
+        if let Some(cwd) = call.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let cwd = expand_cwd_alias(cwd);
+            let disp = short_cwd_display(&cwd);
+            (PathBuf::from(cwd), disp)
+        } else {
+            let cwd = default_workdir();
+            let disp = short_cwd_display(&cwd);
+            (PathBuf::from(cwd), disp)
+        };
     command
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .env("LANG", "C.UTF-8")
         .env("LC_ALL", "C.UTF-8")
         .env("TERM_PROGRAM", "AItermux")
-        .current_dir({
-            if let Some(cwd) = call.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                cwd_display = short_display_path(cwd);
-                PathBuf::from(cwd)
-            } else {
-                PathBuf::from(".")
-            }
-        });
+        .current_dir(cwd_exec);
     let out = command
         .output()
         .with_context(|| format!("termux_api 执行失败：{input}"))?;
@@ -2937,122 +3406,6 @@ fn run_termux_api(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         parse_shell_save_mode(call.save.as_deref()),
         call.ok_exit_codes.as_deref(),
     ))
-}
-
-fn run_work(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    // 这是一个“纯 UI 工具”：用于在聊天区显示“开始工作/工作结束”的目标与汇报区块。
-    // 不执行任何命令、无副作用。
-    const MODEL_NOTE_PREFIX: &str = "[[AITERMUX_MODEL_NOTE]]";
-    let started = Instant::now();
-    let phase_raw = call
-        .section
-        .as_deref()
-        .unwrap_or("start")
-        .trim()
-        .to_ascii_lowercase();
-    let phase = if matches!(
-        phase_raw.as_str(),
-        "end" | "done" | "finish" | "stop" | "report"
-    ) {
-        "end"
-    } else {
-        "start"
-    };
-
-    let input = call.input.trim();
-    let content = call.content.as_deref().unwrap_or("").trim();
-    let time = call.time.as_deref().unwrap_or("").trim();
-
-    let mut body = String::new();
-    let has_structured = {
-        let lower = content.to_ascii_lowercase();
-        lower.contains("target:") || lower.contains("steps:") || lower.contains("time:")
-    };
-
-    if has_structured && !content.is_empty() {
-        body.push_str(content);
-    } else if phase == "start" {
-        let target = if !input.is_empty() {
-            input
-        } else if !content.is_empty() {
-            content
-        } else {
-            call.brief.as_deref().unwrap_or("").trim()
-        };
-        if !target.is_empty() {
-            body.push_str(&format!("Target: {target}\n"));
-        }
-        if !content.is_empty() && content != target {
-            body.push_str("Steps:\n");
-            for (idx, line) in content.lines().enumerate() {
-                let t = line.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                body.push_str(&format!("  {}. {}\n", idx.saturating_add(1), t));
-            }
-        }
-        if !time.is_empty() {
-            body.push_str(&format!("Time: {time}\n"));
-        }
-    } else {
-        // end/report
-        if !input.is_empty() {
-            body.push_str(input);
-            body.push('\n');
-        }
-        if !content.is_empty() {
-            body.push_str(content);
-            body.push('\n');
-        }
-        if !time.is_empty() {
-            body.push_str(&format!("Time: {time}\n"));
-        }
-    }
-
-    let body = body.trim_end().to_string();
-    let mut log_lines = vec![format!(
-        "状态:0 | 耗时:{}ms | phase:{}",
-        started.elapsed().as_millis(),
-        phase
-    )];
-    if matches!(call.tool.as_str(), "plan" | "work") {
-        // 给模型看的“低歧义指令”：避免反复 plan/work 循环。
-        let note = if phase == "start" {
-            "plan 已生成（start）。下一步：按 Steps 执行；每轮只调用 1 个实际工具（bash/pty/...）；不要重复 plan/work。完成后再用 plan(section=end) 汇报。"
-        } else {
-            "plan 汇报已记录（end）。若无进一步任务：停止调用工具，等待用户下一条消息。"
-        };
-        log_lines.push(format!("{MODEL_NOTE_PREFIX}{note}"));
-    }
-    Ok(ToolOutcome {
-        user_message: if body.is_empty() {
-            "(empty)".to_string()
-        } else {
-            body
-        },
-        log_lines,
-    })
-}
-
-fn count_text_lines(text: &str) -> usize {
-    text.lines().count()
-}
-
-fn count_file_lines(path: &str) -> Option<usize> {
-    let file = fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut buf: Vec<u8> = Vec::new();
-    let mut count = 0usize;
-    loop {
-        buf.clear();
-        let n = reader.read_until(b'\n', &mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        count = count.saturating_add(1);
-    }
-    Some(count)
 }
 
 fn find_files_by_name_with_timeout(
@@ -3169,663 +3522,389 @@ fn find_files_by_name_with_timeout(
     )
 }
 
-fn run_read_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    if call.memory.unwrap_or(false) {
-        return run_read_memory_like("read_file", call);
-    }
-    #[derive(Clone, Copy)]
-    enum ReadMode {
-        Peek,
-        Range,
-        Full,
-    }
 
-    fn estimate_tokens_for_text(text: &str) -> usize {
-        let mut ascii = 0usize;
-        let mut non_ascii = 0usize;
-        for ch in text.chars() {
-            if ch.is_ascii() {
-                ascii = ascii.saturating_add(1);
-            } else {
-                non_ascii = non_ascii.saturating_add(1);
-            }
-        }
-        non_ascii.saturating_add(ascii.saturating_add(3) / 4)
-    }
+// -----------------------------
+// list (filesystem base)
+// -----------------------------
 
-    fn trim_line_for_read(raw: &str) -> (String, bool) {
-        let clean = sanitize_search_line(raw.trim_end_matches(['\n', '\r']));
-        let chars = clean.chars().count();
-        if chars <= READ_MAX_LINE_CHARS {
-            return (clean, false);
-        }
-        let mut out: String = clean.chars().take(READ_MAX_LINE_CHARS).collect();
-        out.push_str(" …");
-        (out, true)
-    }
+const LIST_MAX_DEPTH_CAP: usize = 3;
+const LIST_MAX_DEPTH_DEFAULT: usize = 1;
+const LIST_STAT_SCAN_MAX_BYTES: u64 = 2_000_000;
+// list：目录条目默认上限（不可配置）
+const LIST_DIR_ENTRY_CAP: usize = 300;
+// list：当目录条目超过上限时，回显给模型的“条目预览”数量（中间截断）
+const LIST_DIR_EXPORT_PREVIEW_ENTRIES: usize = 160;
+const FS_CACHE_DIR: &str = "log/fs-cache";
 
-    fn count_file_lines_limited(path: &str, max_bytes: usize) -> (usize, bool) {
-        let Ok(file) = fs::File::open(path) else {
-            return (0, false);
-        };
-        let mut reader = std::io::BufReader::new(file);
-        let mut buf: Vec<u8> = Vec::new();
-        let mut bytes = 0usize;
-        let mut lines = 0usize;
-        loop {
-            buf.clear();
-            let Ok(n) = reader.read_until(b'\n', &mut buf) else {
-                return (lines, false);
-            };
-            if n == 0 {
-                return (lines, true);
-            }
-            bytes = bytes.saturating_add(n);
-            lines = lines.saturating_add(1);
-            if bytes >= max_bytes {
-                return (lines, false);
-            }
-        }
-    }
-
-    fn read_head_lines(
-        path: &str,
-        max_lines: usize,
-    ) -> anyhow::Result<(Vec<(usize, String)>, bool)> {
-        let file = fs::File::open(path).with_context(|| format!("读取文件失败：{path}"))?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut buf: Vec<u8> = Vec::new();
-        let mut out: Vec<(usize, String)> = Vec::new();
-        let mut truncated = false;
-        let mut line_no = 0usize;
-        while out.len() < max_lines {
-            buf.clear();
-            let n = reader
-                .read_until(b'\n', &mut buf)
-                .context("读取文件内容失败")?;
-            if n == 0 {
-                break;
-            }
-            line_no = line_no.saturating_add(1);
-            let line = String::from_utf8_lossy(&buf);
-            let (t, was_trunc) = trim_line_for_read(&line);
-            if was_trunc {
-                truncated = true;
-            }
-            out.push((line_no, t));
-        }
-        Ok((out, truncated))
-    }
-
-    fn read_tail_lines(
-        path: &str,
-        total_bytes: usize,
-        tail_lines: usize,
-    ) -> anyhow::Result<(Vec<String>, bool, bool)> {
-        let mut file = fs::File::open(path).with_context(|| format!("读取文件失败：{path}"))?;
-        let mut truncated_by_bytes = false;
-        if total_bytes > READ_MAX_BYTES {
-            truncated_by_bytes = true;
-            let offset = total_bytes.saturating_sub(READ_MAX_BYTES) as u64;
-            file.seek(std::io::SeekFrom::Start(offset))
-                .context("尾部读取 seek 失败")?;
-        }
-        let mut buf: Vec<u8> = Vec::new();
-        std::io::Read::take(&mut file, READ_MAX_BYTES as u64)
-            .read_to_end(&mut buf)
-            .context("读取文件内容失败")?;
-        let text = String::from_utf8_lossy(&buf);
-        let mut lines: Vec<&str> = text.lines().collect();
-        if lines.len() > tail_lines {
-            lines = lines[lines.len().saturating_sub(tail_lines)..].to_vec();
-        }
-        let mut out: Vec<String> = Vec::new();
-        let mut truncated_line = false;
-        for line in lines {
-            let (t, was_trunc) = trim_line_for_read(line);
-            if was_trunc {
-                truncated_line = true;
-            }
-            out.push(t);
-        }
-        Ok((out, truncated_by_bytes, truncated_line))
-    }
-
-    let path = pick_path(call)?;
-    let started = Instant::now();
-    let head_mode = call.head.unwrap_or(false) && !call.tail.unwrap_or(false);
-    let tail_mode = call.tail.unwrap_or(false);
-    let full_requested = call.full.unwrap_or(false);
-    let range_requested =
-        head_mode || tail_mode || call.start_line.is_some() || call.max_lines.is_some();
-
-    let meta0 = fs::metadata(&path).with_context(|| format!("读取文件失败：{path}"))?;
-    let total_bytes = meta0.len() as usize;
-    let modified = meta0.modified().ok();
-    let modified_ms = modified
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64);
-    let is_binary = is_probably_binary_file(Path::new(&path));
-
-    let mut mode = if range_requested {
-        ReadMode::Range
-    } else if full_requested {
-        ReadMode::Full
+fn fs_tool_base_dir(call: &ToolCall) -> PathBuf {
+    let base = if let Some(cwd) = call.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        expand_cwd_alias(cwd)
     } else {
-        ReadMode::Peek
+        default_workdir()
     };
-
-    let mut full_note: Option<String> = None;
-    if full_requested && range_requested {
-        full_note = Some("ignored: range 参数已提供（按 range 处理）".to_string());
-    }
-    if matches!(mode, ReadMode::Full) && total_bytes > READ_FULL_MAX_BYTES {
-        // full 仅允许小文件；大文件降级为 Peek（并给出更丰富 meta 信息）。
-        full_note = Some(format!(
-            "denied: full 仅允许 <= {READ_FULL_MAX_BYTES} bytes"
-        ));
-        mode = ReadMode::Peek;
-    }
-
-    let token_budget = match mode {
-        ReadMode::Peek => READ_PEEK_TOKEN_BUDGET,
-        ReadMode::Range => READ_RANGE_TOKEN_BUDGET,
-        ReadMode::Full => READ_FULL_TOKEN_BUDGET,
-    };
-
-    // 额外的“读文件信息”：最多扫 2MB 估算行数，避免对超大文件全扫卡住。
-    let (total_lines_est, total_lines_complete) = if total_bytes <= 2_000_000 {
-        count_file_lines_limited(&path, 2_000_000)
+    let p = PathBuf::from(base);
+    if p.is_absolute() {
+        p
     } else {
-        (0, false)
-    };
-
-    let mut out_lines: Vec<String> = Vec::new();
-    out_lines.push(format!("File: {}", shorten_path(&path)));
-    out_lines.push(format!("Size: {total_bytes} bytes"));
-    if let Some(ms) = modified_ms {
-        out_lines.push(format!("MTime(ms): {ms}"));
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(p)
     }
-    if total_lines_est > 0 {
-        if total_lines_complete {
-            out_lines.push(format!("Total lines: {total_lines_est}"));
-        } else {
-            out_lines.push(format!("Total lines(estimated): >= {total_lines_est}"));
-        }
-    }
-    out_lines.push(format!(
-        "Binary: {}",
-        if is_binary { "true" } else { "false" }
-    ));
-    if full_requested {
-        if let Some(note) = full_note.as_deref() {
-            out_lines.push(format!("Full requested: true ({note})"));
-        } else {
-            out_lines.push("Full requested: true".to_string());
-        }
-    }
-    out_lines.push("---".to_string());
-
-    let mut partial = false;
-    let mut partial_reason: Option<&'static str> = None;
-    let mut truncated_line = false;
-    let mut shown_start: Option<usize> = None;
-    let mut shown_end: Option<usize> = None;
-
-    if is_binary {
-        out_lines.push("(binary file: content omitted)".to_string());
-        partial = true;
-        partial_reason = Some("binary");
-    } else if matches!(mode, ReadMode::Peek) {
-        let (head, head_trunc) = read_head_lines(&path, READ_PEEK_HEAD_LINES)?;
-        let (tail, tail_trunc_bytes, tail_trunc_line) =
-            read_tail_lines(&path, total_bytes, READ_PEEK_TAIL_LINES)?;
-        truncated_line = head_trunc || tail_trunc_line;
-        let _tail_window_limited = tail_trunc_bytes;
-
-        out_lines.push(format!("(peek) head {READ_PEEK_HEAD_LINES} lines:"));
-        for (ln, text) in head {
-            out_lines.push(format!("{ln} | {text}"));
-        }
-        out_lines.push("...".to_string());
-        out_lines.push(format!("(peek) tail {READ_PEEK_TAIL_LINES} lines:"));
-        for text in tail {
-            out_lines.push(text);
-        }
-        partial = true;
-        partial_reason = Some("peek");
-    } else {
-        // Range / Full（小文件 full 也走这里）：按行流式扫描，支持 start_line/max_lines。
-        let mut start_line = if tail_mode {
-            0usize
-        } else if matches!(mode, ReadMode::Full) || head_mode {
-            1usize
-        } else {
-            call.start_line.unwrap_or(1).max(1)
-        };
-        let mut max_lines = call.max_lines.unwrap_or(200).max(1);
-        if matches!(mode, ReadMode::Full) {
-            start_line = 1;
-            max_lines = call
-                .max_lines
-                .unwrap_or(READ_FULL_MAX_LINES)
-                .max(1)
-                .min(READ_FULL_MAX_LINES);
-        } else {
-            max_lines = max_lines.min(READ_RANGE_MAX_LINES);
-        }
-
-        if tail_mode {
-            let (tail, tail_trunc_bytes, tail_trunc_line) =
-                read_tail_lines(&path, total_bytes, max_lines)?;
-            truncated_line = tail_trunc_line;
-            if tail_trunc_bytes {
-                partial = true;
-                partial_reason = Some("tail_bytes_window");
-            }
-            out_lines.push(format!(
-                "(tail) last {max_lines} lines (line numbers unknown):"
-            ));
-            for text in tail {
-                out_lines.push(text);
-            }
-        } else {
-            let file = fs::File::open(&path).with_context(|| format!("读取文件失败：{path}"))?;
-            let mut reader = std::io::BufReader::new(file);
-            let mut buf: Vec<u8> = Vec::new();
-            let mut bytes_scanned = 0usize;
-            let mut line_no = 0usize;
-            let mut collected = 0usize;
-            let width = (start_line + max_lines).to_string().len().max(3);
-            while collected < max_lines {
-                buf.clear();
-                let n = reader
-                    .read_until(b'\n', &mut buf)
-                    .context("读取文件内容失败")?;
-                if n == 0 {
-                    break;
-                }
-                bytes_scanned = bytes_scanned.saturating_add(n);
-                line_no = line_no.saturating_add(1);
-                if bytes_scanned >= READ_SCAN_MAX_BYTES && line_no < start_line {
-                    partial = true;
-                    partial_reason = Some("scan_bytes_cap");
-                    break;
-                }
-                if line_no < start_line {
-                    continue;
-                }
-                let line = String::from_utf8_lossy(&buf);
-                let (t, was_trunc) = trim_line_for_read(&line);
-                if was_trunc {
-                    truncated_line = true;
-                }
-                shown_start.get_or_insert(line_no);
-                shown_end = Some(line_no);
-                out_lines.push(format!("{:>width$} | {}", line_no, t, width = width));
-                collected = collected.saturating_add(1);
-            }
-            if line_no >= start_line && collected >= max_lines {
-                // 触发了 max_lines 上限：仅当文件确实还有更多内容时才算 partial，避免“刚好读完整文件”的误判。
-                buf.clear();
-                let more = reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0;
-                if more {
-                    partial = true;
-                    partial_reason = Some("max_lines_cap");
-                }
-            }
-        }
-    }
-
-    // 预算裁剪：token budget + char budget 双兜底（并明确 partial）。
-    let mut budget_tokens_used = 0usize;
-    let mut budget_chars_used = 0usize;
-    let mut clipped: Vec<String> = Vec::new();
-    for line in out_lines {
-        let line_chars = line.chars().count();
-        let line_tokens = estimate_tokens_for_text(&line);
-        if !clipped.is_empty() {
-            // newline cost
-            budget_chars_used = budget_chars_used.saturating_add(1);
-        }
-        if budget_tokens_used.saturating_add(line_tokens) > token_budget
-            || budget_chars_used.saturating_add(line_chars) > READ_TOOL_RAW_MAX_CHARS
-            || clipped.len().saturating_add(1) > READ_TOOL_RAW_MAX_LINES
-        {
-            partial = true;
-            partial_reason = Some("token_budget");
-            break;
-        }
-        budget_tokens_used = budget_tokens_used.saturating_add(line_tokens);
-        budget_chars_used = budget_chars_used.saturating_add(line_chars);
-        clipped.push(line);
-    }
-
-    if partial {
-        let reason = partial_reason.unwrap_or("partial");
-        clipped.push("---".to_string());
-        clipped.push(format!(
-            "[partial:true reason:{reason} | token_budget:{token_budget} | est_tokens:{budget_tokens_used}]"
-        ));
-        if let (Some(a), Some(b)) = (shown_start, shown_end) {
-            clipped.push(format!("[window: lines {a}-{b}]"));
-        }
-        if truncated_line {
-            clipped.push(format!(
-                "[note: some lines were truncated to {READ_MAX_LINE_CHARS} chars]"
-            ));
-        }
-    }
-
-    let elapsed = started.elapsed();
-    let body = clipped.join("\n").trim_end().to_string();
-    let line_count = body.lines().count();
-    let char_count = body.chars().count();
-
-    let mode_label = match mode {
-        ReadMode::Peek => "peek",
-        ReadMode::Range => "range",
-        ReadMode::Full => "full",
-    };
-    let mut meta = format!(
-        "状态:0 | 耗时:{}ms | path:{} | mode:{mode_label} | bytes:{total_bytes} | lines:{} | chars:{}",
-        elapsed.as_millis(),
-        shorten_path(&path),
-        line_count,
-        char_count
-    );
-    if total_lines_est > 0 {
-        if total_lines_complete {
-            meta.push_str(&format!(" | total_lines:{total_lines_est}"));
-        } else {
-            meta.push_str(&format!(" | total_lines:>={total_lines_est}"));
-        }
-    }
-    if partial {
-        meta.push_str(" | partial:true");
-        if let Some(r) = partial_reason {
-            meta.push_str(&format!(" | reason:{r}"));
-        }
-    }
-    if is_binary {
-        meta.push_str(" | binary:true");
-    }
-    if truncated_line {
-        meta.push_str(" | line_truncated:true");
-    }
-    meta.push_str(&format!(" | est_tokens:{budget_tokens_used}"));
-    if let Some(note) = full_note.as_deref() {
-        meta.push_str(&format!(" | full_note:{note}"));
-    }
-
-    Ok(ToolOutcome {
-        user_message: body,
-        log_lines: vec![meta],
-    })
 }
 
-fn run_write_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    let (path, content) = pick_write_fields(call)?;
-    if content.len() > WRITE_MAX_BYTES {
-        return Ok(ToolOutcome {
-            user_message: format!("安全限制：写入内容过大（>{WRITE_MAX_BYTES} bytes）。"),
-            log_lines: vec![],
-        });
+fn display_path_best_effort(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        return String::new();
     }
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
 
-    fn atomic_write_text(
-        path: &str,
-        content: &str,
-        preserve_mode: Option<u32>,
-    ) -> anyhow::Result<()> {
-        let p = Path::new(path);
-        let parent = p.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = p
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("file");
-        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let pid = unsafe { libc::getpid() };
-        let mut last_err: Option<anyhow::Error> = None;
-        for seq in 0..10usize {
-            let tmp_name = format!(".{file_name}.tmp_{ts}_{pid}_{seq}");
-            let tmp_path = parent.join(tmp_name);
-            let opened = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp_path);
-            let mut f = match opened {
-                Ok(f) => f,
-                Err(e) => {
-                    last_err = Some(anyhow!(e).context("创建临时文件失败"));
-                    continue;
-                }
-            };
-            if let Err(e) = f.write_all(content.as_bytes()) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(anyhow!(e).context("写入临时文件失败"));
-            }
-            let _ = f.flush();
-            let _ = f.sync_all();
-            drop(f);
-
-            #[cfg(unix)]
-            if let Some(mode) = preserve_mode {
-                let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode));
-            }
-
-            if let Err(e) = fs::rename(&tmp_path, p) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(anyhow!(e).context("原子替换失败（rename）"));
-            }
-
-            #[cfg(unix)]
-            if let Ok(dirf) = fs::File::open(parent) {
-                let _ = dirf.sync_all();
-            }
-            return Ok(());
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("创建临时文件失败（重试耗尽）")))
+fn abs_path_from_cwd(raw: &str) -> PathBuf {
+    let norm = normalize_tool_path(raw);
+    if norm.is_empty() {
+        return PathBuf::from("");
     }
+    let p = PathBuf::from(norm);
+    if p.is_absolute() {
+        return p;
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(p)
+}
 
-    let started = Instant::now();
-    let overwrite = call.overwrite.unwrap_or(false);
-    let old_meta = fs::metadata(&path).ok().filter(|m| m.is_file());
-    let old_bytes = old_meta.as_ref().map(|m| m.len() as usize).unwrap_or(0);
+
+fn real_display_path(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        return String::new();
+    }
+    let abs = abs_path_from_cwd(&path.to_string_lossy());
+    std::fs::canonicalize(&abs)
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn fmt_time(ts: std::io::Result<std::time::SystemTime>) -> String {
+    ts.ok()
+        .and_then(|t| {
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn fmt_mode(meta: &fs::Metadata) -> String {
     #[cfg(unix)]
-    let old_mode: Option<u32> = old_meta.as_ref().map(|m| m.permissions().mode());
-    #[cfg(not(unix))]
-    let old_mode: Option<u32> = None;
-    let old_lines = count_file_lines(&path).unwrap_or(0);
-    let old_chars = if old_bytes <= READ_MAX_BYTES {
-        fs::read_to_string(&path)
-            .ok()
-            .map(|s| s.chars().count())
-            .unwrap_or(old_bytes)
-    } else {
-        old_bytes
-    };
-    let mut backup_path: Option<String> = None;
-    if old_meta.is_some() && old_bytes > 0 && !overwrite {
-        return Ok(ToolOutcome {
-            user_message: format!(
-                "目标文件已存在且非空：{path}\n为避免误覆盖，请显式设置 overwrite:true。\n（覆盖前会自动备份旧文件到 {WRITE_BACKUP_DIR}/）"
-            ),
-            log_lines: vec![format!(
-                "状态:ok_need_confirm | path:{} | bytes:{} | overwrite:0",
-                shorten_path(&path),
-                old_bytes
-            )],
-        });
-    }
-    // 非空覆盖：自动备份旧文件到 log/backupcache
-    if old_meta.is_some() && old_bytes > 0 && overwrite {
-        let _ = fs::create_dir_all(WRITE_BACKUP_DIR);
-        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let pid = unsafe { libc::getpid() };
-        let name = Path::new(&path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file");
-        let backup = format!("{WRITE_BACKUP_DIR}/write_{ts}_{pid}_{name}.bak");
-        match fs::copy(&path, &backup) {
-            Ok(_) => backup_path = Some(backup),
-            Err(e) => {
-                return Ok(ToolOutcome {
-                    user_message: format!("备份失败，已取消写入：{path}\n原因：{e}"),
-                    log_lines: vec![format!(
-                        "状态:fail | phase:backup_failed | path:{} | bytes:{}",
-                        shorten_path(&path),
-                        old_bytes
-                    )],
-                });
-            }
-        }
-    }
-    if let Some(parent) = Path::new(&path).parent()
-        && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录失败：{}", parent.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        format!("{:04o}", meta.permissions().mode() & 0o7777)
     }
-    atomic_write_text(&path, &content, old_mode).with_context(|| format!("写入失败：{path}"))?;
-    let elapsed = started.elapsed();
-    let new_bytes = content.len();
-    let new_lines = count_text_lines(&content);
-    let new_chars = content.chars().count();
-
-    let preview = build_preview(&content, 160);
-    let mut msg = String::new();
-    msg.push_str(&format!(
-        "已写入 {path}（{new_lines} 行 / {new_chars} 字符）"
-    ));
-    if let Some(bk) = backup_path.as_deref() {
-        msg.push_str(&format!("\nbackup: {bk}"));
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        "?".to_string()
     }
-    msg.push_str(&format!("\n预览: {preview}"));
-
-    let delta = if old_lines > 1 || new_lines > 1 {
-        format!("delta_lines:+{} -{}", new_lines, old_lines)
-    } else {
-        format!("delta_chars:+{} -{}", new_chars, old_chars)
-    };
-
-    let mut log_lines = vec![format!(
-        "状态:0 | 耗时:{}ms | path:{} | bytes:{} | lines:{} | chars:{} | overwrite:{} | {delta}",
-        elapsed.as_millis(),
-        shorten_path(&path),
-        new_bytes,
-        new_lines,
-        new_chars,
-        if overwrite { 1 } else { 0 }
-    )];
-    if let Some(bk) = backup_path.as_deref() {
-        log_lines.push(format!("backup:{}", bk));
-    }
-    Ok(ToolOutcome {
-        user_message: msg,
-        log_lines,
-    })
 }
 
-fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    let path = pick_path(call)?;
+fn maybe_export_fs_text(file_prefix: &str, text: &str) -> (String, Option<ExportedOutputMeta>) {
+    let total_bytes = text.as_bytes().len();
+    let raw_lines = text.lines().count();
+    let truncated_by_lines = raw_lines > OUTPUT_MAX_LINES;
+    let truncated_by_chars = text.chars().count() > OUTPUT_MAX_CHARS;
+    let need_save =
+        total_bytes > EXPORT_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
+    if !need_save {
+        return (truncate_tool_payload(text, OUTPUT_MAX_LINES, OUTPUT_MAX_CHARS), None);
+    }
+    let _ = fs::create_dir_all(FS_CACHE_DIR);
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let pid = unsafe { libc::getpid() };
+    let path = format!("{FS_CACHE_DIR}/{file_prefix}_{ts}_{pid}.log");
+    let ok = try_write_shell_cache_impl(FS_CACHE_DIR, &path, text.as_bytes(), &[]);
+    if !ok {
+        return (truncate_tool_payload(text, OUTPUT_MAX_LINES, OUTPUT_MAX_CHARS), None);
+    }
+    let abs_saved = real_display_path(Path::new(&path));
+    let meta = exported_meta(abs_saved, total_bytes, raw_lines);
+    let preview = truncate_export_preview(text);
+    let mut out = String::new();
+    out.push_str(&format_exported_notice(&meta));
+    if !preview.trim().is_empty() {
+        out.push_str("\n\n");
+        out.push_str(preview.trim_end());
+    }
+    (out, Some(meta))
+}
+
+fn export_fs_text_always(file_prefix: &str, text: &str) -> Option<ExportedOutputMeta> {
+    let total_bytes = text.as_bytes().len();
+    let raw_lines = text.lines().count();
+    let _ = fs::create_dir_all(FS_CACHE_DIR);
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let pid = unsafe { libc::getpid() };
+    let path = format!("{FS_CACHE_DIR}/{file_prefix}_{ts}_{pid}.log");
+    let ok = try_write_shell_cache_impl(FS_CACHE_DIR, &path, text.as_bytes(), &[]);
+    if !ok {
+        return None;
+    }
+    let abs_saved = real_display_path(Path::new(&path));
+    Some(exported_meta(abs_saved, total_bytes, raw_lines))
+}
+
+fn list_preview_middle_truncate(lines: &[String], want: usize) -> Vec<String> {
+    let want = want.max(1);
+    if lines.len() <= want {
+        return lines.to_vec();
+    }
+    let head = want / 2;
+    let tail = want - head;
+    let omitted = lines.len().saturating_sub(head + tail);
+    let mut out: Vec<String> = Vec::new();
+    out.extend(lines.iter().take(head).cloned());
+    out.push(format!("... (中间省略 {omitted} 条) ..."));
+    out.extend(lines.iter().skip(lines.len().saturating_sub(tail)).cloned());
+    out
+}
+
+fn list_one_file_abs(abs: &Path) -> anyhow::Result<(bool, u64, String)> {
+    let abs_display = display_path_best_effort(abs);
+    if abs_display.is_empty() {
+        return Ok((false, 0, "path: (empty)\nstatus: fail\nreason: empty path".to_string()));
+    }
+    if !abs.exists() {
+        return Ok((false, 0, format!("path: {abs_display}\nstatus: not_found")));
+    }
+    let meta = fs::symlink_metadata(abs).with_context(|| format!("获取文件信息失败：{abs_display}"))?;
+    let real = abs_display;
+    let readonly = meta.permissions().readonly();
+    let mode = fmt_mode(&meta);
+    let mtime = fmt_time(meta.modified());
+    let atime = fmt_time(meta.accessed());
+    let created = fmt_time(meta.created());
+
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        let target = fs::read_link(abs)
+            .ok()
+            .and_then(|x| x.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let body = format!(
+            "path: {real}\nkind: symlink\ntarget: {target}\ncreated: {created}\nmtime: {mtime}\natime: {atime}\nreadonly: {readonly}\nmode: {mode}"
+        );
+        return Ok((true, 0, body));
+    }
+
+    if meta.is_dir() {
+        let body = format!(
+            "path: {real}\nkind: dir\ncreated: {created}\nmtime: {mtime}\natime: {atime}\nreadonly: {readonly}\nmode: {mode}"
+        );
+        return Ok((true, 0, body));
+    }
+
+    let bytes = meta.len();
+    let mut lines: Option<u64> = None;
+    let mut chars: Option<u64> = None;
+    let mut note = String::new();
+    if bytes == 0 {
+        lines = Some(0);
+        chars = Some(0);
+    } else if bytes <= LIST_STAT_SCAN_MAX_BYTES && !is_probably_binary_file(abs) {
+        let f = fs::File::open(abs).with_context(|| format!("读取失败：{real}"))?;
+        let mut reader = std::io::BufReader::new(f);
+        let mut buf = String::new();
+        let mut ln: u64 = 0;
+        let mut ch: u64 = 0;
+        while reader.read_line(&mut buf).unwrap_or(0) > 0 {
+            ln = ln.saturating_add(1);
+            ch = ch.saturating_add(buf.trim_end_matches(['\n', '\r']).chars().count() as u64);
+            buf.clear();
+        }
+        lines = Some(ln);
+        chars = Some(ch);
+    } else {
+        note = if is_probably_binary_file(abs) {
+            "note: binary_file (skip lines/chars)".to_string()
+        } else {
+            format!(
+                "note: too_large (>{} bytes) (skip lines/chars)",
+                LIST_STAT_SCAN_MAX_BYTES
+            )
+        };
+    }
+
+    let mut body = String::new();
+    body.push_str(&format!("path: {real}\n"));
+    body.push_str("kind: file\n");
+    body.push_str(&format!("bytes: {bytes} ({})\n", format_bytes(bytes)));
+    if let Some(n) = lines {
+        body.push_str(&format!("lines: {n}\n"));
+    } else {
+        body.push_str("lines: unknown\n");
+    }
+    if let Some(n) = chars {
+        body.push_str(&format!("chars: {n}\n"));
+    } else {
+        body.push_str("chars: unknown\n");
+    }
+    body.push_str(&format!("created: {created}\n"));
+    body.push_str(&format!("mtime: {mtime}\n"));
+    body.push_str(&format!("atime: {atime}\n"));
+    body.push_str(&format!("readonly: {readonly}\n"));
+    body.push_str(&format!("mode: {mode}"));
+    if !note.is_empty() {
+        body.push('\n');
+        body.push_str(&note);
+    }
+    Ok((true, bytes, body))
+}
+
+fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let started = Instant::now();
-    let p = Path::new(&path);
-    if !p.exists() {
+    let depth = call
+        .depth
+        .unwrap_or(LIST_MAX_DEPTH_DEFAULT)
+        .clamp(1, LIST_MAX_DEPTH_CAP);
+    let base_dir = fs_tool_base_dir(call);
+    let cwd_log = short_cwd_display(&display_path_best_effort(&base_dir));
+    let op = call.op.as_deref().unwrap_or("dir").trim().to_ascii_lowercase();
+    // list 不支持 paths：避免模型产生“多路径 list”心智负担。
+            if call
+                .paths
+                .as_ref()
+                .is_some_and(|v| v.iter().any(|p| !p.trim().is_empty()))
+            {
+                return Ok(tool_format_error(
+                    "list",
+                    "list 不支持 paths；用 cwd 指定目录；同目录多文件用 name 数组。",
+                ));
+            }
+
+    // 收敛协议：list 只基于 cwd 工作（由 validate_tool_call 保证）。
+    let names = call
+        .names
+        .as_ref()
+        .map(|v| {
+            v.iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let abs = base_dir.clone();
+    let abs_display = real_display_path(&base_dir);
+    if abs_display.is_empty() {
+        return Ok(tool_format_error("list", "缺少 cwd"));
+    }
+    if !abs.exists() {
         return Ok(ToolOutcome {
-            user_message: format!("路径不存在：{path}"),
+            user_message: format!("路径不存在：{abs_display}"),
             log_lines: vec![format!(
                 "状态:ok_not_found | 耗时:{}ms | path:{}",
                 started.elapsed().as_millis(),
-                shorten_path(&path)
+                abs_display
             )],
         });
     }
 
-    fn fmt_mtime(meta: &fs::Metadata) -> String {
-        meta.modified()
-            .ok()
-            .and_then(|t| {
-                let dt: chrono::DateTime<Local> = t.into();
-                Some(dt.format("%Y-%m-%d %H:%M").to_string())
-            })
-            .unwrap_or_else(|| "unknown".to_string())
-    }
-
-    fn fmt_kind(meta: &fs::Metadata) -> &'static str {
-        if meta.is_dir() {
-            "dir"
-        } else if meta.is_file() {
-            "file"
-        } else {
-            "other"
+    // op=files：输出 cwd 目录下 names 的文件信息（纯文件名）
+    if op == "files" {
+        if !abs.is_dir() {
+            return Ok(tool_format_error("list", "list.op=files 需要 cwd 指向目录"));
         }
-    }
-
-    fn abs_path(cwd: &Path, raw: &str) -> PathBuf {
-        let p = Path::new(raw);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            cwd.join(p)
+        let mut blocks: Vec<String> = Vec::new();
+        let mut ok_count = 0usize;
+        let mut fail_count = 0usize;
+        let mut total_bytes: u64 = 0;
+        for (idx, name) in names.iter().enumerate() {
+            let t = name.trim();
+            if t.is_empty()
+                || t.contains('/')
+                || t.contains('\\')
+                || Path::new(t).is_absolute()
+                || t == "."
+                || t == ".."
+            {
+                fail_count = fail_count.saturating_add(1);
+                blocks.push(format!(
+                    "[#{}]\npath: {}/{}\nstatus: fail\nreason: invalid_file_name",
+                    idx + 1,
+                    abs_display,
+                    t
+                ));
+                continue;
+            }
+            let joined = abs.join(t);
+            let (ok, bytes, body) = list_one_file_abs(&joined)?;
+            if ok {
+                ok_count = ok_count.saturating_add(1);
+            } else {
+                fail_count = fail_count.saturating_add(1);
+            }
+            total_bytes = total_bytes.saturating_add(bytes);
+            blocks.push(format!("[#{}]\n{}", idx + 1, body.trim_end()));
         }
-    }
-
-    // 合并 stat_file 能力：path 是文件时，直接输出单条“增强版 list”。
-    if p.is_file() {
-        let meta = fs::metadata(p).with_context(|| format!("获取文件信息失败：{path}"))?;
-        let elapsed = started.elapsed();
-        let bytes = meta.len();
-        let body = format!(
-            "{} | path:{} | size:{} ({}) | mtime:{} | readonly:{}",
-            fmt_kind(&meta),
-            shorten_path(&path),
-            bytes,
-            format_bytes(bytes),
-            fmt_mtime(&meta),
-            meta.permissions().readonly()
+        let body = blocks.join("\n\n---\n\n");
+        let raw_lines = body.lines().count();
+        let raw_chars = body.chars().count();
+        let (body2, saved) = maybe_export_fs_text("list_files", &body);
+        let mut log = format!(
+            "状态:0 | 耗时:{}ms | op:list | type:dir_files | cwd:{} | base:{} | files:{} | ok:{} | fail:{} | bytes:{} | lines:{} | chars:{}",
+            started.elapsed().as_millis(),
+            cwd_log,
+            abs_display,
+            names.len(),
+            ok_count,
+            fail_count,
+            total_bytes,
+            raw_lines,
+            raw_chars
         );
+        if let Some(m) = saved.as_ref() {
+            log.push_str(&format!(" | saved:{}", m.path));
+        }
         return Ok(ToolOutcome {
-            user_message: body,
-            log_lines: vec![format!(
-                "状态:0 | 耗时:{}ms | path:{} | type:file",
-                elapsed.as_millis(),
-                shorten_path(&path)
-            )],
+            user_message: body2,
+            log_lines: vec![log],
         });
     }
 
-    let depth = call.depth.unwrap_or(1).clamp(1, LIST_MAX_DEPTH_CAP);
-    let max_entries = call
-        .max_entries
-        .unwrap_or(LIST_MAX_ENTRIES_DEFAULT)
-        .clamp(1, LIST_MAX_ENTRIES_CAP);
+    // op=dir：列目录（若 path 实际是文件，则退化成“看文件信息”，兼容用户习惯）
+    if abs.is_file() || abs.symlink_metadata().map(|m| m.is_file()).unwrap_or(false) {
+        let (_ok, _bytes, body) = list_one_file_abs(&abs)?;
+        let mut log = format!(
+            "状态:0 | 耗时:{}ms | op:list | type:file | cwd:{} | path:{}",
+            started.elapsed().as_millis(),
+            cwd_log,
+            abs_display
+        );
+        let (body2, saved) = maybe_export_fs_text("list_file", &body);
+        if let Some(m) = saved.as_ref() {
+            log.push_str(&format!(" | saved:{}", m.path));
+        }
+        return Ok(ToolOutcome {
+            user_message: body2,
+            log_lines: vec![log],
+        });
+    }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let abs = abs_path(&cwd, &path);
-    let real = fs::canonicalize(&abs).unwrap_or(abs.clone());
+    // 目录：枚举（递归 depth），条目上限固定为 300（不可配置）
+    let cwd_display = display_path_best_effort(&base_dir);
 
     let mut out: Vec<String> = Vec::new();
-    out.push(format!("cwd: {}", shorten_path(&cwd.to_string_lossy())));
-    out.push(format!("path: {path}"));
-    out.push(format!("real: {}", shorten_path(&real.to_string_lossy())));
-    out.push(format!("depth: {depth} | entry_cap: {max_entries}"));
+    out.push(format!("cwd: {cwd_display}"));
+    out.push(format!("path: {abs_display}"));
+    out.push(format!("depth: {depth}"));
     out.push(String::new());
 
     let mut produced = 0usize;
     let mut truncated = false;
 
-    fn join_rel(prefix: &str, name: &str) -> String {
-        if prefix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{prefix}/{name}")
-        }
-    }
-
-    fn list_one_dir(
+    fn list_dir_rec(
         root: &Path,
         rel_prefix: &str,
         level: usize,
@@ -3843,14 +3922,8 @@ fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         let rd = match fs::read_dir(root) {
             Ok(rd) => rd,
             Err(_) => {
-                let here = if rel_prefix.is_empty() {
-                    ".".to_string()
-                } else {
-                    format!("{rel_prefix}/")
-                };
-                out.push(format!(
-                    "dir | size:- | mtime:unknown | readonly:? | {here} [unreadable]"
-                ));
+                let here = real_display_path(root);
+                out.push(format!("dir | unreadable:1 | {here}"));
                 *produced = produced.saturating_add(1);
                 return Ok(());
             }
@@ -3867,37 +3940,31 @@ fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
                 break;
             }
             let meta = fs::metadata(&ep).ok();
-            let (kind, bytes, mtime, ro) = if let Some(m) = meta.as_ref() {
-                (
-                    fmt_kind(m),
-                    m.len(),
-                    fmt_mtime(m),
-                    m.permissions().readonly(),
-                )
+            let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+            let is_file = meta.as_ref().is_some_and(|m| m.is_file());
+            let kind = if is_dir { "dir" } else if is_file { "file" } else { "other" };
+            let hidden = if name.starts_with('.') { " hidden:1" } else { "" };
+            let size_part = if is_file {
+                let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                format!(" size:{}({})", bytes, format_bytes(bytes))
             } else {
-                ("other", 0u64, "unknown".to_string(), false)
+                String::new()
             };
-            let rel = join_rel(rel_prefix, &name);
-            let display = if kind == "dir" {
-                format!("{rel}/")
+            let mut rel = if rel_prefix.is_empty() {
+                name.clone()
             } else {
-                rel
+                format!("{rel_prefix}/{name}")
             };
-            let size_part = if kind == "file" {
-                format!("size:{} ({})", bytes, format_bytes(bytes))
-            } else {
-                "size:-".to_string()
-            };
-            out.push(format!(
-                "{kind} | {size_part} | mtime:{mtime} | readonly:{ro} | {display}"
-            ));
+            if is_dir {
+                rel = format!("{rel}/");
+            }
+            out.push(format!("{kind}{size_part}{hidden} | {rel}"));
             *produced = produced.saturating_add(1);
 
-            if kind == "dir" && level < max_level && !*truncated {
-                let next_prefix = join_rel(rel_prefix, &name);
-                list_one_dir(
+            if is_dir && level < max_level && !*truncated {
+                list_dir_rec(
                     &ep,
-                    &next_prefix,
+                    &rel.trim_end_matches('/'),
                     level.saturating_add(1),
                     max_level,
                     max_entries,
@@ -3910,57 +3977,74 @@ fn run_list_dir(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         Ok(())
     }
 
-    list_one_dir(
-        p,
+    list_dir_rec(
+        &abs,
         "",
         1,
         depth,
-        max_entries,
+        LIST_DIR_ENTRY_CAP,
         &mut produced,
         &mut truncated,
         &mut out,
     )?;
-    if truncated {
-        out.push(String::new());
-        out.push(format!(
-            "[truncated:true entries:{produced} entry_cap:{max_entries} depth:{depth}]"
-        ));
-    }
-    let elapsed = started.elapsed();
-    let mut body = out.join("\n");
-    if body.is_empty() {
-        body = "(empty)".to_string();
-    }
-    let total_entries = produced;
-    let truncated_by_lines = total_entries > OUTPUT_MAX_LINES;
-    let truncated_by_chars = body.chars().count() > OUTPUT_MAX_CHARS;
 
-    Ok(ToolOutcome {
-        user_message: truncate_command_output(body),
-        log_lines: vec![{
-            let mut meta = format!(
-                "状态:0 | 耗时:{}ms | path:{} | entries:{}",
-                elapsed.as_millis(),
-                shorten_path(&path),
-                total_entries
-            );
-            if truncated_by_lines || truncated_by_chars {
-                meta.push_str(&format!(
-                    " | truncated:true | limit:{} lines/{} chars",
-                    OUTPUT_MAX_LINES, OUTPUT_MAX_CHARS
-                ));
+    // 将 entries/truncated 回填到 header（第 3 行）
+    if let Some(line) = out.get_mut(2) {
+        *line = format!(
+            "depth: {depth} | entries: {produced} | truncated: {}",
+            if truncated { 1 } else { 0 }
+        );
+    }
+
+    let body = out.join("\n").trim_end().to_string();
+    let raw_lines = body.lines().count();
+    let raw_chars = body.chars().count();
+    let (body2, saved) = if truncated {
+        // 超过 300 条：强制导出，并只回显 160 条（中间截断）
+        let meta = export_fs_text_always("list_dir", &body);
+        let entries = if out.len() >= 4 { &out[4..] } else { &[] };
+        let preview_entries = list_preview_middle_truncate(entries, LIST_DIR_EXPORT_PREVIEW_ENTRIES);
+        let mut preview_lines: Vec<String> = Vec::new();
+        preview_lines.extend(out.iter().take(4).cloned()); // header + blank
+        preview_lines.extend(preview_entries);
+        let preview_body = preview_lines.join("\n").trim_end().to_string();
+        if let Some(m) = meta.clone() {
+            let mut msg = String::new();
+            msg.push_str(&format_exported_notice(&m));
+            if !preview_body.trim().is_empty() {
+                msg.push_str("\n\n");
+                msg.push_str(preview_body.trim_end());
             }
-            meta
-        }],
+            (msg, Some(m))
+        } else {
+            (preview_body, None)
+        }
+    } else {
+        maybe_export_fs_text("list_dir", &body)
+    };
+    let mut log = format!(
+        "状态:0 | 耗时:{}ms | op:list | type:dir | cwd:{} | path:{} | depth:{} | entries:{} | truncated:{} | lines:{} | chars:{}",
+        started.elapsed().as_millis(),
+        cwd_log,
+        abs_display,
+        depth,
+        produced,
+        if truncated { 1 } else { 0 },
+        raw_lines,
+        raw_chars
+    );
+    if let Some(m) = saved.as_ref() {
+        log.push_str(&format!(" | saved:{}", m.path));
+    }
+    Ok(ToolOutcome {
+        user_message: body2,
+        log_lines: vec![log],
     })
 }
 
-fn run_stat_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    // stat_file 已并入“增强版 list_dir”（list_dir 对文件路径会输出单条信息）。
-    run_list_dir(call)
-}
 
-fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
+
+pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     if call.memory.unwrap_or(false) {
         return run_search_memory_like("search", call);
     }
@@ -4040,6 +4124,24 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let extra_exclude_dirs = call.exclude_dirs.clone().unwrap_or_default();
     let include_re = compile_globs(&include_globs);
     let exclude_re = compile_globs(&exclude_globs);
+
+    // search(format=coords)：只返回坐标（abs_path:line），不返回命中行内容。
+    // search(format=ranges)：只返回行号范围（abs_path:Lx-Ly），用于指导按需 read。
+    // 仅对“内容搜索”生效；文件名搜索（file:true）与上下文搜索（context:true）忽略该字段。
+    let format = call
+        .format
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let want_coords = format == "coords" || format == "coord";
+    let want_ranges = format == "ranges" || format == "range";
+    if want_coords && !search_files && !want_context {
+        return run_search_coords(call, &pattern_effective, &root);
+    }
+    if want_ranges && !search_files && !want_context {
+        return run_search_ranges(call, &pattern_effective, &root);
+    }
     if search_files {
         let needles: Vec<String> = keywords
             .iter()
@@ -4102,7 +4204,6 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
                 out.push_str("\n\n");
                 out.push_str(preview.trim_end());
             }
-            out.push_str(&format!("\n\n[saved:{}]", meta.path));
             out
         } else {
             truncate_tool_payload(&body, out_lines, out_chars)
@@ -4114,10 +4215,7 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             match_count
         );
         if let Some(meta) = saved_meta.as_ref() {
-            log.push_str(&format!(
-                " | saved:{} | saved_bytes:{} | saved_lines:{}",
-                meta.path, meta.bytes, meta.lines
-            ));
+            log.push_str(&format!(" | saved:{}", meta.path));
         }
         return Ok(ToolOutcome {
             user_message: body,
@@ -4303,7 +4401,6 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             out.push_str("\n\n");
             out.push_str(preview.trim_end());
         }
-        out.push_str(&format!("\n\n[saved:{}]", meta.path));
         out
     } else {
         truncate_tool_payload(&raw_body, out_lines, out_chars)
@@ -4319,16 +4416,223 @@ fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         match_count
     );
     if let Some(meta) = saved_meta.as_ref() {
-        log.push_str(&format!(
-            " | saved:{} | saved_bytes:{} | saved_lines:{}",
-            meta.path, meta.bytes, meta.lines
-        ));
+        log.push_str(&format!(" | saved:{}", meta.path));
     }
 
     Ok(ToolOutcome {
         user_message: body,
         log_lines: vec![log],
     })
+}
+
+#[derive(Debug)]
+struct MemoryBlock {
+    start_line: usize,
+    end_line: usize,
+    lines: Vec<String>,
+}
+
+fn parse_memory_keywords(pattern: &str) -> Vec<String> {
+    let mut normalized = pattern.to_string();
+    for sep in ['，', ',', '、', '|', ';', '；', '/', '\\', '\n', '\t'] {
+        normalized = normalized.replace(sep, " ");
+    }
+    normalized
+        .split_whitespace()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+}
+
+fn dedup_keywords(keywords: &[String], cap: usize) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for kw in keywords {
+        let t = kw.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if seen.insert(t.clone()) {
+            out.push(t);
+        }
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
+}
+
+fn parse_memory_date(raw: &str) -> Option<NaiveDate> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return Some(date);
+    }
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 8 {
+        let y = digits.get(0..4)?.parse::<i32>().ok()?;
+        let m = digits.get(4..6)?.parse::<u32>().ok()?;
+        let d = digits.get(6..8)?.parse::<u32>().ok()?;
+        return NaiveDate::from_ymd_opt(y, m, d);
+    }
+    None
+}
+
+fn parse_memory_date_range(
+    start_raw: &str,
+    end_raw: &str,
+) -> Result<(Option<NaiveDate>, Option<NaiveDate>), &'static str> {
+    let start_raw = start_raw.trim();
+    let end_raw = end_raw.trim();
+    let mut start = if start_raw.is_empty() {
+        None
+    } else {
+        Some(parse_memory_date(start_raw).ok_or("start_date 无效")?)
+    };
+    let mut end = if end_raw.is_empty() {
+        None
+    } else {
+        Some(parse_memory_date(end_raw).ok_or("end_date 无效")?)
+    };
+    if start.is_some() && end.is_none() {
+        end = start;
+    }
+    if end.is_some() && start.is_none() {
+        start = end;
+    }
+    if let (Some(left), Some(right)) = (start, end)
+        && left > right
+    {
+        start = Some(right);
+        end = Some(left);
+    }
+    Ok((start, end))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MemoDateRegion {
+    Recent7d,
+    Past1y,
+    Older,
+}
+
+fn parse_memo_date_region(raw: &str) -> Option<MemoDateRegion> {
+    let t = raw.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    match t.as_str() {
+        "recent" | "week" | "7d" | "last7" | "last_7" | "最近" | "一周" | "近一周" => {
+            Some(MemoDateRegion::Recent7d)
+        }
+        "past" | "year" | "1y" | "过去" | "一年" | "近一年" => Some(MemoDateRegion::Past1y),
+        "older" | "old" | "以前" | "更早" | "一年以前" | ">1y" => {
+            Some(MemoDateRegion::Older)
+        }
+        _ => None,
+    }
+}
+
+fn call_region_or_section(call: &ToolCall) -> String {
+    let r = call.region.as_deref().unwrap_or("").trim();
+    if !r.is_empty() {
+        return r.to_string();
+    }
+    call.section.as_deref().unwrap_or("").trim().to_string()
+}
+
+fn default_date_range_for_region(region: MemoDateRegion) -> (Option<NaiveDate>, Option<NaiveDate>) {
+    let today = Local::now().date_naive();
+    let recent_start = today - chrono::Duration::days(7);
+    let one_year_ago = today - chrono::Duration::days(365);
+    let older_end = one_year_ago - chrono::Duration::days(1);
+    let past_end = recent_start - chrono::Duration::days(1);
+    match region {
+        MemoDateRegion::Recent7d => (Some(recent_start), Some(today)),
+        MemoDateRegion::Past1y => (Some(one_year_ago), Some(past_end)),
+        MemoDateRegion::Older => (None, Some(older_end)),
+    }
+}
+
+fn extract_block_date(block: &MemoryBlock) -> Option<NaiveDate> {
+    let head = block.lines.first()?.trim();
+    parse_memory_date(head)
+}
+
+fn collect_memory_blocks(text: &str) -> Vec<MemoryBlock> {
+    let mut blocks = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut start_line = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                blocks.push(MemoryBlock {
+                    start_line,
+                    end_line: line_no.saturating_sub(1),
+                    lines: std::mem::take(&mut current),
+                });
+                start_line = 0;
+            }
+            continue;
+        }
+        if current.is_empty() && line.trim_start().starts_with('#') {
+            continue;
+        }
+        if current.is_empty() {
+            start_line = line_no;
+        }
+        current.push(line.to_string());
+    }
+    if !current.is_empty() {
+        let end_line = text.lines().count().max(start_line);
+        blocks.push(MemoryBlock {
+            start_line,
+            end_line,
+            lines: current,
+        });
+    }
+    blocks
+}
+
+fn memo_row_header(content: &str) -> String {
+    content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "(空记录)".to_string())
+}
+
+fn memo_row_preview(content: &str, keywords: &[String]) -> Option<String> {
+    if keywords.is_empty() {
+        return None;
+    }
+    for line in content.lines() {
+        let lower = line.to_ascii_lowercase();
+        if keywords.iter().any(|kw| lower.contains(kw)) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn render_memo_rows(rows: &[MemoRow]) -> String {
+    let mut out = String::new();
+    for (idx, row) in rows.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("[L{}]\n", row.rownum));
+        out.push_str(row.content.trim_end());
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolOutcome> {
@@ -4372,7 +4676,7 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
     let mut global_max: Option<NaiveDate> = None;
 
     for (label, path) in files {
-        if label == "fastmemo" {
+        if label == "fastmemo" || label == "scopememo" {
             let text = fs::read_to_string(&path).unwrap_or_default();
             let mut block_hits = 0usize;
             // fastmemo 的 block 头部是日期；memory_check/search(memory) 默认不做复杂区间筛选，避免误命中。
@@ -4539,7 +4843,7 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
                 }
                 let body = render_memo_rows(&rows);
                 let (out_lines, out_chars) = pick_search_output_limits(call);
-                let (body2, saved) = maybe_export_text(
+                let (body2, _saved) = maybe_export_text(
                     MEMORY_CACHE_DIR,
                     "datememo_recent",
                     &body,
@@ -4554,9 +4858,6 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
                 out.push('\n');
                 out.push_str(body2.trim_end());
                 out.push('\n');
-                if let Some(meta) = saved.as_ref() {
-                    out.push_str(&format!("\n[saved:{}]\n", meta.path));
-                }
                 hits = hits.saturating_add(rows.len());
                 continue;
             }
@@ -5046,7 +5347,6 @@ fn build_context_pack(
             out.push_str("\n\n");
             out.push_str(preview.trim_end());
         }
-        out.push_str(&format!("\n\n[saved:{}]", meta.path));
         out
     } else {
         truncate_tool_payload(&body, out_lines, out_chars)
@@ -5059,10 +5359,7 @@ fn build_context_pack(
         shorten_path(root),
     );
     if let Some(meta) = saved_meta.as_ref() {
-        log.push_str(&format!(
-            " | saved:{} | saved_bytes:{} | saved_lines:{}",
-            meta.path, meta.bytes, meta.lines
-        ));
+        log.push_str(&format!(" | saved:{}", meta.path));
     }
     ToolOutcome {
         user_message: body,
@@ -5339,7 +5636,6 @@ fn run_search_keywords_and(
             out.push_str("\n\n");
             out.push_str(preview.trim_end());
         }
-        out.push_str(&format!("\n\n[saved:{}]", meta.path));
         out
     } else {
         truncate_tool_payload(&body, out_lines, out_chars)
@@ -5373,10 +5669,7 @@ fn run_search_keywords_and(
         ));
     }
     if let Some(meta) = saved_meta.as_ref() {
-        log.push_str(&format!(
-            " | saved:{} | saved_bytes:{} | saved_lines:{}",
-            meta.path, meta.bytes, meta.lines
-        ));
+        log.push_str(&format!(" | saved:{}", meta.path));
     }
 
     ToolOutcome {
@@ -5385,7 +5678,7 @@ fn run_search_keywords_and(
     }
 }
 
-fn run_edit_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
+pub(crate) fn run_edit_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let path = if call.memory.unwrap_or(false) {
         let raw = call.path.as_deref().unwrap_or(call.input.trim()).trim();
         let Some((label, path)) = resolve_memory_path_label(raw) else {
@@ -5484,7 +5777,7 @@ fn run_edit_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     })
 }
 
-fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
+pub(crate) fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let mut patch_text = call
         .patch
         .as_deref()
@@ -5502,8 +5795,8 @@ fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             log_lines: vec![],
         });
     }
-    if !patch_text.ends_with('\n') {
-        patch_text.push('\n');
+    if !patch_text.ends_with("\n") {
+        patch_text.push_str("\n");
     }
     if let Err(err) = validate_unified_patch(&patch_text) {
         return Ok(ToolOutcome {
@@ -5511,59 +5804,91 @@ fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             log_lines: vec![format!("状态:format_error | line:{}", err.line)],
         });
     }
-    let started = Instant::now();
-    let (add, del) = count_patch_changes(&patch_text);
-    let strip = if patch_text.contains("\n--- a/") || patch_text.starts_with("--- a/") {
+
+    let strip = if patch_text.contains("\n--- a/")
+        || patch_text.starts_with("--- a/")
+        || patch_text.contains("\n+++ b/")
+        || patch_text.starts_with("+++ b/")
+    {
         1
     } else {
         0
     };
-    let strict = call.strict.unwrap_or(false);
-    if strict {
-        let (code, stdout, stderr, timed_out) = run_patch_command(&patch_text, strip, true)?;
-        let elapsed = started.elapsed();
-        let body = annotate_timeout(
-            truncate_command_output(collect_output(&stdout, &stderr)),
-            timed_out,
-            None,
-        );
-        let report = parse_patch_report(&body);
-        if timed_out {
-            return Ok(ToolOutcome {
-                user_message: "补丁超时（严格模式未应用）".to_string(),
-                log_lines: vec![format!(
-                    "状态:timeout | 耗时:{}ms | strip:-p{strip} | delta_lines:+{} -{} | result:timeout",
-                    elapsed.as_millis(),
-                    add,
-                    del
-                )],
-            });
-        }
-        if code != 0 || report.failed {
-            return Ok(ToolOutcome {
-                user_message: format!("补丁失败（严格模式未应用）\n{body}"),
-                log_lines: vec![format!(
-                    "状态:fail | 耗时:{}ms | strip:-p{strip} | delta_lines:+{} -{} | result:fail",
-                    elapsed.as_millis(),
-                    add,
-                    del
-                )],
-            });
-        }
-        if report.fuzz || report.offset {
-            return Ok(ToolOutcome {
-                user_message: format!("补丁命中不精确（严格模式拒绝）\n{body}"),
-                log_lines: vec![format!(
-                    "状态:ok_fuzz | 耗时:{}ms | strip:-p{strip} | delta_lines:+{} -{} | result:ok_fuzz",
-                    elapsed.as_millis(),
-                    add,
-                    del
-                )],
-            });
-        }
+
+    let started = Instant::now();
+    let cwd_exec = if let Some(cwd) = call
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        expand_cwd_alias(cwd)
+    } else {
+        default_workdir()
+    };
+    let cwd_display = short_cwd_display(&cwd_exec);
+    let (add, del) = count_patch_changes(&patch_text);
+    // 先 dry-run：避免 patch 在失败时“部分应用”导致工作区混乱。
+    let (pre_code, pre_stdout, pre_stderr, pre_timed_out) =
+        run_patch_command(&patch_text, strip, true, &cwd_exec)?;
+    let pre_elapsed = started.elapsed();
+    let pre_body = annotate_timeout(
+        truncate_command_output(collect_output(&pre_stdout, &pre_stderr)),
+        pre_timed_out,
+        None,
+    );
+    let pre_report = parse_patch_report(&pre_body);
+
+    if pre_timed_out {
+        return Ok(ToolOutcome {
+            user_message: "补丁超时（未应用）".to_string(),
+            log_lines: vec![format!(
+                "状态:timeout | 耗时:{}ms | cwd:{} | strip:-p{strip} | delta_lines:+{} -{} | result:timeout",
+                pre_elapsed.as_millis(),
+                cwd_display,
+                add,
+                del
+            )],
+        });
+    }
+    if pre_code != 0 || pre_report.failed {
+        return Ok(ToolOutcome {
+            user_message: if pre_body.trim().is_empty() {
+                "补丁失败（未应用）".to_string()
+            } else {
+                format!("补丁失败（未应用）\n{pre_body}")
+            },
+            log_lines: vec![format!(
+                "状态:fail | 耗时:{}ms | cwd:{} | strip:-p{strip} | delta_lines:+{} -{} | result:precheck_fail",
+                pre_elapsed.as_millis(),
+                cwd_display,
+                add,
+                del
+            )],
+        });
+    }
+    // 自动化策略：
+    // - fuzz：拒绝（未应用），因为上下文未精确匹配，风险更高。
+    // - offset：允许（上下文匹配但行号偏移）。
+    if pre_report.fuzz {
+        return Ok(ToolOutcome {
+            user_message: if pre_body.trim().is_empty() {
+                "补丁命中不精确（fuzz，未应用）".to_string()
+            } else {
+                format!("补丁命中不精确（fuzz，未应用）\n{pre_body}")
+            },
+            log_lines: vec![format!(
+                "状态:fail | 耗时:{}ms | cwd:{} | strip:-p{strip} | delta_lines:+{} -{} | result:fuzz_reject",
+                pre_elapsed.as_millis(),
+                cwd_display,
+                add,
+                del
+            )],
+        });
     }
 
-    let (code, stdout, stderr, timed_out) = run_patch_command(&patch_text, strip, false)?;
+    // 正式应用
+    let (code, stdout, stderr, timed_out) = run_patch_command(&patch_text, strip, false, &cwd_exec)?;
     let elapsed = started.elapsed();
     let body = annotate_timeout(
         truncate_command_output(collect_output(&stdout, &stderr)),
@@ -5575,17 +5900,23 @@ fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let success = code == 0 && !timed_out;
     let result_tag = if timed_out {
         "timeout"
-    } else if success && (report.fuzz || report.offset) {
+    } else if success && report.fuzz {
+        // 理论上 dry-run 已拦截 fuzz；保留兜底标记，避免静默。
         "ok_fuzz"
+    } else if success && report.offset {
+        "ok_offset"
     } else if success && !report.failed {
         "ok"
     } else {
         "fail"
     };
+
     let summary = if timed_out {
         "补丁超时"
     } else if result_tag == "ok_fuzz" {
-        "补丁成功（含差异）"
+        "补丁成功（fuzz）"
+    } else if result_tag == "ok_offset" {
+        "补丁成功（offset）"
     } else if result_tag == "ok" {
         "补丁成功"
     } else {
@@ -5600,826 +5931,14 @@ fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     Ok(ToolOutcome {
         user_message,
         log_lines: vec![format!(
-            "状态:{status} | 耗时:{}ms | strip:-p{strip} | delta_lines:+{} -{} | result:{}",
+            "状态:{status} | 耗时:{}ms | cwd:{} | strip:-p{strip} | delta_lines:+{} -{} | result:{}",
             elapsed.as_millis(),
+            cwd_display,
             add,
             del,
             result_tag
         )],
     })
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TrashMeta {
-    trash_id: String,
-    created_at: String,
-    src: String,
-    payload: String,
-    kind: String,
-    method: String,
-    note: Option<String>,
-}
-
-fn file_manager_make_trash_id() -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
-    let pid = unsafe { libc::getpid() };
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("trash_{ts}_{pid}_{seq}")
-}
-
-fn file_manager_recycle_dir() -> PathBuf {
-    PathBuf::from(FILE_MANAGER_RECYCLE_DIR)
-}
-
-fn file_manager_is_exdev(err: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        err.raw_os_error() == Some(libc::EXDEV)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = err;
-        false
-    }
-}
-
-fn file_manager_meta_path(trash_id: &str) -> PathBuf {
-    file_manager_recycle_dir().join(trash_id).join("meta.json")
-}
-
-fn file_manager_payload_path(trash_id: &str) -> PathBuf {
-    file_manager_recycle_dir().join(trash_id).join("payload")
-}
-
-fn file_manager_write_trash_meta(meta: &TrashMeta) -> anyhow::Result<()> {
-    let meta_path = file_manager_meta_path(&meta.trash_id);
-    if let Some(parent) = meta_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建回收站目录失败：{}", parent.display()))?;
-    }
-    let json = serde_json::to_string_pretty(meta).context("序列化回收站 meta 失败")?;
-    fs::write(&meta_path, json)
-        .with_context(|| format!("写入回收站 meta 失败：{}", meta_path.display()))?;
-    Ok(())
-}
-
-fn file_manager_read_trash_meta(trash_id: &str) -> anyhow::Result<TrashMeta> {
-    let meta_path = file_manager_meta_path(trash_id);
-    let raw = fs::read_to_string(&meta_path)
-        .with_context(|| format!("读取回收站 meta 失败：{}", meta_path.display()))?;
-    let meta: TrashMeta = serde_json::from_str(&raw).context("解析回收站 meta 失败")?;
-    Ok(meta)
-}
-
-#[derive(Debug, Default)]
-struct CopyStats {
-    files: usize,
-    dirs: usize,
-    bytes: u64,
-}
-
-fn copy_recursive(src: &Path, dst: &Path, stats: &mut CopyStats) -> anyhow::Result<()> {
-    let meta = fs::symlink_metadata(src)
-        .with_context(|| format!("读取源路径信息失败：{}", src.display()))?;
-    if meta.is_dir() {
-        fs::create_dir_all(dst).with_context(|| format!("创建目录失败：{}", dst.display()))?;
-        stats.dirs = stats.dirs.saturating_add(1);
-        for entry in
-            fs::read_dir(src).with_context(|| format!("读取目录失败：{}", src.display()))?
-        {
-            let entry = entry?;
-            let name = entry.file_name();
-            let child_src = entry.path();
-            let child_dst = dst.join(name);
-            copy_recursive(&child_src, &child_dst, stats)?;
-        }
-    } else {
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("创建目录失败：{}", parent.display()))?;
-        }
-        let copied = fs::copy(src, dst)
-            .with_context(|| format!("复制失败：{} -> {}", src.display(), dst.display()))?;
-        stats.files = stats.files.saturating_add(1);
-        stats.bytes = stats.bytes.saturating_add(copied);
-    }
-    Ok(())
-}
-
-fn backup_existing_path_to_recycle(path: &Path) -> anyhow::Result<(String, String)> {
-    // 返回 (trash_id, method)
-    let trash_id = file_manager_make_trash_id();
-    let recycle = file_manager_recycle_dir();
-    fs::create_dir_all(&recycle)
-        .with_context(|| format!("创建回收站目录失败：{}", recycle.display()))?;
-    let id_dir = recycle.join(&trash_id);
-    fs::create_dir_all(&id_dir)
-        .with_context(|| format!("创建回收站子目录失败：{}", id_dir.display()))?;
-    let payload = file_manager_payload_path(&trash_id);
-
-    let kind = if fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
-        "dir"
-    } else {
-        "file"
-    };
-    let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let src_display = path.to_string_lossy().to_string();
-    let payload_display = payload.to_string_lossy().to_string();
-
-    match fs::rename(path, &payload) {
-        Ok(_) => {
-            let meta = TrashMeta {
-                trash_id: trash_id.clone(),
-                created_at,
-                src: src_display,
-                payload: payload_display,
-                kind: kind.to_string(),
-                method: "rename".to_string(),
-                note: None,
-            };
-            file_manager_write_trash_meta(&meta)?;
-            return Ok((trash_id, "rename".to_string()));
-        }
-        Err(e) => {
-            if !file_manager_is_exdev(&e) {
-                return Err(anyhow!(e).context("回收站 rename 失败"));
-            }
-            // EXDEV：退化为 copy（不做删除）
-            let mut stats = CopyStats::default();
-            copy_recursive(path, &payload, &mut stats)?;
-            let meta = TrashMeta {
-                trash_id: trash_id.clone(),
-                created_at,
-                src: src_display,
-                payload: payload_display,
-                kind: kind.to_string(),
-                method: "copy_only".to_string(),
-                note: Some("EXDEV: source not removed".to_string()),
-            };
-            file_manager_write_trash_meta(&meta)?;
-            Ok((trash_id, "copy_only".to_string()))
-        }
-    }
-}
-
-fn rename_to_local_backup(path: &Path) -> anyhow::Result<PathBuf> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("item");
-    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let pid = unsafe { libc::getpid() };
-    for seq in 0..20usize {
-        let backup_name = format!(".bak_{name}_{ts}_{pid}_{seq}");
-        let backup_path = parent.join(&backup_name);
-        if backup_path.exists() {
-            continue;
-        }
-        fs::rename(path, &backup_path).with_context(|| {
-            format!(
-                "本地备份 rename 失败：{} -> {}",
-                path.display(),
-                backup_path.display()
-            )
-        })?;
-        return Ok(backup_path);
-    }
-    Err(anyhow!("生成本地备份文件名失败（重试耗尽）"))
-}
-
-fn run_file_manager(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    let started = Instant::now();
-    let op = call.op.as_deref().unwrap_or("").trim().to_ascii_lowercase();
-
-    fn pick_op_path(call: &ToolCall) -> String {
-        call.path
-            .as_deref()
-            .or(call.src.as_deref())
-            .unwrap_or(call.input.trim())
-            .trim()
-            .to_string()
-    }
-
-    match op.as_str() {
-        "list" => {
-            let mut inner = call.clone();
-            inner.tool = "list_dir".to_string();
-            let raw = pick_op_path(call);
-            inner.path = Some(if raw.trim().is_empty() {
-                ".".to_string()
-            } else {
-                raw
-            });
-            run_list_dir(&inner)
-        }
-        "stat" => {
-            let mut inner = call.clone();
-            inner.tool = "stat_file".to_string();
-            let raw = pick_op_path(call);
-            inner.path = Some(if raw.trim().is_empty() {
-                ".".to_string()
-            } else {
-                raw
-            });
-            run_stat_file(&inner)
-        }
-        "search" => {
-            let mode = call
-                .mode
-                .as_deref()
-                .unwrap_or("content")
-                .trim()
-                .to_ascii_lowercase();
-            let pattern = call
-                .pattern
-                .as_deref()
-                .unwrap_or(call.input.trim())
-                .trim()
-                .to_string();
-            let root = call
-                .root
-                .as_deref()
-                .or(call.path.as_deref())
-                .or(call.src.as_deref())
-                .unwrap_or(".")
-                .trim()
-                .to_string();
-
-            if mode == "both" {
-                let mut a = call.clone();
-                a.tool = "search".to_string();
-                a.pattern = Some(pattern.clone());
-                a.root = Some(root.clone());
-                a.file = Some(false);
-                let out_a = run_search(&a)?;
-
-                let mut b = call.clone();
-                b.tool = "search".to_string();
-                b.pattern = Some(pattern);
-                b.root = Some(root);
-                b.file = Some(true);
-                let out_b = run_search(&b)?;
-
-                let mut body = String::new();
-                body.push_str("[content]\n");
-                body.push_str(out_a.user_message.trim_end());
-                body.push_str("\n\n[name]\n");
-                body.push_str(out_b.user_message.trim_end());
-
-                let mut meta = format!(
-                    "状态:0 | 耗时:{}ms | op:search | mode:both",
-                    started.elapsed().as_millis()
-                );
-                // 附带子工具状态（便于排障，但不影响 UI “失败”判断）
-                for line in out_a.log_lines.iter().take(2) {
-                    if line.trim_start().starts_with("状态:") {
-                        meta.push_str(&format!(" | content_{}", line.trim()));
-                        break;
-                    }
-                }
-                for line in out_b.log_lines.iter().take(2) {
-                    if line.trim_start().starts_with("状态:") {
-                        meta.push_str(&format!(" | name_{}", line.trim()));
-                        break;
-                    }
-                }
-                return Ok(ToolOutcome {
-                    user_message: truncate_command_output(body),
-                    log_lines: vec![meta],
-                });
-            }
-
-            let mut inner = call.clone();
-            inner.tool = "search".to_string();
-            inner.pattern = Some(pattern);
-            inner.root = Some(root);
-            inner.file = Some(matches!(mode.as_str(), "name" | "file"));
-            run_search(&inner)
-        }
-        "trash" => {
-            let raw = pick_op_path(call);
-            let path = if raw.trim().is_empty() {
-                ".".to_string()
-            } else {
-                raw
-            };
-            let p = Path::new(&path);
-            if !p.exists() {
-                return Ok(ToolOutcome {
-                    user_message: format!("路径不存在：{path}"),
-                    log_lines: vec![format!(
-                        "状态:ok_not_found | 耗时:{}ms | op:trash | path:{}",
-                        started.elapsed().as_millis(),
-                        shorten_path(&path)
-                    )],
-                });
-            }
-            let (trash_id, method) = backup_existing_path_to_recycle(p)?;
-            let elapsed = started.elapsed();
-            let payload = file_manager_payload_path(&trash_id);
-            let mut status = "0".to_string();
-            let mut note = String::new();
-            if method == "copy_only" {
-                status = "ok_exdev_copied".to_string();
-                note = "\n注意：跨文件系统（EXDEV），已复制进回收站，但未删除原路径。".to_string();
-            }
-            Ok(ToolOutcome {
-                user_message: format!(
-                    "已回收：{path}\ntrash_id: {trash_id}\npayload: {}{note}",
-                    shorten_path(&payload.to_string_lossy())
-                ),
-                log_lines: vec![format!(
-                    "状态:{status} | 耗时:{}ms | op:trash | path:{} | trash_id:{} | method:{}",
-                    elapsed.as_millis(),
-                    shorten_path(&path),
-                    trash_id,
-                    method
-                )],
-            })
-        }
-        "restore" => {
-            let id = call.trash_id.as_deref().unwrap_or("").trim().to_string();
-            let force = call.force.unwrap_or(false);
-            let recycle = file_manager_recycle_dir();
-            if !recycle.exists() {
-                return Ok(ToolOutcome {
-                    user_message: "回收站不存在（无可恢复项）".to_string(),
-                    log_lines: vec![format!(
-                        "状态:ok_not_found | 耗时:{}ms | op:restore",
-                        started.elapsed().as_millis()
-                    )],
-                });
-            }
-            let meta = match file_manager_read_trash_meta(&id) {
-                Ok(m) => m,
-                Err(_) => {
-                    return Ok(ToolOutcome {
-                        user_message: format!("未找到 trash_id：{id}"),
-                        log_lines: vec![format!(
-                            "状态:ok_not_found | 耗时:{}ms | op:restore | trash_id:{}",
-                            started.elapsed().as_millis(),
-                            id
-                        )],
-                    });
-                }
-            };
-            let payload = PathBuf::from(&meta.payload);
-            if !payload.exists() {
-                return Ok(ToolOutcome {
-                    user_message: format!("回收站 payload 不存在：{}", meta.payload),
-                    log_lines: vec![format!(
-                        "状态:ok_not_found | 耗时:{}ms | op:restore | trash_id:{}",
-                        started.elapsed().as_millis(),
-                        id
-                    )],
-                });
-            }
-            let target = PathBuf::from(&meta.src);
-            if target.exists() && !force {
-                return Ok(ToolOutcome {
-                    user_message: format!(
-                        "目标已存在：{}\n为避免覆盖，请显式设置 force:true（覆盖前会把旧目标备份到回收站/本地备份）。",
-                        meta.src
-                    ),
-                    log_lines: vec![format!(
-                        "状态:ok_need_confirm | 耗时:{}ms | op:restore | trash_id:{} | force:0 | target:{}",
-                        started.elapsed().as_millis(),
-                        id,
-                        shorten_path(&meta.src)
-                    )],
-                });
-            }
-            let mut backup_note: Option<String> = None;
-            if target.exists() && force {
-                // 优先进回收站；EXDEV 退化为本地备份（同目录 rename）
-                match backup_existing_path_to_recycle(&target) {
-                    Ok((bid, method)) => {
-                        backup_note = Some(format!("backup_trash_id:{bid} method:{method}"));
-                    }
-                    Err(e) => {
-                        // 可能是 EXDEV（目标在别的 FS），尝试本地备份
-                        let bak = rename_to_local_backup(&target).ok();
-                        if let Some(bak) = bak.as_ref() {
-                            backup_note = Some(format!(
-                                "backup_local:{}",
-                                shorten_path(&bak.to_string_lossy())
-                            ));
-                        } else {
-                            return Ok(ToolOutcome {
-                                user_message: format!(
-                                    "备份旧目标失败，已取消恢复：{}\n原因：{e}",
-                                    meta.src
-                                ),
-                                log_lines: vec![format!(
-                                    "状态:fail | 耗时:{}ms | op:restore | phase:backup_failed | trash_id:{}",
-                                    started.elapsed().as_millis(),
-                                    id
-                                )],
-                            });
-                        }
-                    }
-                }
-            }
-            if let Some(parent) = target.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("创建目录失败：{}", parent.display()))?;
-            }
-            let mut method = "rename".to_string();
-            if let Err(e) = fs::rename(&payload, &target) {
-                if !file_manager_is_exdev(&e) {
-                    return Err(anyhow!(e).context("恢复 rename 失败"));
-                }
-                // EXDEV：copy + 删除回收站 payload（安全）
-                let mut stats = CopyStats::default();
-                copy_recursive(&payload, &target, &mut stats)?;
-                method = "copy_then_remove".to_string();
-                if payload.is_dir() {
-                    let _ = fs::remove_dir_all(&payload);
-                } else {
-                    let _ = fs::remove_file(&payload);
-                }
-            }
-            // 标记已恢复（仅更新 meta；保留目录作为审计记录）
-            let mut meta2 = meta.clone();
-            meta2.note = Some(format!(
-                "restored_at:{}{}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                backup_note
-                    .as_ref()
-                    .map(|s| format!(" | {s}"))
-                    .unwrap_or_default()
-            ));
-            let _ = file_manager_write_trash_meta(&meta2);
-            let elapsed = started.elapsed();
-            let mut user_message =
-                format!("已恢复到：{}\ntrash_id: {id}\nmethod: {method}", meta2.src);
-            if let Some(note) = backup_note.as_deref() {
-                user_message.push_str(&format!("\n{note}"));
-            }
-            Ok(ToolOutcome {
-                user_message,
-                log_lines: vec![format!(
-                    "状态:0 | 耗时:{}ms | op:restore | trash_id:{} | target:{} | method:{} | force:{}",
-                    elapsed.as_millis(),
-                    id,
-                    shorten_path(&meta2.src),
-                    method,
-                    if force { 1 } else { 0 }
-                )],
-            })
-        }
-        "copy" | "move" => {
-            let src_raw = call.src.as_deref().unwrap_or("").trim().to_string();
-            let dst_raw = call.dst.as_deref().unwrap_or("").trim().to_string();
-            let force = call.force.unwrap_or(false);
-            let recursive = call.recursive.unwrap_or(false);
-            if src_raw.is_empty() || dst_raw.is_empty() {
-                return Ok(ToolOutcome {
-                    user_message: "file_manager copy/move 需要 src/dst".to_string(),
-                    log_lines: vec![format!(
-                        "状态:fail | 耗时:{}ms | op:{}",
-                        started.elapsed().as_millis(),
-                        op
-                    )],
-                });
-            }
-            let src = PathBuf::from(&src_raw);
-            let dst = PathBuf::from(&dst_raw);
-            if !src.exists() {
-                return Ok(ToolOutcome {
-                    user_message: format!("源路径不存在：{src_raw}"),
-                    log_lines: vec![format!(
-                        "状态:ok_not_found | 耗时:{}ms | op:{} | src:{}",
-                        started.elapsed().as_millis(),
-                        op,
-                        shorten_path(&src_raw)
-                    )],
-                });
-            }
-            let src_is_dir = fs::metadata(&src).map(|m| m.is_dir()).unwrap_or(false);
-            if src_is_dir && !recursive {
-                return Ok(ToolOutcome {
-                    user_message: format!(
-                        "源路径是目录：{src_raw}\n为避免误操作，请显式设置 recursive:true。",
-                    ),
-                    log_lines: vec![format!(
-                        "状态:ok_need_confirm | 耗时:{}ms | op:{} | recursive:0 | src:{}",
-                        started.elapsed().as_millis(),
-                        op,
-                        shorten_path(&src_raw)
-                    )],
-                });
-            }
-            // 目标已存在：默认需要确认；force:true 则备份旧目标再继续。
-            let mut backup_info: Option<String> = None;
-            if dst.exists() && !force {
-                return Ok(ToolOutcome {
-                    user_message: format!(
-                        "目标已存在：{dst_raw}\n为避免覆盖，请显式设置 force:true（覆盖前会把旧目标备份到回收站/本地备份）。"
-                    ),
-                    log_lines: vec![format!(
-                        "状态:ok_need_confirm | 耗时:{}ms | op:{} | force:0 | dst:{}",
-                        started.elapsed().as_millis(),
-                        op,
-                        shorten_path(&dst_raw)
-                    )],
-                });
-            }
-            if dst.exists() && force {
-                match backup_existing_path_to_recycle(&dst) {
-                    Ok((bid, method)) => {
-                        backup_info = Some(format!("backup_trash_id:{bid} method:{method}"));
-                        // copy_only 代表原目标未移走，会导致覆盖失败；此时尝试本地备份移走。
-                        if method == "copy_only" {
-                            let bak = rename_to_local_backup(&dst)?;
-                            backup_info = Some(format!(
-                                "{} | backup_local:{}",
-                                backup_info.unwrap_or_default(),
-                                shorten_path(&bak.to_string_lossy())
-                            ));
-                        }
-                    }
-                    Err(_) => {
-                        let bak = rename_to_local_backup(&dst)?;
-                        backup_info = Some(format!(
-                            "backup_local:{}",
-                            shorten_path(&bak.to_string_lossy())
-                        ));
-                    }
-                }
-            }
-
-            let mut method = "rename".to_string();
-            let mut stats = CopyStats::default();
-            if op == "move" {
-                if let Err(e) = fs::rename(&src, &dst) {
-                    if !file_manager_is_exdev(&e) {
-                        return Err(anyhow!(e).context("move rename 失败"));
-                    }
-                    // EXDEV：退化为 copy（不删除源，避免真删）
-                    copy_recursive(&src, &dst, &mut stats)?;
-                    method = "exdev_copy_only".to_string();
-                }
-            } else {
-                copy_recursive(&src, &dst, &mut stats)?;
-                method = "copy".to_string();
-            }
-
-            let elapsed = started.elapsed();
-            let mut status = "0".to_string();
-            let mut note = String::new();
-            if method == "exdev_copy_only" {
-                status = "ok_exdev_copied".to_string();
-                note = "\n注意：跨文件系统（EXDEV），已复制到目标，但未删除源路径。".to_string();
-            }
-            let mut msg = format!(
-                "{op} 完成：\nsrc: {src_raw}\ndst: {dst_raw}\nmethod: {method}\nfiles:{} dirs:{} bytes:{} ({}){note}",
-                stats.files,
-                stats.dirs,
-                stats.bytes,
-                format_bytes(stats.bytes),
-            );
-            if let Some(bk) = backup_info.as_deref() {
-                msg.push_str(&format!("\n{bk}"));
-            }
-            Ok(ToolOutcome {
-                user_message: msg,
-                log_lines: vec![format!(
-                    "状态:{status} | 耗时:{}ms | op:{} | src:{} | dst:{} | method:{} | force:{} | recursive:{} | files:{} | dirs:{} | bytes:{}",
-                    elapsed.as_millis(),
-                    op,
-                    shorten_path(&src_raw),
-                    shorten_path(&dst_raw),
-                    method,
-                    if force { 1 } else { 0 },
-                    if recursive { 1 } else { 0 },
-                    stats.files,
-                    stats.dirs,
-                    stats.bytes
-                )],
-            })
-        }
-        _ => Ok(ToolOutcome {
-            user_message: format!("file_manager 不支持的 op：{op}"),
-            log_lines: vec![format!(
-                "状态:fail | 耗时:{}ms | op:{}",
-                started.elapsed().as_millis(),
-                op
-            )],
-        }),
-    }
-}
-
-#[derive(Debug)]
-struct MemoryBlock {
-    start_line: usize,
-    end_line: usize,
-    lines: Vec<String>,
-}
-
-fn parse_memory_keywords(pattern: &str) -> Vec<String> {
-    let mut normalized = pattern.to_string();
-    for sep in ['，', ',', '、', '|', ';', '；', '/', '\\', '\n', '\t'] {
-        normalized = normalized.replace(sep, " ");
-    }
-    normalized
-        .split_whitespace()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-}
-
-fn dedup_keywords(keywords: &[String], cap: usize) -> Vec<String> {
-    use std::collections::HashSet;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<String> = Vec::new();
-    for kw in keywords {
-        let t = kw.trim().to_ascii_lowercase();
-        if t.is_empty() {
-            continue;
-        }
-        if seen.insert(t.clone()) {
-            out.push(t);
-        }
-        if out.len() >= cap {
-            break;
-        }
-    }
-    out
-}
-
-fn parse_memory_date(raw: &str) -> Option<NaiveDate> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        return Some(date);
-    }
-    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.len() >= 8 {
-        let y = digits.get(0..4)?.parse::<i32>().ok()?;
-        let m = digits.get(4..6)?.parse::<u32>().ok()?;
-        let d = digits.get(6..8)?.parse::<u32>().ok()?;
-        return NaiveDate::from_ymd_opt(y, m, d);
-    }
-    None
-}
-
-fn parse_memory_date_range(
-    start_raw: &str,
-    end_raw: &str,
-) -> Result<(Option<NaiveDate>, Option<NaiveDate>), &'static str> {
-    let start_raw = start_raw.trim();
-    let end_raw = end_raw.trim();
-    let mut start = if start_raw.is_empty() {
-        None
-    } else {
-        Some(parse_memory_date(start_raw).ok_or("start_date 无效")?)
-    };
-    let mut end = if end_raw.is_empty() {
-        None
-    } else {
-        Some(parse_memory_date(end_raw).ok_or("end_date 无效")?)
-    };
-    if start.is_some() && end.is_none() {
-        end = start;
-    }
-    if end.is_some() && start.is_none() {
-        start = end;
-    }
-    if let (Some(left), Some(right)) = (start, end)
-        && left > right
-    {
-        start = Some(right);
-        end = Some(left);
-    }
-    Ok((start, end))
-}
-
-#[derive(Clone, Copy, Debug)]
-enum MemoDateRegion {
-    Recent7d,
-    Past1y,
-    Older,
-}
-
-fn parse_memo_date_region(raw: &str) -> Option<MemoDateRegion> {
-    let t = raw.trim().to_ascii_lowercase();
-    if t.is_empty() {
-        return None;
-    }
-    match t.as_str() {
-        "recent" | "week" | "7d" | "last7" | "last_7" | "最近" | "一周" | "近一周" => {
-            Some(MemoDateRegion::Recent7d)
-        }
-        "past" | "year" | "1y" | "过去" | "一年" | "近一年" => Some(MemoDateRegion::Past1y),
-        "older" | "old" | "以前" | "更早" | "一年以前" | ">1y" => {
-            Some(MemoDateRegion::Older)
-        }
-        _ => None,
-    }
-}
-
-fn call_region_or_section(call: &ToolCall) -> String {
-    let r = call.region.as_deref().unwrap_or("").trim();
-    if !r.is_empty() {
-        return r.to_string();
-    }
-    call.section.as_deref().unwrap_or("").trim().to_string()
-}
-
-fn default_date_range_for_region(region: MemoDateRegion) -> (Option<NaiveDate>, Option<NaiveDate>) {
-    let today = Local::now().date_naive();
-    let recent_start = today - chrono::Duration::days(7);
-    let one_year_ago = today - chrono::Duration::days(365);
-    let older_end = one_year_ago - chrono::Duration::days(1);
-    let past_end = recent_start - chrono::Duration::days(1);
-    match region {
-        MemoDateRegion::Recent7d => (Some(recent_start), Some(today)),
-        MemoDateRegion::Past1y => (Some(one_year_ago), Some(past_end)),
-        MemoDateRegion::Older => (None, Some(older_end)),
-    }
-}
-
-fn extract_block_date(block: &MemoryBlock) -> Option<NaiveDate> {
-    let head = block.lines.first()?.trim();
-    parse_memory_date(head)
-}
-
-fn collect_memory_blocks(text: &str) -> Vec<MemoryBlock> {
-    let mut blocks = Vec::new();
-    let mut current: Vec<String> = Vec::new();
-    let mut start_line = 0usize;
-    for (idx, line) in text.lines().enumerate() {
-        let line_no = idx + 1;
-        if line.trim().is_empty() {
-            if !current.is_empty() {
-                blocks.push(MemoryBlock {
-                    start_line,
-                    end_line: line_no.saturating_sub(1),
-                    lines: std::mem::take(&mut current),
-                });
-                start_line = 0;
-            }
-            continue;
-        }
-        if current.is_empty() && line.trim_start().starts_with('#') {
-            continue;
-        }
-        if current.is_empty() {
-            start_line = line_no;
-        }
-        current.push(line.to_string());
-    }
-    if !current.is_empty() {
-        let end_line = text.lines().count().max(start_line);
-        blocks.push(MemoryBlock {
-            start_line,
-            end_line,
-            lines: current,
-        });
-    }
-    blocks
-}
-
-fn memo_row_header(content: &str) -> String {
-    content
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "(空记录)".to_string())
-}
-
-fn memo_row_preview(content: &str, keywords: &[String]) -> Option<String> {
-    if keywords.is_empty() {
-        return None;
-    }
-    for line in content.lines() {
-        let lower = line.to_ascii_lowercase();
-        if keywords.iter().any(|kw| lower.contains(kw)) {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn render_memo_rows(rows: &[MemoRow]) -> String {
-    let mut out = String::new();
-    for (idx, row) in rows.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        out.push_str(&format!("[L{}]\n", row.rownum));
-        out.push_str(row.content.trim_end());
-        out.push('\n');
-    }
-    out.trim_end().to_string()
 }
 
 fn run_memory_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
@@ -6529,10 +6048,7 @@ fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolO
             rows.len()
         );
         if let Some(meta) = saved.as_ref() {
-            log.push_str(&format!(
-                " | saved:{} | saved_bytes:{} | saved_lines:{}",
-                meta.path, meta.bytes, meta.lines
-            ));
+            log.push_str(&format!(" | saved:{}", meta.path));
         }
         return Ok(ToolOutcome {
             user_message: body2,
@@ -6638,7 +6154,7 @@ fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolO
             }
             continue;
         }
-        if label == "fastmemo" {
+        if label == "fastmemo" || label == "scopememo" {
             collected.push(line);
             collecting = true;
             continue;
@@ -6730,8 +6246,8 @@ fn run_memory_edit(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let Some((label, path)) = resolve_memory_path_label(raw) else {
         return Ok(tool_format_error("memory_edit", "缺少有效 path"));
     };
-    if label != "fastmemo" {
-        return Ok(tool_format_error("memory_edit", "仅支持 fastmemo"));
+    if label != "fastmemo" && label != "scopememo" {
+        return Ok(tool_format_error("memory_edit", "仅支持 fastmemo/scopememo"));
     }
     ensure_memory_file(&label, &path)?;
     let section_raw = call.section.as_deref().unwrap_or("").trim();
@@ -7117,8 +6633,8 @@ fn run_memory_add(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let Some((label, path)) = resolve_memory_path_label(raw) else {
         return Ok(tool_format_error("memory_add", "缺少有效 path"));
     };
-    if label != "fastmemo" {
-        return Ok(tool_format_error("memory_add", "仅支持 fastmemo"));
+    if label != "fastmemo" && label != "scopememo" {
+        return Ok(tool_format_error("memory_add", "仅支持 fastmemo/scopememo"));
     }
     let content = call.content.as_deref().unwrap_or("").trim();
     if content.is_empty() {
@@ -7251,7 +6767,7 @@ fn run_system_config(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 }
 
 pub(crate) fn ensure_memory_file(label: &str, path: &str) -> anyhow::Result<()> {
-    if label != "fastmemo" {
+    if label != "fastmemo" && label != "scopememo" {
         MemoDb::open_default().ok();
         return Ok(());
     }
@@ -7286,7 +6802,7 @@ pub(crate) fn ensure_memory_file(label: &str, path: &str) -> anyhow::Result<()> 
     }
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let header = match label {
-        "fastmemo" => {
+        "fastmemo" | "scopememo" => {
             build_fastmemo_v3_template(&now.to_string(), &std::collections::HashMap::new())
         }
         "datememo" => format!(
@@ -7465,22 +6981,17 @@ fn truncate_command_output(text: String) -> String {
     joined.trim().to_string()
 }
 
-fn truncate_tool_payload(text: &str, max_lines: usize, max_chars: usize) -> String {
+pub(crate) fn truncate_tool_payload(text: &str, max_lines: usize, max_chars: usize) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let (mut body, truncated_by_lines) = truncate_by_lines(text, max_lines);
-    let (body2, truncated_by_chars) = truncate_owned_by_chars(body, max_chars);
+    let (mut body, _truncated_by_lines) = truncate_by_lines(text, max_lines);
+    let (body2, _truncated_by_chars) = truncate_owned_by_chars(body, max_chars);
     body = body2;
-    if truncated_by_lines || truncated_by_chars {
-        body.push_str(&format!(
-            "\n\n[输出已截断：保留头尾，最多 {max_lines} 行 / {max_chars} 字符；建议缩小范围或分段读取以获取精确信息]"
-        ));
-    }
     body
 }
 
-fn build_preview(text: &str, limit: usize) -> String {
+pub(crate) fn build_preview(text: &str, limit: usize) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
         return "(空)".to_string();
@@ -7529,6 +7040,8 @@ fn memory_label_for_path(path: &str) -> String {
         "metamemo".to_string()
     } else if lower.contains("datememo") {
         "datememo".to_string()
+    } else if lower.contains("scopememo") {
+        "scopememo".to_string()
     } else if lower.contains("fastmemo") {
         "fastmemo".to_string()
     } else {
@@ -7541,6 +7054,11 @@ fn resolve_memory_path_label(raw: &str) -> Option<(String, String)> {
         return None;
     }
     let lower = raw.trim().to_ascii_lowercase();
+    if lower.starts_with("scopememo:") || lower.starts_with("scope:") {
+        let name = raw.trim().splitn(2, ":").nth(1).unwrap_or("").trim();
+        let rel = crate::memory_scope::scopememo_rel_path(name)?;
+        return Some(("scopememo".to_string(), normalize_tool_path(&rel)));
+    }
     if lower.contains("metamemo") {
         return Some(("metamemo".to_string(), memory_path_for_key("metamemo")?));
     }
@@ -7569,6 +7087,13 @@ fn resolve_memory_path_label(raw: &str) -> Option<(String, String)> {
 
 fn memory_paths_for_check(raw: &str) -> Vec<(String, String)> {
     let target = raw.trim().to_ascii_lowercase();
+    if target.starts_with("scopememo:") || target.starts_with("scope:") {
+        let name = raw.trim().splitn(2, ":").nth(1).unwrap_or("").trim();
+        if let Some(rel) = crate::memory_scope::scopememo_rel_path(name) {
+            return vec![("scopememo".to_string(), normalize_tool_path(&rel))];
+        }
+        return vec![];
+    }
     if target.is_empty() {
         return vec![
             ("datememo".to_string(), "memory/datememo".to_string()),
@@ -7614,27 +7139,6 @@ fn pick_path(call: &ToolCall) -> anyhow::Result<String> {
     }
 }
 
-fn pick_write_fields(call: &ToolCall) -> anyhow::Result<(String, String)> {
-    let path = call
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let content = call.content.as_ref().map(|s| s.to_string());
-    if let Some(path) = path {
-        let body = content.unwrap_or_else(|| call.input.to_string());
-        return Ok((normalize_tool_path(path), body));
-    }
-    if content.is_some() {
-        let input_path = call.input.trim();
-        if input_path.is_empty() {
-            return Err(anyhow!("write_file 需要 path"));
-        }
-        return Ok((normalize_tool_path(input_path), content.unwrap_or_default()));
-    }
-    Err(anyhow!("write_file 需要 path 与 content"))
-}
-
 #[allow(dead_code)]
 fn bytes_preview_hex(bytes: &[u8], limit: usize) -> String {
     let len = bytes.len().min(limit);
@@ -7667,20 +7171,6 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
         format!("./{display}")
     }
 
-    fn format_line_range(start: Option<usize>, max: Option<usize>) -> Option<String> {
-        let start = start.unwrap_or(0);
-        let max = max.unwrap_or(0);
-        if start == 0 {
-            return None;
-        }
-        let begin = start.max(1);
-        if max > 0 {
-            let end = begin.saturating_add(max.saturating_sub(1));
-            Some(format!("{begin}-{end}"))
-        } else {
-            Some(format!("{begin}-..."))
-        }
-    }
 
     fn format_date_range(start: Option<NaiveDate>, end: Option<NaiveDate>) -> Option<String> {
         if start.is_none() && end.is_none() {
@@ -7745,13 +7235,19 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
                     if let Some(id) = call.job_id.filter(|v| *v > 0) {
                         ids.push(id);
                     }
+                    if let Some(id) = call.pid.filter(|v| *v > 0) {
+                        ids.push(id);
+                    }
                     if let Some(list) = call.job_ids.as_ref() {
+                        ids.extend(list.iter().copied().filter(|v| *v > 0));
+                    }
+                    if let Some(list) = call.pids.as_ref() {
                         ids.extend(list.iter().copied().filter(|v| *v > 0));
                     }
                     ids.sort_unstable();
                     ids.dedup();
                     let job = if ids.is_empty() {
-                        "(missing job_id/job_ids)".to_string()
+                        "(missing pid/pids/job_id/job_ids)".to_string()
                     } else if ids.len() == 1 {
                         ids[0].to_string()
                     } else {
@@ -7809,59 +7305,6 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
                 s.push_str(&display_tool_path(cwd));
             }
             build_preview(&s, limit)
-        }
-        "read_file" | "stat_file" => {
-            let path = call.path.as_deref().unwrap_or(call.input.trim());
-            let mut display = if call.tool == "read_file" && call.memory.unwrap_or(false) {
-                let raw = path.trim();
-                if raw.is_empty() {
-                    "mem:(missing path)".to_string()
-                } else {
-                    format!("mem:{raw}")
-                }
-            } else {
-                display_tool_path(path)
-            };
-            if call.tool == "read_file" {
-                let max_lines = call
-                    .max_lines
-                    .unwrap_or(TOOL_OUTPUT_MAX_LINES)
-                    .clamp(1, READ_MAX_LINES_CAP);
-                if call.tail.unwrap_or(false) {
-                    display = format!("{display} tail:{max_lines}");
-                } else if call.head.unwrap_or(false) && call.start_line.is_none() {
-                    display = format!("{display} head:{max_lines}");
-                } else if let Some(range) = format_line_range(call.start_line, call.max_lines) {
-                    display = format!("{display} lines:{range}");
-                } else if call.full.unwrap_or(false) {
-                    display = format!("{display} full");
-                } else {
-                    display = format!("{display} peek");
-                }
-            }
-            build_preview(&display, limit)
-        }
-        "list_dir" => {
-            let path = call.path.as_deref().unwrap_or(call.input.trim());
-            build_preview(&display_tool_path(path), limit)
-        }
-        "write_file" => {
-            let path = call
-                .path
-                .as_deref()
-                .or_else(|| call.content.as_ref().map(|_| call.input.trim()))
-                .unwrap_or("");
-            let bytes = call
-                .content
-                .as_ref()
-                .map(|c| c.len())
-                .unwrap_or(call.input.len());
-            if path.is_empty() {
-                build_preview("(missing path)", limit)
-            } else {
-                let display = display_tool_path(path);
-                build_preview(&format!("{display} ({bytes} bytes)"), limit)
-            }
         }
         "search" => {
             let raw_pattern = call.pattern.as_deref().unwrap_or(call.input.trim());
@@ -8024,62 +7467,26 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
             };
             build_preview(category, limit)
         }
-        "file_manager" => {
-            let op = call.op.as_deref().unwrap_or("").trim().to_ascii_lowercase();
-            match op.as_str() {
-                "list" | "stat" | "trash" => {
-                    let raw = call
-                        .path
-                        .as_deref()
-                        .or(call.src.as_deref())
-                        .unwrap_or(call.input.trim())
-                        .trim();
-                    let p = if raw.is_empty() { "." } else { raw };
-                    build_preview(&format!("{op} {}", display_tool_path(p)), limit)
-                }
-                "restore" => {
-                    let id = call.trash_id.as_deref().unwrap_or("").trim();
-                    let force = call.force.unwrap_or(false);
-                    let suffix = if force { " force" } else { "" };
-                    build_preview(&format!("restore {id}{suffix}"), limit)
-                }
-                "copy" | "move" => {
-                    let src = call.src.as_deref().unwrap_or("").trim();
-                    let dst = call.dst.as_deref().unwrap_or("").trim();
-                    let force = call.force.unwrap_or(false);
-                    let recursive = call.recursive.unwrap_or(false);
-                    let mut extra = String::new();
-                    if force {
-                        extra.push_str(" force");
-                    }
-                    if recursive {
-                        extra.push_str(" recursive");
-                    }
-                    build_preview(
-                        &format!(
-                            "{op} {} -> {}{extra}",
-                            display_tool_path(src),
-                            display_tool_path(dst)
-                        ),
-                        limit,
-                    )
-                }
-                "search" => {
-                    let mode = call.mode.as_deref().unwrap_or("content").trim();
-                    let pattern = call.pattern.as_deref().unwrap_or(call.input.trim()).trim();
-                    let root = call
-                        .root
-                        .as_deref()
-                        .or(call.path.as_deref())
-                        .or(call.src.as_deref())
-                        .unwrap_or(".")
-                        .trim();
-                    build_preview(
-                        &format!("search[{mode}] {pattern} in {}", display_tool_path(root)),
-                        limit,
-                    )
-                }
-                _ => build_preview(&call.input, limit),
+        "list" => {
+            let op = call.op.as_deref().unwrap_or("dir").trim().to_ascii_lowercase();
+            let cwd = call.cwd.as_deref().unwrap_or(".").trim();
+            let cwd = if cwd.is_empty() { "." } else { cwd };
+            let depth = call.depth.unwrap_or(LIST_MAX_DEPTH_DEFAULT);
+            let file_count = call
+                .names
+                .as_ref()
+                .map(|v| v.iter().filter(|s| !s.trim().is_empty()).count())
+                .unwrap_or(0);
+            if op == "files" {
+                build_preview(
+                    &format!("files name:{} in {}", file_count, display_tool_path(cwd)),
+                    limit,
+                )
+            } else {
+                build_preview(
+                    &format!("dir depth:{} in {}", depth, display_tool_path(cwd)),
+                    limit,
+                )
             }
         }
         _ => build_preview(&call.input, limit),
@@ -8092,15 +7499,12 @@ pub fn tool_display_label(tool: &str) -> String {
         "bash" => "BASH",
         "adb" => "SHELL",
         "termux_api" => "TERMUX",
-        "plan" | "work" => "PLAN",
         "read_file" => "READ",
         "write_file" => "WRITE",
-        "list_dir" => "LIST",
-        "stat_file" => "INFO",
         "search" => "SEARCH",
         "edit_file" => "EDIT",
         "apply_patch" => "PATCH",
-        "file_manager" => "MANAGE",
+        "list" => "LIST",
         "memory_check" => "MFIND",
         "memory_read" => "MREAD",
         "memory_edit" => "MEDIT",
@@ -8108,12 +7512,52 @@ pub fn tool_display_label(tool: &str) -> String {
         "mind_msg" => "MIND",
         "system_config" => "SYS",
         "skills_mcp" => "SKILLS",
+        "pty" => "Terminal",
         _ => tool.trim(),
     }
     .to_string()
 }
-fn shorten_path(raw: &str) -> String {
+pub(crate) fn shorten_path(raw: &str) -> String {
     short_tail_path(raw, 2)
+}
+
+// cwd 的展示规则：
+// - 如果在 $HOME 下：显示为 `~` 或 `~/<rel>`（省 token，避免 Android 沙盒长路径）
+// - 否则：显示真实的绝对路径（便于排查/定位）
+fn short_cwd_display(raw: &str) -> String {
+    let path = raw.trim();
+    if path.is_empty() {
+        return String::new();
+    }
+    let mut p = path.to_string();
+    // 将相对路径先解析成绝对（避免 cwd:system 这种歧义）
+    if !p.starts_with('/') && !p.starts_with('~') {
+        if let Ok(base) = std::env::current_dir() {
+            p = base.join(path).to_string_lossy().to_string();
+        }
+    }
+    // 尝试 canonicalize（失败则直接用解析后的路径）
+    let p = std::fs::canonicalize(&p)
+        .ok()
+        .and_then(|x| x.to_str().map(|s| s.to_string()))
+        .unwrap_or(p);
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home.trim_end_matches('/').to_string();
+    if !home.is_empty() {
+        let home_prefix = format!("{home}/");
+        if p == home {
+            return "~".to_string();
+        }
+        if p.starts_with(&home_prefix) {
+            let rest = p[home_prefix.len()..].trim_start_matches('/');
+            if rest.is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{rest}");
+        }
+    }
+    p
 }
 
 fn short_tail_path(raw: &str, tail_parts: usize) -> String {
@@ -8183,28 +7627,32 @@ fn short_display_path(raw: &str) -> String {
     shorten_path(path)
 }
 
-fn normalize_tool_path(raw: &str) -> String {
+pub(crate) fn normalize_tool_path(raw: &str) -> String {
     let path = raw.trim();
     if path.is_empty() {
         return String::new();
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    if path == "~" || path.starts_with("~/") {
-        if !home.is_empty() {
+    // 工程根别名：home -> ~/AItermux
+    if !home.is_empty() {
+        let project = format!("{home}/AItermux");
+        if path == "." {
+            return ".".to_string();
+        }
+        if path == "~" || path.starts_with("~/") {
             let rest = path.trim_start_matches('~').trim_start_matches('/');
             if rest.is_empty() {
-                return home;
+                return project;
             }
-            return format!("{home}/{rest}");
+            return format!("{project}/{rest}");
         }
-        return path.to_string();
-    }
-    if (path == "home" || path.starts_with("home/")) && !home.is_empty() {
-        let rest = path.trim_start_matches("home").trim_start_matches('/');
-        if rest.is_empty() {
-            return home;
+        if path == "home" || path.starts_with("home/") {
+            let rest = path.trim_start_matches("home").trim_start_matches('/');
+            if rest.is_empty() {
+                return project;
+            }
+            return format!("{project}/{rest}");
         }
-        return format!("{home}/{rest}");
     }
     if path.starts_with('/') {
         return path.to_string();
@@ -8380,13 +7828,13 @@ fn validate_unified_patch(patch: &str) -> Result<(), PatchValidationError> {
     }
     Ok(())
 }
-
 #[derive(Default)]
 struct PatchReport {
     fuzz: bool,
     offset: bool,
     failed: bool,
 }
+
 
 fn parse_patch_report(body: &str) -> PatchReport {
     let mut report = PatchReport::default();
@@ -8409,6 +7857,7 @@ fn run_patch_command(
     patch_text: &str,
     strip: i32,
     dry_run: bool,
+    cwd_exec: &str,
 ) -> anyhow::Result<(i32, String, String, bool)> {
     let strip_arg = format!("-p{strip}");
     let mut args = vec![strip_arg.as_str(), "--forward", "--batch"];
@@ -8425,6 +7874,7 @@ fn run_patch_command(
     };
     let (mut command, timeout_used) = build_command_with_timeout("patch", &args, timeout_secs);
     let mut child = command
+        .current_dir(cwd_exec)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -8457,5 +7907,25 @@ fn run_command_output_with_optional_timeout(
     let timed_out = timeout_used && is_timeout_status(code);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    // Termux 环境下可能存在“被覆盖到 PATH 的不可执行 rg”（例如被某些工具链注入的 musl 二进制）。
+    // 这会导致 search 工具走 rg 时稳定返回 127（cannot execute / required file not found）。
+    // 这里做一次兜底：检测到典型错误后改用 Termux 自带的 rg 路径重试。
+    if program == "rg"
+        && code == 127
+        && (stderr.contains("cannot execute") || stderr.contains("required file not found"))
+    {
+        let termux_rg = "/data/data/com.termux/files/usr/bin/rg";
+        if Path::new(termux_rg).is_file() {
+            let (mut cmd2, timeout_used2) =
+                build_command_with_optional_timeout(termux_rg, args, timeout_secs);
+            if let Ok(out2) = cmd2.output() {
+                let code2 = status_code(out2.status.code());
+                let timed_out2 = timeout_used2 && is_timeout_status(code2);
+                let stdout2 = String::from_utf8_lossy(&out2.stdout).to_string();
+                let stderr2 = String::from_utf8_lossy(&out2.stderr).to_string();
+                return Ok((code2, stdout2, stderr2, timed_out2));
+            }
+        }
+    }
     Ok((code, stdout, stderr, timed_out))
 }

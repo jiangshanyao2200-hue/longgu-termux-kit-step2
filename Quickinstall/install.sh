@@ -233,6 +233,7 @@ sync_system_tree
 
 log "覆盖 Termux 启动链路文件"
 install_file "$QUICK_ROOT/deploy/termux/motd.sh" "$HOME/.termux/motd.sh" 0755
+install_file "$QUICK_ROOT/deploy/termux/termux.properties" "$HOME/.termux/termux.properties" 0644
 install_file "$QUICK_ROOT/deploy/termux/login.sh" "$PREFIX_DIR/bin/login" 0755
 install_file "$QUICK_ROOT/deploy/termux/etc-motd.sh" "$PREFIX_DIR/etc/motd.sh" 0755
 install_file "$QUICK_ROOT/deploy/termux/termux-login.sh" "$PREFIX_DIR/etc/termux-login.sh" 0755

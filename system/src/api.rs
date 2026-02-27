@@ -138,6 +138,15 @@ fn normalize_role_for_codex(role: &str) -> &'static str {
     }
 }
 
+fn content_type_for_codex(role: &str) -> &'static str {
+    match normalize_role_for_codex(role) {
+        // responses API 的历史 assistant 消息必须是 output_text/refusal；
+        // 我们这里只回放普通文本，统一使用 output_text。
+        "assistant" => "output_text",
+        _ => "input_text",
+    }
+}
+
 pub(crate) fn build_codex_input_messages(messages: &[ApiMessage]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
@@ -145,23 +154,27 @@ pub(crate) fn build_codex_input_messages(messages: &[ApiMessage]) -> Vec<Value> 
         if text.is_empty() {
             continue;
         }
+        let role = normalize_role_for_codex(&msg.role);
+        let content_type = content_type_for_codex(role);
         out.push(json!({
-            "role": normalize_role_for_codex(&msg.role),
+            "role": role,
             "content": [
                 {
-                    "type": "input_text",
+                    "type": content_type,
                     "text": text,
                 }
             ],
         }));
     }
     if out.is_empty() {
+        let placeholder = crate::context::role_needed_user_placeholder_to(None);
         out.push(json!({
             "role": "user",
             "content": [
                 {
                     "type": "input_text",
-                    "text": "continue"
+                    // 最小占位：避免空请求；同时保持零指令语义，防止模型误判为“用户要求继续执行”。
+                    "text": placeholder
                 }
             ],
         }));

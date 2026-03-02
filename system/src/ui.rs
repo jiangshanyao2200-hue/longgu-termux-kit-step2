@@ -1428,6 +1428,7 @@ fn strip_ok_exit_tokens(raw: &str) -> String {
 
 fn normalize_tool_display(tool: &str, raw_cmd: &str) -> (String, String) {
     let tool_key = tool.trim();
+    let tool_upper = tool_key.to_ascii_uppercase();
     let tool_name = match tool_key {
         "MEdit" | "memory_edit" => "编织记忆",
         "MAdd" | "memory_add" => "添加记忆",
@@ -1445,6 +1446,9 @@ fn normalize_tool_display(tool: &str, raw_cmd: &str) -> (String, String) {
         return (tool_name, String::new());
     }
     if tool_key.eq_ignore_ascii_case("list") {
+        return (tool_name, cmd);
+    }
+    if tool_upper == "LIST" {
         return (tool_name, cmd);
     }
     if tool_key.eq_ignore_ascii_case("search") {
@@ -1473,10 +1477,19 @@ fn normalize_tool_display(tool: &str, raw_cmd: &str) -> (String, String) {
             | "MAdd"
             | "MRead"
             | "MFind"
+            | "MemoryAdd"
+            | "MemoryRead"
+            | "MemoryCheck"
             | "memory_edit"
             | "memory_add"
             | "memory_read"
             | "memory_check"
+    ) {
+        return (tool_name, normalize_memory_target(&cmd));
+    }
+    if matches!(
+        tool_upper.as_str(),
+        "MADD" | "MREAD" | "MFIND" | "MEMORYADD" | "MEMORYREAD" | "MEMORYCHECK"
     ) {
         return (tool_name, normalize_memory_target(&cmd));
     }
@@ -1485,6 +1498,9 @@ fn normalize_tool_display(tool: &str, raw_cmd: &str) -> (String, String) {
         tool_key,
         "Run" | "bash" | "Bash" | "BASH" | "Shell" | "Termux"
     ) {
+        return (tool_name, cmd);
+    }
+    if matches!(tool_upper.as_str(), "BASH" | "SHELL" | "TERMUX") {
         return (tool_name, cmd);
     }
 
@@ -1571,15 +1587,15 @@ fn normalize_tool_display(tool: &str, raw_cmd: &str) -> (String, String) {
 fn tool_compact_title_parts(tool_raw: &str) -> (String, String, String) {
     let key = tool_raw.trim();
     match key {
-        "Shell" => ("Worked with ".to_string(), "ADB".to_string(), String::new()),
-        "Run" => ("Ran ".to_string(), "CMD".to_string(), String::new()),
+        // 工具名称（黄色）与非工具文本（白色）拆分：满足 UI 规范（例如 ADB Shell、TERMUX api 等）。
         "bash" | "Bash" | "BASH" => ("Ran ".to_string(), "Bash".to_string(), String::new()),
-        "adb" | "ADB" => ("Ran ".to_string(), "ADB".to_string(), String::new()),
-        "termux_api" | "Termux" => (String::new(), "Termux".to_string(), " API".to_string()),
-        "MAdd" => (String::new(), "Memory".to_string(), " Add".to_string()),
-        "MEdit" => (String::new(), "Memory".to_string(), " Edit".to_string()),
-        "MRead" => (String::new(), "Memory".to_string(), " Read".to_string()),
-        "MFind" => (String::new(), "Memory".to_string(), " Find".to_string()),
+        "SHELL" | "Shell" => ("ADB ".to_string(), "Shell".to_string(), String::new()),
+        "TERMUX" => (String::new(), "TERMUX".to_string(), " api".to_string()),
+        "LIST" => ("Get ".to_string(), "List".to_string(), String::new()),
+        "PATCH" => ("Edited ".to_string(), "Ap".to_string(), String::new()),
+        "MemoryCheck" | "MFIND" => (String::new(), "MemoryCheck".to_string(), String::new()),
+        "MemoryRead" | "MREAD" => (String::new(), "MemoryRead".to_string(), String::new()),
+        "MemoryAdd" | "MADD" => (String::new(), "MemoryAdd".to_string(), String::new()),
         "Write" => (String::new(), "Wrote".to_string(), String::new()),
         "Edit" => (String::new(), "Edited".to_string(), String::new()),
         "Patch" => (String::new(), "Patched".to_string(), String::new()),
@@ -1592,6 +1608,43 @@ fn tool_compact_title_parts(tool_raw: &str) -> (String, String, String) {
         }
         other => (String::new(), other.to_string(), String::new()),
     }
+}
+
+fn extract_tool_patch_lines(text: &str) -> Vec<String> {
+    // 仅用于 apply_patch：从工具消息中提取 PATCH 区块（unified diff）。
+    // 期望形态：
+    // PATCH:
+    // ```diff
+    // ...
+    // ```
+    let mut seen = false;
+    let mut in_fence = false;
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !seen {
+            if trimmed.eq_ignore_ascii_case("patch:") {
+                seen = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with("output:") || trimmed.starts_with("meta:") {
+            break;
+        }
+        if trimmed.starts_with("```") {
+            if in_fence {
+                break;
+            }
+            // 允许 ```diff / ```text / ``` 等
+            in_fence = true;
+            continue;
+        }
+        if !in_fence {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out
 }
 
 fn parse_tool_summary(text: &str) -> (String, Option<String>, Option<String>) {
@@ -1652,6 +1705,7 @@ fn render_tool_detail_lines(
     if width == 0 {
         return Vec::new();
     }
+    let patch_lines = extract_tool_patch_lines(text);
     let (output_lines, meta_lines) = extract_tool_sections(text);
     if output_lines.is_empty() && meta_lines.is_empty() {
         let detail = extract_tool_detail(text);
@@ -1700,6 +1754,32 @@ fn render_tool_detail_lines(
     let heading_style = Style::default().fg(theme.dim).bg(theme.bg);
     let pipe_style = Style::default().fg(theme.dim).bg(theme.bg);
     let content_style = Style::default().fg(theme.fg).bg(theme.bg);
+
+    // PATCH（apply_patch）：按“原始行”展示，不做 wrap，仅对单行做尾部截断。
+    if !patch_lines.is_empty() {
+        out.push(Line::from(vec![Span::styled("  patch:", heading_style)]));
+        let prefix = "  ┆ ";
+        let prefix_w = UnicodeWidthStr::width(prefix);
+        let avail = width.saturating_sub(prefix_w).max(1);
+        const HARD_MAX_PATCH_LINES: usize = 5000; // 极端兜底，避免 TUI 卡死
+        let mut shown = 0usize;
+        for raw in patch_lines.iter().take(HARD_MAX_PATCH_LINES) {
+            let line = sanitize_tool_detail_line(raw).trim_end().to_string();
+            let clipped = truncate_to_width(&line, avail);
+            out.push(Line::from(vec![
+                Span::styled(prefix.to_string(), pipe_style),
+                Span::styled(clipped, content_style),
+            ]));
+            shown = shown.saturating_add(1);
+        }
+        if patch_lines.len() > HARD_MAX_PATCH_LINES {
+            let note = format!("... [truncated: >{HARD_MAX_PATCH_LINES} patch lines]");
+            out.push(Line::from(vec![
+                Span::styled(prefix.to_string(), pipe_style),
+                Span::styled(truncate_to_width(&note, avail), heading_style),
+            ]));
+        }
+    }
 
     let mut push_section = |title: &str, lines: &[String], max_lines: usize, max_chars: usize| {
         if lines.is_empty() {
@@ -2347,6 +2427,7 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
     let DrawHeaderArgs {
         theme,
         area,
+        center,
         main_mode: _main_mode,
         dog_mode: _dog_mode,
         user_active: _user_active,
@@ -2354,7 +2435,7 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
         tick: _tick,
         run_secs,
     } = args;
-    // 顶栏一行：左（品牌静态）/右（运行时间）
+    // 顶栏一行：左（品牌静态）/中（提示）/右（运行时间）
     // 约束：顶栏不要展示 Working/Connecting/Ready 等动态状态（避免噪声与误导）。
     let block = Block::default()
         .borders(Borders::NONE)
@@ -2454,6 +2535,32 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
             .style(Style::default().bg(theme.bg));
         f.render_widget(left_p, left_area);
     }
+
+    // 中间：提示文本（例如 Memory 面板展开时显示 “Memory”）。仅在有空间时渲染。
+    let center = center.trim();
+    if !center.is_empty() && right_area.x > left_area.x.saturating_add(left_area.width) {
+        let center_x = left_area.x.saturating_add(left_area.width);
+        let center_w = right_area.x.saturating_sub(center_x).max(1);
+        if center_w > 2 {
+            let center_area = Rect {
+                x: center_x,
+                y: line_area.y,
+                width: center_w,
+                height: 1,
+            };
+            let center_p = Paragraph::new(center.to_string())
+                .block(Block::default().borders(Borders::NONE))
+                .style(
+                    Style::default()
+                        .fg(theme.dim)
+                        .bg(theme.bg)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(ratatui::layout::Alignment::Center);
+            f.render_widget(center_p, center_area);
+        }
+    }
+
     let right_p = Paragraph::new(Text::from(right_line))
         .block(Block::default().borders(Borders::NONE))
         .style(Style::default().bg(theme.bg))
@@ -2464,6 +2571,8 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
 pub struct DrawHeaderArgs<'a> {
     pub theme: &'a Theme,
     pub area: Rect,
+    // 顶栏中间提示：不加动态状态，仅用于“面板/模式”提示（例如 Memory）。
+    pub center: &'a str,
     pub main_mode: Mode,
     pub dog_mode: Mode,
     pub user_active: bool,
@@ -2484,6 +2593,340 @@ pub fn draw_chat(
         .block(Block::default().borders(Borders::NONE))
         .scroll((scroll, 0));
     f.render_widget(p, area);
+}
+
+pub fn draw_memory_status_line(
+    f: &mut ratatui::Frame,
+    theme: &Theme,
+    area: Rect,
+    status: &str,
+    busy: bool,
+    tick: usize,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    use unicode_width::UnicodeWidthStr;
+
+    // 左侧：状态（● Thinking... / ● Ready...）；右侧：模块名（萤·记忆模块）。
+    // 动画仅作用于尾部 `...`，且固定宽度 3，避免文字左右跳动。
+    let module = "萤·记忆模块";
+    let module_w = UnicodeWidthStr::width(module) as u16;
+    let right_w = (module_w.saturating_add(1)).min(area.width.max(1));
+    let left_w = area.width.saturating_sub(right_w).max(1);
+    let left_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: left_w,
+        height: area.height,
+    };
+    let right_area = Rect {
+        x: area.x.saturating_add(left_w),
+        y: area.y,
+        width: area.width.saturating_sub(left_w).max(1),
+        height: area.height,
+    };
+
+    let st_module = Style::default()
+        .fg(theme.fg)
+        .bg(theme.bg)
+        .add_modifier(Modifier::BOLD);
+    let p_module = Paragraph::new(module)
+        .block(Block::default().borders(Borders::NONE))
+        .style(st_module)
+        .alignment(ratatui::layout::Alignment::Right)
+        .wrap(Wrap { trim: false });
+    f.render_widget(p_module, right_area);
+
+    let dots = if busy {
+        // 慢一点：避免过快闪烁导致“像在抖”。
+        match (tick / 12) % 4 {
+            0 => "   ",
+            1 => ".  ",
+            2 => ".. ",
+            _ => "...",
+        }
+    } else {
+        "   "
+    };
+    let status_text = format!("● {}{}", status.trim(), dots);
+    let max_w = left_area.width.max(1) as usize;
+    let clipped = truncate_to_width_ellipsis(status_text.as_str(), max_w);
+    let st_status = if busy {
+        Style::default().fg(theme.dim).bg(theme.bg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.dim).bg(theme.bg).add_modifier(Modifier::BOLD)
+    };
+    let p_status = Paragraph::new(clipped)
+        .block(Block::default().borders(Borders::NONE))
+        .style(st_status)
+        .alignment(ratatui::layout::Alignment::Left)
+        .wrap(Wrap { trim: false });
+    f.render_widget(p_status, left_area);
+}
+
+pub struct MemoryPanelDrawResult {
+    pub max_scroll: u16,
+}
+
+pub fn draw_memory_panel(
+    f: &mut ratatui::Frame,
+    theme: &Theme,
+    area: Rect,
+    content: &str,
+    scroll: u16,
+    tick: usize,
+    focused: bool,
+) -> MemoryPanelDrawResult {
+    if area.width == 0 || area.height == 0 {
+        return MemoryPanelDrawResult { max_scroll: 0 };
+    }
+    // Memory 面板是从“顶栏横杠”下拉的附加区域：不使用边框/标题，尽量把空间留给内容。
+    let _ = focused;
+    let wrap_w = area.width.saturating_sub(1).max(1) as usize; // 左侧留 1 格空白
+    let inner_h = area.height.max(1) as usize;
+
+    fn strip_simple_markdown(s: &str) -> String {
+        // 只做“轻量去噪”，避免在这块面板里出现大段 Markdown 符号刷屏。
+        let mut out = s.replace("```", "");
+        out = out.replace("**", "");
+        out = out.replace('`', "");
+        out
+    }
+
+    fn marquee_cells(s: &str, width_cells: usize, tick: usize) -> String {
+        use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+        let s = s.trim();
+        if width_cells == 0 {
+            return String::new();
+        }
+        let s_w = UnicodeWidthStr::width(s);
+        if s_w <= width_cells {
+            return s.to_string();
+        }
+        let gap = "   ";
+        let span_cells = s_w.saturating_add(UnicodeWidthStr::width(gap));
+        if span_cells == 0 {
+            return String::new();
+        }
+        let start_cell = tick % span_cells;
+
+        // looped: s + gap + s
+        let mut looped: Vec<(char, usize)> = Vec::new();
+        for ch in s.chars() {
+            looped.push((ch, UnicodeWidthChar::width(ch).unwrap_or(0).max(1)));
+        }
+        for ch in gap.chars() {
+            looped.push((ch, UnicodeWidthChar::width(ch).unwrap_or(0).max(1)));
+        }
+        for ch in s.chars() {
+            looped.push((ch, UnicodeWidthChar::width(ch).unwrap_or(0).max(1)));
+        }
+        if looped.is_empty() {
+            return String::new();
+        }
+
+        // Find start index by cell offset.
+        let mut idx = 0usize;
+        let mut off = start_cell;
+        while off > 0 && idx < looped.len() {
+            let w = looped[idx].1;
+            if w > off {
+                break;
+            }
+            off = off.saturating_sub(w);
+            idx += 1;
+        }
+        if idx >= looped.len() {
+            idx = 0;
+        }
+
+        let mut out = String::new();
+        let mut used = 0usize;
+        for j in 0..looped.len() {
+            let (ch, w) = looped[(idx + j) % looped.len()];
+            if used.saturating_add(w) > width_cells {
+                break;
+            }
+            out.push(ch);
+            used = used.saturating_add(w);
+            if used >= width_cells {
+                break;
+            }
+        }
+        out
+    }
+
+    let mut wrapped: Vec<Line<'static>> = Vec::new();
+    for raw in content.lines() {
+        let raw = raw.trim_end_matches('\r');
+        let raw = strip_simple_markdown(raw);
+        let is_thinking = raw.starts_with("▶ · Thinking · ");
+        let is_thought = raw.starts_with("▶ · Thought");
+        let is_json_preview = raw.starts_with("// ");
+        if is_thinking {
+            // 思考行：强制单行，不换行；内容做跑马灯（横向滚动）。
+            use unicode_width::UnicodeWidthStr;
+            let prefix = "▶ · Thinking · ";
+            let body = raw.trim_start_matches(prefix);
+            let prefix_w = UnicodeWidthStr::width(prefix);
+            let avail = wrap_w.saturating_sub(prefix_w).max(1);
+            // 跑马灯速度：与流式输出节奏对齐（更快一点），避免“思考已结束但跑马还在慢慢滚”。
+            let body2 = marquee_cells(body, avail, tick.saturating_mul(3));
+            let st_prefix = Style::default().fg(theme.dim).bg(theme.bg).add_modifier(Modifier::BOLD);
+            let st_body = Style::default().fg(theme.dim).bg(theme.bg);
+            wrapped.push(Line::from(vec![
+                Span::styled(" ", st_body),
+                Span::styled(prefix.to_string(), st_prefix),
+                Span::styled(body2, st_body),
+            ]));
+            continue;
+        }
+        if is_thought {
+            // Thought 行：浅灰，保持单行。
+            let st = Style::default().fg(theme.dim).bg(theme.bg);
+            let clipped = truncate_to_width_ellipsis(raw.as_str(), wrap_w);
+            wrapped.push(Line::from(vec![Span::styled(" ", st), Span::styled(clipped, st)]));
+            continue;
+        }
+        if is_json_preview {
+            // 原 tool call（单行）：浅灰跑马灯。tick=0 时保持静止。
+            use unicode_width::UnicodeWidthStr;
+            let prefix = "// ";
+            let body = raw.trim_start_matches(prefix);
+            let prefix_w = UnicodeWidthStr::width(prefix);
+            let avail = wrap_w.saturating_sub(prefix_w).max(1);
+            let body2 = marquee_cells(body, avail, tick.saturating_mul(2));
+            let st = Style::default().fg(theme.dim).bg(theme.bg);
+            wrapped.push(Line::from(vec![
+                Span::styled(" ", st),
+                Span::styled(prefix.to_string(), st),
+                Span::styled(body2, st),
+            ]));
+            continue;
+        }
+
+        if let Some(rest) = raw.strip_prefix("▷ · ") {
+            // 用户消息：浅粉（magenta）加粗，允许换行。
+            let st = Style::default()
+                .fg(theme.magenta)
+                .bg(theme.bg)
+                .add_modifier(Modifier::BOLD);
+            let head = "▷ · ";
+            let head2 = truncate_to_width_ellipsis(head, wrap_w);
+            // 第一行：前缀 + 第一段
+            let mut first = true;
+            for part in wrap_plain_line(rest, wrap_w.saturating_sub(UnicodeWidthStr::width(head))) {
+                if first {
+                    wrapped.push(Line::from(vec![
+                        Span::styled(" ", st),
+                        Span::styled(head2.clone(), st),
+                        Span::styled(part, st),
+                    ]));
+                    first = false;
+                } else {
+                    wrapped.push(Line::from(vec![Span::styled(" ", st), Span::styled(part, st)]));
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = raw.strip_prefix("▶ · ") {
+            // 统一前缀：区分“工具摘要行”和“正文行”。
+            // 工具摘要形态：`MemoryCheck · brief`，且 tool 属于已知集合。
+            let known_tool = |t: &str| {
+                matches!(
+                    t,
+                    "MemoryCheck"
+                        | "MemoryRead"
+                        | "MemoryAdd"
+                        | "Bash"
+                        | "Adb"
+                        | "TermuxApi"
+                        | "List"
+                        | "Patch"
+                        | "Terminal"
+                )
+            };
+            if let Some((tool, _brief)) = rest.split_once(" · ")
+                && known_tool(tool.trim())
+            {
+                let st = Style::default()
+                    .fg(theme.yellow)
+                    .bg(theme.bg)
+                    .add_modifier(Modifier::BOLD);
+                let clipped = truncate_to_width_ellipsis(rest, wrap_w.saturating_sub(UnicodeWidthStr::width("▶ · ") + 1));
+                // 尽量把 tool 与 brief 拆开上色；若截断后无法可靠拆分，整体黄字即可。
+                if let Some((tool2, brief2)) = clipped.split_once(" · ") {
+                    wrapped.push(Line::from(vec![
+                        Span::styled(" ", st),
+                        Span::styled("▶ · ", st),
+                        Span::styled(tool2.to_string(), st),
+                        Span::styled(" · ", st),
+                        Span::styled(brief2.to_string(), st),
+                    ]));
+                } else {
+                    wrapped.push(Line::from(vec![
+                        Span::styled(" ", st),
+                        Span::styled("▶ · ", st),
+                        Span::styled(clipped, st),
+                    ]));
+                }
+            } else {
+                // 正文行：浅白；前缀用浅灰，正文用白。
+                let st_head = Style::default().fg(theme.dim).bg(theme.bg);
+                let st_body = Style::default().fg(theme.fg).bg(theme.bg);
+                let head = "▶ · ";
+                let head_w = UnicodeWidthStr::width(head);
+                let mut first = true;
+                for part in wrap_plain_line(rest, wrap_w.saturating_sub(head_w).max(1)) {
+                    if first {
+                        wrapped.push(Line::from(vec![
+                            Span::styled(" ", st_body),
+                            Span::styled(head.to_string(), st_head),
+                            Span::styled(part, st_body),
+                        ]));
+                        first = false;
+                    } else {
+                        wrapped.push(Line::from(vec![Span::styled(" ", st_body), Span::styled(part, st_body)]));
+                    }
+                }
+            }
+            continue;
+        }
+        for part in wrap_plain_line(raw.as_str(), wrap_w) {
+            let st = Style::default().fg(theme.fg).bg(theme.bg);
+            wrapped.push(Line::from(vec![Span::styled(" ", st), Span::styled(part, st)]));
+        }
+    }
+    if wrapped.is_empty() {
+        f.render_widget(
+            Paragraph::new(Text::from(Vec::<Line<'static>>::new()))
+                .style(Style::default().bg(theme.bg))
+                .block(Block::default().borders(Borders::NONE))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return MemoryPanelDrawResult { max_scroll: 0 };
+    }
+
+    let max_scroll = wrapped.len().saturating_sub(inner_h) as u16;
+    let scroll = if scroll == u16::MAX {
+        max_scroll
+    } else {
+        scroll.min(max_scroll)
+    } as usize;
+    let end = (scroll + inner_h).min(wrapped.len());
+    let visible = wrapped[scroll..end].to_vec();
+
+    let p = Paragraph::new(Text::from(visible))
+        .style(Style::default().bg(theme.bg))
+        .block(Block::default().borders(Borders::NONE))
+        // 不启用 Paragraph 的自动 wrap：上面已经做了手动换行；避免出现“同一行再次 wrap”的视觉跳变。
+        ;
+    f.render_widget(p, area);
+    MemoryPanelDrawResult { max_scroll }
 }
 
 pub struct DrawHintLineArgs<'a> {
@@ -2969,6 +3412,8 @@ pub fn draw_separator(f: &mut ratatui::Frame, args: DrawSeparatorArgs<'_>) {
             match active_kind {
                 MindKind::Main => theme.cyan,
                 MindKind::Sub => theme.magenta,
+                // Memory：避免黄色（更像“警告态”）；用粉白系更符合“记忆面板”的氛围。
+                MindKind::Memory => theme.magenta,
             }
         };
         let highlight = if hint_text.trim().eq_ignore_ascii_case("ready") {
@@ -3019,10 +3464,19 @@ pub fn draw_context_bar(f: &mut ratatui::Frame, theme: &Theme, area: Rect, line:
     }
 
     let max_cells = area.width.max(1) as usize;
+    let fast_part = line
+        .fastmemo_label
+        .map(|label| format!("[{label}]{}/10 ", line.fastmemo_n.min(10)))
+        .unwrap_or_default();
+    let date_part = if line.date_kb_limit == 0 {
+        "Date Off".to_string()
+    } else {
+        format!("Date {}%", line.date_pct)
+    };
     let text = format!(
-        "Ctx {}% Date {}% ↑{} ↓{} T↑{} T↓{} ♡{} ♥{}",
-        line.ctx_pct,
-        line.sc_pct,
+        "{}{}↑{} ↓{} T↑{} T↓{} ♡{} ♥{}",
+        fast_part,
+        date_part,
         format_tokens_m(line.run_in_tokens),
         format_tokens_m(line.run_out_tokens),
         format_tokens_m(line.total_in_tokens),
@@ -3591,6 +4045,10 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
     });
 
     for (msg_idx, msg) in core.history.iter().enumerate() {
+        // Memory 通道消息不进入主聊天时间线（改由顶部 Memory 面板展示）。
+        if msg.mind == Some(MindKind::Memory) {
+            continue;
+        }
         // assistant 占位（空内容）不渲染：避免在“思考/工具阶段”插入任何聊天区提示造成错位。
         if msg.role == Role::Assistant && msg.text.trim().is_empty() {
             continue;
@@ -3959,7 +4417,16 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 } else {
                     target_disp.as_str()
                 };
-                let header_body = if !brief.trim().is_empty() {
+                let is_streaming_tool = streaming_enabled
+                    && extract_tool_status_token(&msg.text)
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("parsing") || s.eq_ignore_ascii_case("running"));
+                // SSE 流式：第一行只显示 tool + brief（即使 brief 暂缺也不回退显示命令），
+                // 命令/输入交给第二行跑马（避免首行在流式阶段频繁跳变）。
+                let header_body = if is_streaming_tool {
+                    let b = if brief.trim().is_empty() { "..." } else { brief.trim() };
+                    truncate_to_width_ellipsis(b, avail_inline)
+                } else if !brief.trim().is_empty() {
                     truncate_to_width_ellipsis(&brief, avail_inline)
                 } else if !target_for_line2.trim().is_empty() {
                     truncate_to_width_middle_ellipsis(target_for_line2.trim(), avail_inline)
@@ -3982,7 +4449,39 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 ]));
 
                 // 第二行：命令/目标（↳）；当 header 已经展示命令（brief 为空）时，不重复展示。
-                if !target_for_line2.trim().is_empty() && !brief.trim().is_empty() {
+                if is_streaming_tool {
+                    // SSE：单行跑马显示“正在编辑的输入”，不换行不超行。
+                    let arrow_style = Style::default()
+                        .fg(theme.dim)
+                        .bg(theme.bg)
+                        .add_modifier(Modifier::ITALIC);
+                    let cmd_style = Style::default()
+                        .fg(theme.fg)
+                        .bg(theme.bg)
+                        .add_modifier(Modifier::ITALIC);
+                    let cmd_avail = avail.saturating_sub(2).max(1);
+                    let raw = if target_for_line2.trim().is_empty() {
+                        "Typing..."
+                    } else {
+                        target_for_line2.trim()
+                    };
+                    let raw = compact_ws_inline(raw);
+                    let sep = "   ";
+                    let base_w = UnicodeWidthStr::width(raw.as_str()).max(1);
+                    let cycle = base_w.saturating_add(UnicodeWidthStr::width(sep)).max(1);
+                    let start = ((tick / 2) % cycle).min(cycle.saturating_sub(1));
+                    let looped = format!("{raw}{sep}{raw}");
+                    let marquee = if UnicodeWidthStr::width(looped.as_str()) <= cmd_avail {
+                        truncate_to_width(&raw, cmd_avail)
+                    } else {
+                        slice_by_cells(&looped, start, cmd_avail)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
+                        Span::styled("↳ ", arrow_style),
+                        Span::styled(marquee, cmd_style),
+                    ]));
+                } else if !target_for_line2.trim().is_empty() && !brief.trim().is_empty() {
                     // 命令行：斜体（包含符号/箭头），避免与正文语义混淆
                     let arrow_style = Style::default()
                         .fg(theme.dim)
@@ -3994,8 +4493,15 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         .add_modifier(Modifier::ITALIC);
                     let cmd_avail = avail.saturating_sub(2).max(1);
                     let chunks = wrap_plain_line(target_for_line2.trim(), cmd_avail);
-                    const CMD_MAX_LINES: usize = 2;
-                    for (i, chunk) in chunks.iter().take(CMD_MAX_LINES).enumerate() {
+                    let cmd_max = if tool_raw.eq_ignore_ascii_case("list")
+                        || tool_raw.eq_ignore_ascii_case("LIST")
+                        || tool_raw.trim().to_ascii_uppercase().starts_with("M")
+                    {
+                        3
+                    } else {
+                        2
+                    };
+                    for (i, chunk) in chunks.iter().take(cmd_max).enumerate() {
                         if chunk.trim().is_empty() {
                             continue;
                         }
@@ -4560,7 +5066,7 @@ mod tests {
         let theme = Theme::cyberpunk();
         let mut core = Core::new();
         core.push_tool(
-            "操作: Shell\nexplain: 安全测试：获取 优化一点 工具解析如果brief过长，允许自动换行。\ninput: shell ls\noutput:\n```text\nOK\n```\nmeta:\n```text\n状态:0 | exit:0 | saved:log/adb-cache/adb_test.log\n```\n"
+            "操作: SHELL\nexplain: 安全测试：获取 优化一点 工具解析如果brief过长，允许自动换行。\ninput: shell ls\noutput:\n```text\nOK\n```\nmeta:\n```text\n状态:0 | exit:0 | saved:log/adb-cache/adb_test.log\n```\n"
                 .to_string(),
         );
 
@@ -4602,7 +5108,7 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("Worked with ADB"));
+        assert!(joined.contains("ADB Shell"));
         assert!(!joined.contains("saved:log/adb-"));
         let joined_no_ws = joined
             .chars()

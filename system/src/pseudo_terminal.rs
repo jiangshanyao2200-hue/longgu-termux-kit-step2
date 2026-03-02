@@ -351,10 +351,12 @@ pub(super) struct PtyDoneBatch {
 pub(super) struct PtyDoneBatches {
     pub(super) main: PtyDoneBatch,
     pub(super) sub: PtyDoneBatch,
+    pub(super) memory: PtyDoneBatch,
     // pty.kill 会导致随后到达的 PtyJobDone 与工具回执重复/冲突。
     // 这里记录“应当抑制 DONE 聚合回执”的 job_id：被 kill 的任务只由 pty.kill 工具回执汇报。
     pub(super) suppress_main: BTreeSet<u64>,
     pub(super) suppress_sub: BTreeSet<u64>,
+    pub(super) suppress_memory: BTreeSet<u64>,
 }
 
 impl PtyDoneBatches {
@@ -362,6 +364,7 @@ impl PtyDoneBatches {
         match owner {
             MindKind::Main => &mut self.main,
             MindKind::Sub => &mut self.sub,
+            MindKind::Memory => &mut self.memory,
         }
     }
 
@@ -369,6 +372,7 @@ impl PtyDoneBatches {
         match owner {
             MindKind::Main => &mut self.suppress_main,
             MindKind::Sub => &mut self.suppress_sub,
+            MindKind::Memory => &mut self.suppress_memory,
         }
     }
 
@@ -2172,6 +2176,213 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
                 )];
             }
         }
+        "input" => {
+            // 向指定 PTY 任务写入 stdin（用于继续自动化：确认/下一条命令等）。
+            //
+            // 约定：
+            // - 需要显式 pid/pids（或 job_id/job_ids），避免误发到错误终端。
+            // - payload 优先取 commands（逐条追加换行）；其次 content；最后 input。
+            // - 默认不强制切换到 Terminal 视图（由用户决定是否打开观察）。
+            const SEND_LOG_TAIL_BYTES: u64 = 48_000;
+            const SEND_INLINE_LOG_MAX_CHARS: usize = 2400;
+            const SEND_EXPORT_THRESHOLD_BYTES: usize = crate::mcp::EXPORT_SAVE_THRESHOLD_BYTES;
+            const PTY_CACHE_DIR: &str = "log/pty-cache";
+
+            fn read_tail_for_preview(path: &str) -> String {
+                let raw = read_tail_text(path, SEND_LOG_TAIL_BYTES).unwrap_or_default();
+                let mut s = raw.replace('\r', "");
+                s.retain(|ch| ch != '\u{0}');
+                let s = s.trim_end().to_string();
+                if s.chars().count() > SEND_INLINE_LOG_MAX_CHARS {
+                    truncate_tail(&s, SEND_INLINE_LOG_MAX_CHARS)
+                } else {
+                    s
+                }
+            }
+
+            fn export_if_needed(text: &str) -> Option<crate::mcp::ExportedOutputMeta> {
+                let bytes = text.as_bytes().len();
+                let lines = text.lines().count();
+                let chars = text.chars().count();
+                if bytes <= SEND_EXPORT_THRESHOLD_BYTES
+                    && lines <= crate::mcp::OUTPUT_MAX_LINES
+                    && chars <= crate::mcp::OUTPUT_MAX_CHARS
+                {
+                    return None;
+                }
+                let _ = fs::create_dir_all(PTY_CACHE_DIR);
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let id = next_pty_done_export_id();
+                let path = format!("{PTY_CACHE_DIR}/pty_input_{now_ms}_{id}.txt");
+                if fs::write(&path, text).is_err() {
+                    return None;
+                }
+                let bytes = fs::metadata(&path)
+                    .ok()
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(bytes);
+                Some(crate::mcp::exported_meta(path, bytes, lines))
+            }
+
+            let mut job_ids: Vec<u64> = Vec::new();
+            if let Some(id) = call.job_id.filter(|v| *v > 0) {
+                job_ids.push(id);
+            }
+            if let Some(id) = call.pid.filter(|v| *v > 0) {
+                job_ids.push(id);
+            }
+            if let Some(ids) = call.job_ids.as_ref() {
+                for id in ids {
+                    if *id > 0 {
+                        job_ids.push(*id);
+                    }
+                }
+            }
+            if let Some(ids) = call.pids.as_ref() {
+                for id in ids {
+                    if *id > 0 {
+                        job_ids.push(*id);
+                    }
+                }
+            }
+            // 兼容模型把 pid/job_id 放进 input 字符串（例如 input:"pid=7" / "7"）。
+            if job_ids.is_empty() {
+                for part in call.input.split(|c: char| !c.is_ascii_digit()) {
+                    let t = part.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if let Ok(n) = t.parse::<u64>() {
+                        if n > 0 {
+                            job_ids.push(n);
+                        }
+                    }
+                }
+            }
+            job_ids.sort_unstable();
+            job_ids.dedup();
+            if job_ids.is_empty() {
+                outcome.user_message = "pty.input 缺少 pid/pids（或 job_id/job_ids）".to_string();
+                let elapsed_ms = started_at.elapsed().as_millis();
+                outcome.log_lines = vec![format!(
+                    "ok:false | result:missing_pid | exit:0 | elapsed_ms:{elapsed_ms} | 状态:fail"
+                )];
+                sys_msg = Some("工具执行失败".to_string());
+                let _ = tx.send(AsyncEvent::ToolStreamEnd { outcome, sys_msg });
+                return;
+            }
+
+            let payload = if let Some(cmds) = call.commands.as_ref().filter(|v| !v.is_empty()) {
+                // commands：逐条发送，默认追加换行，方便“像输入命令一样”执行。
+                let mut joined = cmds.join("\n");
+                if !joined.ends_with('\n') {
+                    joined.push('\n');
+                }
+                joined
+            } else if let Some(c) = call
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                c.to_string()
+            } else {
+                call.input.clone()
+            };
+            if payload.is_empty() {
+                outcome.user_message = "pty.input 缺少 commands/content/input".to_string();
+                let elapsed_ms = started_at.elapsed().as_millis();
+                outcome.log_lines = vec![format!(
+                    "ok:false | result:missing_input | exit:0 | elapsed_ms:{elapsed_ms} | 状态:fail"
+                )];
+                sys_msg = Some("工具执行失败".to_string());
+                let _ = tx.send(AsyncEvent::ToolStreamEnd { outcome, sys_msg });
+                return;
+            }
+            let payload_bytes = payload.as_bytes().to_vec();
+            let bytes_len = payload_bytes.len();
+
+            let now = Instant::now();
+            let mut sent = 0usize;
+            let mut failed = 0usize;
+            let mut lines_out: Vec<String> = Vec::new();
+            lines_out.push(format!("pty.input jobs={} bytes={}", job_ids.len(), bytes_len));
+            for job_id in &job_ids {
+                let info = pty_tabs.iter().find(|s| &s.job_id == job_id).map(|s| {
+                    let elapsed = now.saturating_duration_since(s.started_at).as_secs();
+                    let mut cmd = s.cmd.trim().replace('\n', " ⏎ ").replace('\t', " ");
+                    cmd = truncate_with_suffix(&cmd, 96);
+                    (elapsed, cmd, s.saved_path.clone(), s.status_path.clone())
+                });
+
+                let mut ok = false;
+                if let Some(ctrl) = pty_handles.get(job_id) {
+                    let _ = ctrl.send(PtyControl::Input(payload_bytes.clone()));
+                    ok = true;
+                } else if let Some(state) = pty_tabs.iter().find(|s| &s.job_id == job_id) {
+                    let _ = state.ctrl_tx.send(PtyControl::Input(payload_bytes.clone()));
+                    ok = true;
+                }
+                if ok {
+                    sent = sent.saturating_add(1);
+                } else {
+                    failed = failed.saturating_add(1);
+                }
+
+                if let Some((elapsed, cmd, log_path, status_path)) = info {
+                    if ok {
+                        let log_tail = read_tail_for_preview(&log_path);
+                        lines_out.push(format!(
+                            "# job_id:{job_id} status:sent elapsed:{elapsed}s\ncmd: {cmd}\nlog:{log_path}\nstatus:{status_path}\nlog_tail:\n{log_tail}"
+                        ));
+                    } else {
+                        lines_out.push(format!("# job_id:{job_id} status:fail reason:not_found"));
+                    }
+                } else if ok {
+                    lines_out.push(format!("# job_id:{job_id} status:sent (info missing)"));
+                } else {
+                    lines_out.push(format!("# job_id:{job_id} status:fail reason:not_found"));
+                }
+            }
+            lines_out.push(format!(
+                "summary: sent={sent} failed={failed} total={}",
+                job_ids.len()
+            ));
+
+            let joined = lines_out.join("\n").trim_end().to_string();
+            if let Some(meta) = export_if_needed(&joined) {
+                let preview = crate::mcp::truncate_export_preview(&joined);
+                let mut body = String::new();
+                body.push_str(&crate::mcp::format_exported_notice(&meta));
+                if !preview.trim().is_empty() {
+                    body.push_str("\n\n");
+                    body.push_str(preview.trim_end());
+                }
+                outcome.user_message = body;
+            } else {
+                outcome.user_message = joined;
+            }
+
+            let elapsed_ms = started_at.elapsed().as_millis();
+            if sent == 0 {
+                outcome.log_lines = vec![format!(
+                    "ok:false | result:not_found | exit:0 | elapsed_ms:{elapsed_ms} | 状态:fail"
+                )];
+                sys_msg = Some("工具执行失败".to_string());
+            } else if failed > 0 {
+                outcome.log_lines = vec![format!(
+                    "ok:true | result:partial | exit:0 | elapsed_ms:{elapsed_ms} | 状态:0"
+                )];
+            } else {
+                outcome.log_lines = vec![format!(
+                    "ok:true | result:0 | exit:0 | elapsed_ms:{elapsed_ms} | 状态:0"
+                )];
+            }
+        }
         "run" => {
             // 统一策略：PTY 任务默认保持会话（不自动退出），避免“跑完就关”导致输出来不及观察/复用环境。
             // 若用户需要结束任务：用 pty.kill(pid) 或在 Terminal 视图 350ms 内双击 Esc。
@@ -2367,7 +2578,7 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             return;
         }
         _ => {
-            outcome.user_message = "pty 工具 op 仅支持 run/list/kill".to_string();
+            outcome.user_message = "pty 工具 op 仅支持 run/list/kill/input".to_string();
             let elapsed_ms = started_at.elapsed().as_millis();
             outcome.log_lines = vec![format!(
                 "ok:false | result:unsupported_op | exit:0 | elapsed_ms:{elapsed_ms} | 状态:fail"
@@ -2733,12 +2944,10 @@ pub(super) fn handle_pty_view_key(args: HandlePtyViewKeyArgs<'_>) -> bool {
     }
     // Chat 焦点时：不拦截其它按键，让聊天滚动/其它快捷键继续工作。
     if matches!(*pty_focus, PtyFocus::Chat) {
-        // 终端面板展开时，输入框不显示：避免“键入字符却写进隐藏的 input”。
-        // Chat 焦点仅用于滚动/查看历史消息，因此拦截所有会修改 input 的按键。
-        return matches!(
-            key.code,
-            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab
-        );
+        // 终端面板展开时，输入框仍可见：允许用户在输入框里编辑文本，
+        // 并由 core.rs 决定“Enter 发送到 AI 还是发送到 Terminal”。
+        // 因此这里不再吞掉会修改 input 的按键。
+        return false;
     }
 
     let active = (*pty_active_idx).min(pty_tabs.len().saturating_sub(1));

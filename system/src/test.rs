@@ -351,6 +351,7 @@ fn mind_key(mind: MindKind) -> u8 {
     match mind {
         MindKind::Main => 0,
         MindKind::Sub => 1,
+        MindKind::Memory => 2,
     }
 }
 
@@ -399,6 +400,7 @@ pub(crate) fn contexttest_log_request_start(
     let mind_label = match mind {
         MindKind::Main => "main",
         MindKind::Sub => "dog",
+        MindKind::Memory => "memory",
     };
     let ts = now_ts();
     // 只记录“模型实际收到的上下文”：
@@ -542,6 +544,7 @@ pub(crate) fn contexttest_log_response_end(
     let mind_label = match mind {
         MindKind::Main => "main",
         MindKind::Sub => "dog",
+        MindKind::Memory => "memory",
     };
     let ts = now_ts();
     let mut response = String::new();

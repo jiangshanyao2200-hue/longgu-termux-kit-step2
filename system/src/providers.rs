@@ -167,6 +167,8 @@ impl DogClient {
             req["reasoning"] = json!({ "summary": "detailed" });
         }
 
+        let stream_idle_timeout_secs = self.request_timeout_secs(true).saturating_add(10);
+
         crate::test::contexttest_log_request_start(
             kind,
             request_id,
@@ -177,7 +179,7 @@ impl DogClient {
             self.cfg.reasoning_effort.as_deref(),
             None,
             None,
-            self.request_timeout_secs(true),
+            stream_idle_timeout_secs,
             &messages,
         );
 
@@ -191,7 +193,7 @@ impl DogClient {
                 return Ok(());
             }
 
-            let resp = match self.post_codex_responses(&req, key, self.request_timeout_secs(true)) {
+            let resp = match self.post_codex_responses(&req, key, stream_idle_timeout_secs) {
                 Ok(r) => r,
                 Err(e) => {
                     if Self::is_non_retryable_request_error(&e) {
@@ -587,7 +589,9 @@ impl DogClient {
         request_id: u64,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
-        let mut messages = messages;
+        // 统一的协议层清洗：去空、合并连续 assistant（避免 DeepSeek 400，也让 Codex 请求更稳定）。
+        let mut messages =
+            crate::context::normalize_messages_for_provider(&self.cfg.provider, &messages);
         // DeepSeek（chat/completions）某些实现要求最后一条必须是 user。
         // 工具回执使用 system（避免模型误判为“用户输入”），因此只要最后一条不是 user，
         // 就补一个“零指令语义”的 user 占位，保证协议兼容。
@@ -621,6 +625,7 @@ impl DogClient {
                 }),
             );
         }
+        let stream_idle_timeout_secs = self.request_timeout_secs(true).saturating_add(10);
         crate::trace_startup("run_loop: runlog_event");
         crate::test::runlog_event(
             "INFO",
@@ -635,7 +640,7 @@ impl DogClient {
                 "reasoning_effort": self.cfg.reasoning_effort.as_deref(),
                 "temperature": self.cfg.temperature,
                 "max_tokens": self.cfg.max_tokens,
-                "timeout_secs": self.request_timeout_secs(true),
+                "timeout_secs": stream_idle_timeout_secs,
                 "messages_len": messages.len(),
                 "estimated_in_tokens": crate::estimate_messages_in_tokens(&messages),
                 "messages": &messages,
@@ -673,7 +678,7 @@ impl DogClient {
             self.cfg.reasoning_effort.as_deref(),
             self.cfg.temperature,
             self.cfg.max_tokens,
-            self.request_timeout_secs(true),
+            stream_idle_timeout_secs,
             &messages,
         );
         let max_retries = 3usize;
@@ -686,7 +691,7 @@ impl DogClient {
                 return Ok(());
             }
 
-            let resp = match self.post_deepseek(&req, key, self.request_timeout_secs(true)) {
+            let resp = match self.post_deepseek(&req, key, stream_idle_timeout_secs) {
                 Ok(r) => r,
                 Err(e) => {
                     if Self::is_non_retryable_request_error(&e) {
@@ -889,7 +894,9 @@ impl DogClient {
         request_id: u64,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
-        let mut messages = messages;
+        // 统一的协议层清洗：去空、合并连续 assistant（避免 DeepSeek 400，也让 Codex 请求更稳定）。
+        let mut messages =
+            crate::context::normalize_messages_for_provider(&self.cfg.provider, &messages);
         // DeepSeek（chat/completions）某些实现要求最后一条必须是 user。
         // 工具回执使用 system（避免模型误判为“用户输入”），因此只要最后一条不是 user，
         // 就补一个“零指令语义”的 user 占位，保证协议兼容。

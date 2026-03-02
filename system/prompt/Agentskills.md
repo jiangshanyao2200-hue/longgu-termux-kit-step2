@@ -51,7 +51,7 @@
 
 字段：
 - `op`：`dir` 或 `files`
-- `cwd`：可选。基准目录。不填则默认工作目录~/AItermux/system
+- `cwd`：可选。基准目录。不填则默认工作目录 /data/data/com.termux/files/home/AItermux
 - `op=dir`：列目录（列的是 cwd 目录；`depth` 仅对 op=dir 生效）
 - `op=files`：查看文件信息（`name` 为 cwd 目录下的文件名数组）
 - `name`：文件名数组（同目录下纯文件名，不含 `/`）。单文件也用 name
@@ -76,4 +76,4 @@
 
 ## 记忆管理类
 
-- memory_check / memory_read / memory_add / memory_edit
+- memory_check / memory_read / memory_add

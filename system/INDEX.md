@@ -9,6 +9,9 @@
 - 2026-02-25：移除 `plan/work` 工具：后端路由、提示词与 UI 专用渲染（plan panel / reveal 动画）已清理，避免出现 “● Planning…” 之类的伪工具状态与误导性展示。
 - 2026-02-25：提示词收敛：`prompt/mainprompt.txt` 仅保留“基础稳定工具 + 硬规则”，扩展工具说明迁移到 `prompt/Agentskills.md`（用 `skills_mcp` 按需拉取），并删除 `prompt/mainprompt.full.txt` 以避免双版本漂移。
 - 2026-02-26：文件系统工具再次收敛：移除旧“文件管理器模块”；新增基础工具 `list` 与 `trash`（list 合并 stat；trash 合并 remove/list/restore/empty）；并同步更新提示词与 `skills_mcp` 文档。
+- 2026-02-28：日记/记忆链路修复与收敛：底栏 Date 改为基于 `contextmemo` 文件大小（KB）显示；新增系统配置 `date_kb_limit`（0=关闭）；日记触发条件从 token 计数改为 KB；`memory_add` 支持写入 `datememo/metamemo`（sqlite）；并修复 WaitingMain 阶段的工具过滤（仅保留 datememo 的 `memory_add`），避免误把日记写入当成 `context_compact`。
+- 2026-02-28：`contextmemo` 只记录 user/main：移除 mind 协同消息写入 `contextmemo`，避免日记压缩混入 dog<->main 的中间协同内容。
+- 2026-02-28：Memory 面板收敛：记忆模型使用独立 `prompt/memoryprompt.txt`（允许调用 memory_* 工具）；Memory 面板中的工具回执改为单行摘要（例如 `▶ MemoryRead · ...`），不显示工具详情；所有 provider 请求在发送前统一做协议层消息清洗（去空/合并连续 assistant），降低因供应商切换导致的上下文差异。
 
 ## 0. 项目概述（来自 `README.md` / 测试记录）
 

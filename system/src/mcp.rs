@@ -11,7 +11,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::memory::{DEFAULT_MEMO_DB_PATH, MemoDb, MemoKind, MemoRow};
+use crate::memory::{DEFAULT_MEMO_DB_PATH, DateMemoDayAgg, MemoDb, MemoKind, MemoRow};
 
 const BASH_SHELL: &str = "/data/data/com.termux/files/usr/bin/bash";
 // 在 Termux 场景下，PATH 可能被其它软件注入导致 `rg` 解析到不可执行的 wrapper。
@@ -148,14 +148,42 @@ fn pick_search_output_limits(call: &ToolCall) -> (usize, usize) {
     (lines, chars)
 }
 
+fn pick_memory_output_limits(call: &ToolCall) -> (usize, usize) {
+    // memory_read 专用：metamemo（聊天记录）单日可能很长，允许更高的行数上限，
+    // 但字符上限保持一致，避免单次输出把上下文撑爆。
+    let lvl = call
+        .output_level
+        .as_deref()
+        .unwrap_or("mid")
+        .trim()
+        .to_ascii_lowercase();
+    let (base_lines, base_chars) = match lvl.as_str() {
+        "low" | "l" | "small" => (400usize, 20_000usize),
+        "high" | "h" | "large" => (3000usize, 60_000usize),
+        _ => (1200usize, 40_000usize),
+    };
+    let lines = call.max_lines.unwrap_or(base_lines).clamp(80, 3000);
+    let chars = call.max_chars.unwrap_or(base_chars).clamp(4_000, 60_000);
+    (lines, chars)
+}
+
 fn tool_output_limits_for_history(call: &ToolCall) -> (usize, usize) {
     if call.tool == "search" {
         return pick_search_output_limits(call);
     }
+    if call.tool == "memory_check" {
+        // memory_check 的回执偏“索引列表”，允许略高于通用工具的行数，避免把日期列表截断得太厉害。
+        return (500, 20_000);
+    }
+    if call.tool == "memory_read" {
+        return pick_memory_output_limits(call);
+    }
     (TOOL_OUTPUT_RAW_MAX_LINES, TOOL_OUTPUT_RAW_MAX_CHARS)
 }
 const PATCH_MAX_BYTES: usize = 500_000;
+#[allow(dead_code)]
 pub(crate) const EDIT_MAX_FILE_BYTES: usize = 800_000;
+#[allow(dead_code)]
 pub(crate) const EDIT_MAX_MATCHES: usize = 400;
 const MEMORY_CHECK_DEFAULT_RESULTS: usize = 10;
 const MEMORY_CHECK_MAX_RESULTS: usize = 20;
@@ -397,6 +425,19 @@ pub struct ToolCall {
     // search(format)：输出格式（如 coords 只返回坐标）
     #[serde(default)]
     pub format: Option<String>,
+
+    // memory_check：同日内至少命中多少个“不同关键词”才算命中日（可选，默认自动推断）
+    #[serde(default)]
+    pub min_kw_hits: Option<usize>,
+
+    // memory_read：一次读取多个精确日期（最多 5 个），用于批量回放某几天的日记/聊天记录。
+    // 仅用于 sqlite 的 datememo/metamemo。
+    #[serde(default)]
+    pub dates: Option<Vec<String>>,
+
+    // memory_add：fastmemo 单区压缩写回。compact=true 时先清空该 section 的所有条目，再写入 1 条压缩后的内容。
+    #[serde(default)]
+    pub compact: Option<bool>,
 }
 
 fn parse_list_tokens(raw: &str, max: usize) -> Vec<String> {
@@ -693,6 +734,11 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                     .as_bool()
                     .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
             }
+            "compact" => {
+                call.compact = val
+                    .as_bool()
+                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+            }
             "steps" => {
                 call.steps = parse_steps_value_max(&val, 64);
             }
@@ -838,6 +884,13 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             }
             "max_chars" => {
                 call.max_chars = parse_usize_value(&val);
+            }
+            "min_kw_hits" | "min_hits" => {
+                call.min_kw_hits = parse_usize_value(&val);
+            }
+            "dates" => {
+                // 允许字符串或数组；并限制最多 5 个，避免一次读太多撑爆上下文。
+                call.dates = parse_string_list_value_max(&val, 5);
             }
             "head" => {
                 call.head = val
@@ -1948,7 +2001,7 @@ fastmemo v1 | max_chars: 1800 | updated: 2026-01-27 20:30:13
         assert!(out.contains("[自我感知]"));
         assert!(out.contains("[用户感知]"));
         assert!(out.contains("[环境感知]"));
-        assert!(out.contains("[事件感知]"));
+        assert!(out.contains("[动态上下文]"));
         // 去重后，“冷静理性”只应保留一次（作为 bullet）
         assert_eq!(out.matches("冷静理性").count(), 1);
     }
@@ -2095,6 +2148,22 @@ fn format_tool_message_with_limits(
             &[("INPUT", &input_preview)],
         ));
     }
+
+    // apply_patch：UI 详情态需要完整展示 unified diff（不依赖 INPUT 的 preview）。
+    // 注意：该 PATCH 区块只用于 UI 可视化；模型侧上下文使用 `format_tool_message_for_model`，不会注入完整 diff。
+    if call.tool.trim() == "apply_patch" {
+        let patch_text = call
+            .patch
+            .as_deref()
+            .unwrap_or(call.content.as_deref().unwrap_or(call.input.as_str()))
+            .trim_end();
+        if !patch_text.trim().is_empty() {
+            msg.push_str("PATCH:\n```diff\n");
+            msg.push_str(patch_text);
+            msg.push_str("\n```\n");
+        }
+    }
+
     msg.push_str(&msgs.output_header);
     let output = if outcome.user_message.trim().is_empty() {
         msgs.no_output.to_string()
@@ -2255,7 +2324,8 @@ fn tool_usage(tool: &str) -> &'static str {
         "list" => r#"{"tool":"list","op":"dir","cwd":".","depth":1,"brief":"列目录"}
 {"tool":"list","op":"files","cwd":".","name":["main.rs"],"brief":"查看文件信息"}"#,
         "pty" => {
-            r#"{"tool":"pty","op":"run","commands":["long_task.sh","tail -f log.txt"],"brief":"后台终端任务（默认保持会话）"}"#
+            r#"{"tool":"pty","op":"run","commands":["long_task.sh"],"brief":"后台终端任务（默认保持会话）"}
+{"tool":"pty","op":"input","pid":1,"commands":["echo hi"],"brief":"向指定 PTY 输入"}"#
         }
         _ => r#"{"tool":"<tool>","input":"...","brief":"一句话说明"}"#,
     }
@@ -2348,20 +2418,26 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
             if resolve_memory_path_label(path).is_none() {
                 return Err(tool_format_error(tool, "缺少有效 path"));
             }
-        }
-        "memory_edit" => {
-            let path = call.path.as_deref().unwrap_or(call.input.trim()).trim();
-            let Some((label, _)) = resolve_memory_path_label(path) else {
-                return Err(tool_format_error(tool, "缺少有效 path"));
-            };
-            if label != "fastmemo" {
-                return Err(tool_format_error(tool, "仅支持 fastmemo"));
+            // 收敛协议：memory_read 仅支持 dates 数组（单日也用 dates:["YYYY-MM-DD"]）。
+            // 不再支持 date_start/date_end，避免模型混用两套参数导致误读/误判。
+            if call
+                .date_start
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                || call
+                    .date_end
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Err(tool_format_error(tool, "memory_read 不支持 date_start/date_end；请用 dates"));
             }
-            let section = call.section.as_deref().unwrap_or("").trim();
-            let content = call.content.as_deref().unwrap_or("").trim();
-            let find = call.find.as_deref().unwrap_or("").trim();
-            if !(!section.is_empty() && !content.is_empty()) && find.is_empty() {
-                return Err(tool_format_error(tool, "缺少 find（或 section+content）"));
+            let Some(ds) = call.dates.as_ref().filter(|v| !v.is_empty()) else {
+                return Err(tool_format_error(tool, "memory_read 缺少 dates（YYYY-MM-DD 数组，最多5个）"));
+            };
+            for raw_day in ds.iter().take(5) {
+                if parse_memory_date(raw_day).is_none() {
+                    return Err(tool_format_error(tool, "dates 含无效日期（需 YYYY-MM-DD）"));
+                }
             }
         }
         "memory_add" => {
@@ -2369,16 +2445,17 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
             let Some((label, _)) = resolve_memory_path_label(path) else {
                 return Err(tool_format_error(tool, "缺少有效 path"));
             };
-            if label != "fastmemo" {
-                return Err(tool_format_error(tool, "仅支持 fastmemo"));
-            }
             let content = call.content.as_deref().unwrap_or("").trim();
             if content.is_empty() {
                 return Err(tool_format_error(tool, "缺少 content"));
             }
-            let section = call.section.as_deref().unwrap_or("").trim();
-            if section.is_empty() {
-                return Err(tool_format_error(tool, "fastmemo 需要 section"));
+            if label == "fastmemo" {
+                let section = call.section.as_deref().unwrap_or("").trim();
+                if section.is_empty() {
+                    return Err(tool_format_error(tool, "fastmemo 需要 section"));
+                }
+            } else if label != "datememo" && label != "metamemo" {
+                return Err(tool_format_error(tool, "仅支持 fastmemo/datememo/metamemo"));
             }
         }
         "system_config" => {
@@ -2426,8 +2503,31 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
                         return Err(tool_format_error(tool, "pty.run 缺少 commands/input"));
                     }
                 }
+                "input" => {
+                    let has_single = call.job_id.is_some() || call.pid.is_some();
+                    let has_batch = call
+                        .job_ids
+                        .as_ref()
+                        .is_some_and(|v| v.iter().any(|id| *id > 0));
+                    let has_batch_pid = call
+                        .pids
+                        .as_ref()
+                        .is_some_and(|v| v.iter().any(|id| *id > 0));
+                    if !has_single && !has_batch && !has_batch_pid {
+                        return Err(tool_format_error(
+                            tool,
+                            "pty.input 缺少 pid/pids（或 job_id/job_ids）",
+                        ));
+                    }
+                    let has_cmds = call.commands.as_ref().is_some_and(|v| !v.is_empty());
+                    let has_text = call.content.as_deref().is_some_and(|s| !s.trim().is_empty())
+                        || call.input.trim().len() > 0;
+                    if !has_cmds && !has_text {
+                        return Err(tool_format_error(tool, "pty.input 缺少 commands/content/input"));
+                    }
+                }
                 _ => {
-                    return Err(tool_format_error(tool, "op 仅支持 run/list/kill"));
+                    return Err(tool_format_error(tool, "op 仅支持 run/list/kill/input"));
                 }
             }
         }
@@ -2465,7 +2565,7 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
         _ => {
             return Err(tool_format_error(
                 tool,
-                "未知工具（可用：bash/adb/termux_api/apply_patch/search/pty/list/memory_check/memory_read/memory_edit/memory_add/system_config/skills_mcp）",
+                "未知工具（可用：bash/adb/termux_api/apply_patch/search/pty/list/memory_check/memory_read/memory_add/system_config/skills_mcp）",
             ));
         }
     }
@@ -2582,7 +2682,6 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         "list" => run_list_tool(call),
         "memory_check" => run_memory_check(call),
         "memory_read" => run_memory_read(call),
-        "memory_edit" => run_memory_edit(call),
         "memory_add" => run_memory_add(call),
         "mind_msg" => run_mind_msg(call),
         "system_config" => run_system_config(call),
@@ -2728,11 +2827,11 @@ fn current_dir_display() -> String {
 }
 
 pub(crate) fn default_workdir() -> String {
-    // 工具默认在 AItermux 工程目录执行，避免用户从其它目录启动时“相对路径”失效。
+    // 工具默认在 AItermux 工程根目录执行（~/AItermux），避免把程序目录（~/AItermux/system）当 cwd 误操作。
     //
     // 优先级：
     // 1) AITERMUX_WORKDIR（允许用户显式覆盖）
-    // 2) $HOME/AItermux/system（若存在）
+    // 2) $HOME/AItermux（若存在）
     // 3) 当前进程 cwd
     if let Ok(v) = std::env::var("AITERMUX_WORKDIR") {
         let t = v.trim();
@@ -2743,7 +2842,7 @@ pub(crate) fn default_workdir() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let home = home.trim_end_matches('/').to_string();
     if !home.is_empty() {
-        let p = format!("{home}/AItermux/system");
+        let p = format!("{home}/AItermux");
         if std::fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
             return p;
         }
@@ -2759,6 +2858,8 @@ fn expand_cwd_alias(raw: &str) -> String {
     // - . / ./... : 工程根目录 ~/AItermux
     // - ~ / ~/... : 工程根目录 ~/AItermux
     // - home / home/... : 工程根目录 ~/AItermux
+    // - $HOME / $HOME/... : 工程根目录 ~/AItermux（仅作为 cwd 别名；与系统 HOME 概念区分）
+    // - ${HOME} / ${HOME}/... : 同上
     let s = raw.trim();
     if s.is_empty() {
         return String::new();
@@ -2788,6 +2889,15 @@ fn expand_cwd_alias(raw: &str) -> String {
         return project;
     }
     if let Some(rest) = s.strip_prefix("home/") {
+        return format!("{project}/{rest}");
+    }
+    if s == "$HOME" || s == "${HOME}" {
+        return project;
+    }
+    if let Some(rest) = s.strip_prefix("$HOME/") {
+        return format!("{project}/{rest}");
+    }
+    if let Some(rest) = s.strip_prefix("${HOME}/") {
         return format!("{project}/{rest}");
     }
     s.to_string()
@@ -5678,6 +5788,7 @@ fn run_search_keywords_and(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_edit_file(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let path = if call.memory.unwrap_or(false) {
         let raw = call.path.as_deref().unwrap_or(call.input.trim()).trim();
@@ -5942,7 +6053,7 @@ pub(crate) fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
 }
 
 fn run_memory_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    run_search_memory_like("memory_check", call)
+    run_datememo_check(call)
 }
 
 fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolOutcome> {
@@ -5967,7 +6078,7 @@ fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolO
         if use_slice {
             return Ok(tool_format_error(
                 tool_tag,
-                "sqlite 记忆读取不支持 start_line/max_lines；请使用 date_start（精确日期）",
+                "sqlite 记忆读取不支持 start_line/max_lines；请使用 dates（精确日期数组）",
             ));
         }
         // metamemo 要求显式标记 section=day（当天）
@@ -5982,70 +6093,102 @@ fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolO
                 ));
             }
         }
-        if !has_date {
+        // 收敛协议：仅支持批量 dates（最多 5 天）；单日也用 dates:["YYYY-MM-DD"]。
+        let mut days: Vec<NaiveDate> = Vec::new();
+        if has_date {
             return Ok(tool_format_error(
                 tool_tag,
-                "sqlite 记忆读取需要 date_start/date_end（精确日期）",
+                "memory_read 不支持 date_start/date_end；请用 dates",
             ));
         }
-        let (start_date, end_date) = match parse_memory_date_range(
-            call.date_start.as_deref().unwrap_or(""),
-            call.date_end.as_deref().unwrap_or(""),
-        ) {
-            Ok(range) => range,
-            Err(reason) => return Ok(tool_format_error(tool_tag, reason)),
-        };
-        let Some(day) = start_date.or(end_date) else {
+        let Some(ds) = call.dates.as_ref().filter(|v| !v.is_empty()) else {
             return Ok(tool_format_error(
                 tool_tag,
-                "sqlite 记忆读取需要 date_start/date_end（精确日期）",
+                "sqlite 记忆读取需要 dates（YYYY-MM-DD 数组，最多5个）",
             ));
         };
-        let end = end_date.unwrap_or(day);
-        if day != end {
-            return Ok(tool_format_error(
-                tool_tag,
-                "sqlite 记忆读取仅支持精确到单日",
-            ));
+        for raw_day in ds.iter().take(5) {
+            let Some(day) = parse_memory_date(raw_day) else {
+                return Ok(tool_format_error(tool_tag, "dates 含无效日期（需 YYYY-MM-DD）"));
+            };
+            if !days.contains(&day) {
+                days.push(day);
+            }
         }
+        if days.is_empty() {
+            return Ok(tool_format_error(tool_tag, "缺少有效 dates"));
+        }
+
         let db = MemoDb::open_default()?;
-        let (rows, stats) = db.read_by_date(kind, Some(day), Some(day))?;
-        if rows.is_empty() {
+        let mut out = String::new();
+        let mut total_hits = 0usize;
+        let mut table_rows = 0usize;
+        let mut table_chars = 0usize;
+
+        for (idx, day) in days.iter().enumerate() {
+            let (rows, stats) = db.read_by_date(kind, Some(*day), Some(*day))?;
+            if idx == 0 {
+                table_rows = stats.total_rows;
+                table_chars = stats.total_chars;
+            }
+            if idx > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format!("== {} ==\n", day.format("%Y-%m-%d")));
+            if rows.is_empty() {
+                out.push_str("(无条目)\n");
+                continue;
+            }
+            total_hits = total_hits.saturating_add(rows.len());
+            out.push_str(&render_memo_rows(&rows));
+            out.push('\n');
+        }
+
+        if total_hits == 0 {
             return Ok(ToolOutcome {
                 user_message: "未找到匹配日期的条目".to_string(),
                 log_lines: vec![format!(
-                    "状态:0 | 耗时:{}ms | source:sqlite | db:{} | table:{} | day:{} | rows:{} | chars:{} | hits:0",
+                    "状态:0 | 耗时:{}ms | source:sqlite | db:{} | table:{} | days:{} | rows:{} | chars:{} | hits:0",
                     started.elapsed().as_millis(),
                     shorten_path(&memo_db_path_display()),
                     kind.table(),
-                    day.format("%Y-%m-%d"),
-                    stats.total_rows,
-                    stats.total_chars
+                    days.iter()
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    table_rows,
+                    table_chars
                 )],
             });
         }
-        let body = render_memo_rows(&rows);
-        let (out_lines, out_chars) = pick_search_output_limits(call);
-        let (body2, saved) = maybe_export_text(
-            MEMORY_CACHE_DIR,
-            if label == "datememo" {
-                "datememo_day"
+
+        let (out_lines, out_chars) = pick_memory_output_limits(call);
+        let prefix = if label == "datememo" {
+            if days.len() > 1 {
+                "datememo_days"
             } else {
-                "metamemo_day"
-            },
-            &body,
-            out_lines,
-            out_chars,
-        );
+                "datememo_day"
+            }
+        } else if days.len() > 1 {
+            "metamemo_days"
+        } else {
+            "metamemo_day"
+        };
+        let (body2, saved) =
+            maybe_export_text(MEMORY_CACHE_DIR, prefix, &out, out_lines, out_chars);
+
         let mut log = format!(
-            "状态:0 | 耗时:{}ms | source:sqlite | db:{} | table:{} | day:{} | rows:{} | chars:{} | hits:{}",
+            "状态:0 | 耗时:{}ms | source:sqlite | db:{} | table:{} | days:{} | rows:{} | chars:{} | hits:{}",
             started.elapsed().as_millis(),
             shorten_path(&memo_db_path_display()),
             kind.table(),
-            day.format("%Y-%m-%d"),
-            stats.total_rows,
-            stats.total_chars,
-            rows.len()
+            days.iter()
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            table_rows,
+            table_chars,
+            total_hits
         );
         if let Some(meta) = saved.as_ref() {
             log.push_str(&format!(" | saved:{}", meta.path));
@@ -6241,93 +6384,449 @@ fn run_memory_read(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     run_read_memory_like("memory_read", call)
 }
 
-fn run_memory_edit(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    let raw = call.path.as_deref().unwrap_or(call.input.trim()).trim();
-    let Some((label, path)) = resolve_memory_path_label(raw) else {
-        return Ok(tool_format_error("memory_edit", "缺少有效 path"));
-    };
-    if label != "fastmemo" {
-        return Ok(tool_format_error("memory_edit", "仅支持 fastmemo"));
+#[derive(Clone, Copy, Debug)]
+enum DateMemoScope {
+    Recent3m,
+    Past1y,
+    Older,
+}
+
+fn parse_datememo_scope(raw: &str) -> Option<DateMemoScope> {
+    let t = raw.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
     }
-    ensure_memory_file(&label, &path)?;
-    let section_raw = call.section.as_deref().unwrap_or("").trim();
-    let content_raw = call.content.as_deref().unwrap_or("").trim();
-    if !section_raw.is_empty() && !content_raw.is_empty() {
-        let Some(section) = normalize_fastmemo_section(section_raw) else {
-            return Ok(tool_format_error("memory_edit", "未知 section"));
-        };
-        let started = Instant::now();
-        let mut bullets: Vec<String> = Vec::new();
-        for line in content_raw.lines() {
-            let t = compact_ws_inline(line.trim());
-            if t.is_empty() {
-                continue;
+    match t.as_str() {
+        "recent" | "r" | "近" | "最近" | "近三月" | "近三个月" | "3m" | "last3m" => {
+            Some(DateMemoScope::Recent3m)
+        }
+        "past" | "p" | "过去" | "近一年" | "一年" | "1y" | "last1y" => Some(DateMemoScope::Past1y),
+        "older" | "o" | "old" | "陈年" | "陈年往事" | "一年以前" | ">1y" => Some(DateMemoScope::Older),
+        _ => None,
+    }
+}
+
+fn month_range_from_raw(raw: &str) -> Option<(i32, u32)> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 6 {
+        return None;
+    }
+    let y = digits.get(0..4)?.parse::<i32>().ok()?;
+    let m = digits.get(4..6)?.parse::<u32>().ok()?;
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    Some((y, m))
+}
+
+fn first_day_of_month(y: i32, m: u32) -> Option<NaiveDate> {
+    NaiveDate::from_ymd_opt(y, m, 1)
+}
+
+fn last_day_of_month(y: i32, m: u32) -> Option<NaiveDate> {
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    let first_next = NaiveDate::from_ymd_opt(ny, nm, 1)?;
+    Some(first_next - chrono::Duration::days(1))
+}
+
+fn parse_memory_date_or_month_start(raw: &str) -> Option<NaiveDate> {
+    if let Some(date) = parse_memory_date(raw) {
+        return Some(date);
+    }
+    let (y, m) = month_range_from_raw(raw)?;
+    first_day_of_month(y, m)
+}
+
+fn parse_memory_date_or_month_end(raw: &str) -> Option<NaiveDate> {
+    if let Some(date) = parse_memory_date(raw) {
+        return Some(date);
+    }
+    let (y, m) = month_range_from_raw(raw)?;
+    last_day_of_month(y, m)
+}
+
+fn parse_memory_date_or_month_range(
+    start_raw: &str,
+    end_raw: &str,
+) -> Result<(Option<NaiveDate>, Option<NaiveDate>), &'static str> {
+    let start_raw = start_raw.trim();
+    let end_raw = end_raw.trim();
+    let mut start = if start_raw.is_empty() {
+        None
+    } else {
+        Some(parse_memory_date_or_month_start(start_raw).ok_or("start_date 无效")?)
+    };
+    let mut end = if end_raw.is_empty() {
+        None
+    } else {
+        Some(parse_memory_date_or_month_end(end_raw).ok_or("end_date 无效")?)
+    };
+    if start.is_some() && end.is_none() {
+        end = start;
+    }
+    if end.is_some() && start.is_none() {
+        start = end;
+    }
+    if let (Some(left), Some(right)) = (start, end)
+        && left > right
+    {
+        start = Some(right);
+        end = Some(left);
+    }
+    Ok((start, end))
+}
+
+fn min_kw_hits_for_check(keywords_len: usize) -> usize {
+    match keywords_len {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        // 3->2, 4->3, 5->3, 6->4 ... 约等于 ceil(n*0.6)
+        n => ((n * 3) + 4) / 5,
+    }
+    .clamp(1, keywords_len.max(1))
+}
+
+fn ts_to_time_hhmmss(ts: &str) -> String {
+    let t = ts.trim();
+    if t.len() >= 19 {
+        // "YYYY-MM-DD HH:MM:SS"
+        return t[11..19].to_string();
+    }
+    // 兜底：尽量截断末尾 8 位时间
+    let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 14 {
+        let h = &digits[8..10];
+        let m = &digits[10..12];
+        let s = &digits[12..14];
+        return format!("{h}:{m}:{s}");
+    }
+    String::new()
+}
+
+fn format_date_range(start: Option<NaiveDate>, end: Option<NaiveDate>) -> Option<String> {
+    match (start, end) {
+        (None, None) => None,
+        (Some(a), None) => Some(format!("{}", a.format("%Y-%m-%d"))),
+        (None, Some(b)) => Some(format!("{}", b.format("%Y-%m-%d"))),
+        (Some(a), Some(b)) => Some(format!("{}~{}", a.format("%Y-%m-%d"), b.format("%Y-%m-%d"))),
+    }
+}
+
+fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
+    // memory_check：仅用于日记（datememo）的“导航式检索”，输出以“日期”为核心，便于后续 memory_read 精读。
+    let pattern = call.pattern.as_deref().unwrap_or(call.input.trim()).trim();
+    if pattern.is_empty() {
+        return Ok(tool_format_error("memory_check", "缺少 pattern"));
+    }
+    let target_raw = call
+        .root
+        .as_deref()
+        .or(call.path.as_deref())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !target_raw.is_empty()
+        && !target_raw.contains("date")
+        && !target_raw.contains("datememo")
+        && target_raw != "*"
+        && target_raw != "all"
+    {
+        return Ok(tool_format_error("memory_check", "仅支持 datememo（日记）"));
+    }
+    // 兼容旧字段：root/path；新设计只允许 datememo（或为空=默认）。
+    let raw_scope = call
+        .region
+        .as_deref()
+        .or(call.section.as_deref())
+        .unwrap_or("")
+        .trim();
+    let scope = parse_datememo_scope(raw_scope).unwrap_or(DateMemoScope::Recent3m);
+    let keywords = dedup_keywords(&parse_memory_keywords(pattern), SEARCH_MAX_KEYWORDS);
+    if keywords.is_empty() {
+        return Ok(tool_format_error("memory_check", "缺少有效关键词"));
+    }
+    let mut min_kw_hits = call
+        .min_kw_hits
+        .unwrap_or_else(|| min_kw_hits_for_check(keywords.len()));
+    if min_kw_hits == 0 {
+        min_kw_hits = 1;
+    }
+    min_kw_hits = min_kw_hits.min(keywords.len().max(1));
+
+    // 输出形态：
+    // - 默认 auto：命中少给少量预览、命中多给索引/按月汇总（省电+稳定）。
+    // - format=index：强制索引（不拉正文预览）。
+    // - format=month：强制按月汇总。
+    // - format=preview：在 hit_days<=50 时也拉取每日日记样本（更耗电，需显式选择）。
+    let fmt = call
+        .format
+        .as_deref()
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase();
+    let force_index = fmt == "index";
+    let force_month = fmt == "month";
+    let force_preview = fmt == "preview";
+    let out_level = call
+        .output_level
+        .as_deref()
+        .unwrap_or("mid")
+        .trim()
+        .to_ascii_lowercase();
+    let prefer_preview = force_preview || out_level == "high" || out_level == "h" || out_level == "large";
+
+    // 日期范围：若显式指定 date_start/date_end（支持 YYYY-MM-DD / YYYY/MM/DD / YYYY-MM / YYYY/MM），则覆盖 scope。
+    let today = Local::now().date_naive();
+    let three_months_ago = today - chrono::Duration::days(92);
+    let one_year_ago = today - chrono::Duration::days(365);
+    let older_end = one_year_ago - chrono::Duration::days(1);
+
+    let (mut start, mut end) = match parse_memory_date_or_month_range(
+        call.date_start.as_deref().unwrap_or(""),
+        call.date_end.as_deref().unwrap_or(""),
+    ) {
+        Ok(v) => v,
+        Err(reason) => return Ok(tool_format_error("memory_check", reason)),
+    };
+    if start.is_none() && end.is_none() {
+        match scope {
+            DateMemoScope::Recent3m => {
+                start = Some(three_months_ago);
+                end = Some(today);
             }
-            if t.starts_with("- ") {
-                bullets.push(t.to_string());
-            } else {
-                bullets.push(format!("- {t}"));
+            DateMemoScope::Past1y => {
+                start = Some(one_year_ago);
+                end = Some(three_months_ago - chrono::Duration::days(1));
             }
-            if bullets.len() >= 10 {
-                break;
+            DateMemoScope::Older => {
+                start = None;
+                end = Some(older_end);
             }
         }
-        if bullets.is_empty() {
-            return Ok(tool_format_error("memory_edit", "content 为空"));
-        }
-        let bullet_len = bullets.len();
-        let mut lines: Vec<String> = fs::read_to_string(&path)
-            .unwrap_or_default()
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
-        let header_idx = ensure_fastmemo_section(&mut lines, section);
-        let mut next_header_idx = None;
-        for (idx, line) in lines.iter().enumerate().skip(header_idx + 1) {
-            let trimmed = line.trim();
-            if trimmed.starts_with('[') && trimmed.contains(']') {
-                next_header_idx = Some(idx);
-                break;
-            }
-        }
-        let end_idx = next_header_idx.unwrap_or(lines.len());
-        let replace_start = (header_idx + 1).min(lines.len());
-        // 移除旧内容（直到下一个 section header），再插入新 bullet 列表，并保留一个空行分隔。
-        lines.splice(replace_start..end_idx, {
-            let mut injected = bullets;
-            injected.push(String::new());
-            injected
-        });
-        let mut out = lines.join("\n");
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        fs::write(&path, &out).with_context(|| format!("写入失败：{path}"))?;
+    }
+
+    let started = Instant::now();
+    let db = MemoDb::open_default()?;
+    let mut hit_days: Vec<DateMemoDayAgg> =
+        db.datememo_aggregate_days_by_keywords_or(&keywords, start, end)?;
+    // 过滤：按“同日命中不同关键词数”做阈值。
+    hit_days.retain(|d| d.kw_hits >= min_kw_hits);
+    // 已按 date DESC 排序（SQL），这里保持。
+    let hit_days_total = hit_days.len();
+    let hit_entries_total: usize = hit_days.iter().map(|d| d.entries).sum();
+
+    let range_text = format_date_range(start, end).unwrap_or_else(|| "all".to_string());
+
+    if hit_days_total == 0 {
+        let elapsed_ms = started.elapsed().as_millis();
+        let mut out = String::new();
+        out.push_str(&format!(
+            "[datememo] range:{} | kw:{} | rule:min_kw_hits={}\n",
+            range_text,
+            keywords.join("/"),
+            min_kw_hits
+        ));
+        out.push_str(&format!(
+            "hit_days:0 | hit_entries:0 | elapsed_ms:{elapsed_ms}\n"
+        ));
+        out.push_str("未找到匹配（建议：减少关键词，或用 scope=recent/past/older，或缩小 date_start/date_end）");
         return Ok(ToolOutcome {
-            user_message: format!("已更新 fastmemo section：{section}"),
+            user_message: out,
             log_lines: vec![format!(
-                "状态:0 | 耗时:{}ms | path:{} | section:{} | lines:{}",
-                started.elapsed().as_millis(),
-                shorten_path(&path),
-                section,
-                bullet_len
+                "状态:0 | 耗时:{}ms | source:sqlite | table:datememo | hit_days:0",
+                elapsed_ms
             )],
         });
     }
 
-    let mut cloned = call.clone();
-    cloned.path = Some(path);
-    cloned.input.clear();
-    if cloned.count.unwrap_or(1) == 0 {
-        return Ok(tool_format_error("memory_edit", "不支持 count=0"));
+    // 推荐：从最近的一小段里挑 3 个“更值得读”的日期（kw_hits 优先，其次 entries）。
+    // 目的：让模型快速进入 memory_read，而不是盯着长列表发呆。
+    let mut recommended: Vec<(String, usize, usize)> = Vec::new(); // (date, kw_hits, entries)
+    for d in hit_days.iter().take(30) {
+        recommended.push((d.date.clone(), d.kw_hits, d.entries));
     }
-    if cloned.count.unwrap_or(1) > 20 {
-        return Ok(tool_format_error("memory_edit", "count 过大，请缩小范围"));
+    recommended.sort_by(|a, b| {
+        b.1.cmp(&a.1) // kw_hits desc
+            .then_with(|| b.2.cmp(&a.2)) // entries desc
+            .then_with(|| b.0.cmp(&a.0)) // date desc
+    });
+    recommended.truncate(3);
+
+    let mut details = String::new();
+    // 分档输出：按“命中天数”控制信息密度（省电默认）。
+    if !force_month && hit_days_total <= 10 && !force_index {
+        for d in hit_days.iter() {
+            let t_latest = ts_to_time_hhmmss(&d.latest_ts);
+            if t_latest.is_empty() {
+                details.push_str(&format!(
+                    "- {} | kw_hits:{} | entries:{}\n",
+                    d.date, d.kw_hits, d.entries
+                ));
+            } else {
+                details.push_str(&format!(
+                    "- {} {} | kw_hits:{} | entries:{}\n",
+                    d.date, t_latest, d.kw_hits, d.entries
+                ));
+            }
+            // 命中极少：允许 1 条短预览（最多 1 条样本，避免多次查询/输出膨胀）。
+            let samples = db
+                .datememo_fetch_samples_for_day(&d.date, &keywords, 1)
+                .unwrap_or_default();
+            if let Some((ts, content)) = samples.first() {
+                let t = ts_to_time_hhmmss(ts);
+                let snippet = memo_row_preview(content, &keywords).unwrap_or_else(|| memo_row_header(content));
+                let snippet = build_preview(&snippet, 120);
+                if t.is_empty() {
+                    details.push_str(&format!("  - {snippet}\n"));
+                } else {
+                    details.push_str(&format!("  - {t} {snippet}\n"));
+                }
+            }
+        }
+    } else if !force_month && hit_days_total <= 50 {
+        for d in hit_days.iter() {
+            if prefer_preview && !force_index {
+                details.push_str(&format!(
+                    "- {} | kw_hits:{} | entries:{}\n",
+                    d.date, d.kw_hits, d.entries
+                ));
+                let samples = db
+                    .datememo_fetch_samples_for_day(&d.date, &keywords, 1)
+                    .unwrap_or_default();
+                if let Some((ts, content)) = samples.first() {
+                    let t = ts_to_time_hhmmss(ts);
+                    let snippet = memo_row_preview(content, &keywords)
+                        .unwrap_or_else(|| memo_row_header(content));
+                    let snippet = build_preview(&snippet, 120);
+                    if t.is_empty() {
+                        details.push_str(&format!("  - {snippet}\n"));
+                    } else {
+                        details.push_str(&format!("  - {t} {snippet}\n"));
+                    }
+                } else {
+                    let t = ts_to_time_hhmmss(&d.latest_ts);
+                    if !t.is_empty() {
+                        details.push_str(&format!("  - {t}\n"));
+                    }
+                }
+            } else {
+                let t = ts_to_time_hhmmss(&d.latest_ts);
+                if t.is_empty() {
+                    details.push_str(&format!(
+                        "- {} | kw_hits:{} | entries:{}\n",
+                        d.date, d.kw_hits, d.entries
+                    ));
+                } else {
+                    details.push_str(&format!(
+                        "- {} {} | kw_hits:{} | entries:{}\n",
+                        d.date, t, d.kw_hits, d.entries
+                    ));
+                }
+            }
+        }
+    } else if !force_month && hit_days_total <= 100 {
+        for d in hit_days.iter() {
+            let t = ts_to_time_hhmmss(&d.latest_ts);
+            if t.is_empty() {
+                details.push_str(&format!(
+                    "- {} | kw_hits:{} | entries:{}\n",
+                    d.date, d.kw_hits, d.entries
+                ));
+            } else {
+                details.push_str(&format!(
+                    "- {} {} | kw_hits:{} | entries:{}\n",
+                    d.date, t, d.kw_hits, d.entries
+                ));
+            }
+        }
+    } else {
+        use std::collections::BTreeMap;
+        #[derive(Default)]
+        struct MonthAgg {
+            hit_days: usize,
+            hit_entries: usize,
+            days: Vec<(String, usize)>, // (YYYY-MM-DD, entries)
+        }
+        let mut by_month: BTreeMap<String, MonthAgg> = BTreeMap::new();
+        for d in hit_days.iter() {
+            let month = d.date.chars().take(7).collect::<String>();
+            let m = by_month.entry(month).or_default();
+            m.hit_days = m.hit_days.saturating_add(1);
+            m.hit_entries = m.hit_entries.saturating_add(d.entries);
+            m.days.push((d.date.clone(), d.entries));
+        }
+        details.push_str("[命中较多：按月汇总（以 DB 时间为准）]\n");
+        let month_count = by_month.len();
+        // 月份太多时只给月汇总（避免再次刷屏）。
+        let show_days = month_count <= 24;
+        for (month, agg) in by_month.iter().rev() {
+            details.push_str(&format!(
+                "- {month} | hit_days:{} | hit_entries:{}\n",
+                agg.hit_days, agg.hit_entries
+            ));
+            if show_days {
+                // 每月最多列 31 天；这里按日期倒序（已是全局倒序插入），保持即可。
+                for (day, entries) in agg.days.iter() {
+                    details.push_str(&format!("  - {day} | entries:{entries}\n"));
+                }
+            }
+        }
+        details.push_str(
+            "建议：先选中某个月（YYYY-MM）作为 date_start/date_end 再次 memory_check，然后用 memory_read 的 dates 读取命中日记。",
+        );
     }
-    if cloned.count.is_none() {
-        cloned.count = Some(1);
+
+    let elapsed_ms = started.elapsed().as_millis();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "[datememo] range:{} | kw:{} | rule:min_kw_hits={}",
+        range_text,
+        keywords.join("/"),
+        min_kw_hits
+    ));
+    if fmt != "auto" {
+        out.push_str(&format!(" | format:{fmt}"));
     }
-    run_edit_file(&cloned)
+    out.push('\n');
+    out.push_str(&format!(
+        "hit_days:{} | hit_entries:{} | elapsed_ms:{elapsed_ms}\n",
+        hit_days_total, hit_entries_total
+    ));
+    if !recommended.is_empty() {
+        out.push_str("suggest_read:");
+        for (i, (day, _kw_hits, _entries)) in recommended.iter().enumerate() {
+            if i == 0 {
+                out.push(' ');
+            } else {
+                out.push_str(", ");
+            }
+            out.push_str(day);
+        }
+        out.push('\n');
+    }
+    out.push_str("next: memory_read(path=datememo, dates=[YYYY-MM-DD])\n");
+    out.push_str(details.trim_end());
+
+    // 输出上限：超过阈值则导出到 memory-cache
+    let (body2, saved) = maybe_export_text(MEMORY_CACHE_DIR, "datememo_check", &out, 500, 20_000);
+    let mut log = format!(
+        "状态:0 | 耗时:{}ms | source:sqlite | table:datememo | hit_days:{} | hit_entries:{}",
+        elapsed_ms,
+        hit_days_total,
+        hit_entries_total
+    );
+    if let Some(meta) = saved.as_ref() {
+        log.push_str(&format!(" | saved:{}", meta.path));
+    }
+    Ok(ToolOutcome {
+        user_message: body2,
+        log_lines: vec![log],
+    })
 }
 
 fn normalize_section_name(raw: &str) -> String {
@@ -6356,14 +6855,14 @@ fn normalize_fastmemo_section(raw: &str) -> Option<&'static str> {
         "自我感知" | "自我" | "人格" | "风格" | "style" | "self" => Some("自我感知"),
         "用户感知" | "用户" | "画像" | "user" => Some("用户感知"),
         "环境感知" | "环境" | "env" | "system" => Some("环境感知"),
-        "事件感知" | "事件" | "事件池" | "event" | "events" | "history" | "动态" | "动态池"
-        | "dynamic" => Some("事件感知"),
+        "动态上下文" | "动态" | "动态池" | "动态上下文池" | "动态context池" | "动态摘要池" | "contextpool"
+        | "dynamic" => Some("动态上下文"),
+        // 兼容旧名：事件感知 -> 动态上下文
+        "事件感知" | "事件" | "事件池" | "event" | "events" | "history" => Some("动态上下文"),
         // v1/v2 -> v3 mapping (best-effort)
         "动态成长人格" => Some("自我感知"),
         "用户感知画像" => Some("用户感知"),
-        "人生旅程" | "历史感知" | "里程碑" => Some("事件感知"),
-        "动态context池" | "动态上下文池" | "动态摘要池" | "contextpool" | "ctx_pool"
-        | "ctxpool" => Some("事件感知"),
+        "人生旅程" | "历史感知" | "里程碑" => Some("动态上下文"),
         "淡化池" => None,
         _ => None,
     }
@@ -6380,7 +6879,7 @@ fn fastmemo_section_headers_v2() -> [&'static str; 5] {
 }
 
 fn fastmemo_section_headers_v3() -> [&'static str; 4] {
-    ["自我感知", "用户感知", "环境感知", "事件感知"]
+    ["自我感知", "用户感知", "环境感知", "动态上下文"]
 }
 
 fn is_fastmemo_v2_struct(text: &str) -> bool {
@@ -6606,6 +7105,43 @@ fn ensure_fastmemo_section(lines: &mut Vec<String>, section: &str) -> usize {
     lines.len().saturating_sub(2)
 }
 
+fn fastmemo_next_header_idx(lines: &[String], header_idx: usize) -> usize {
+    for (idx, line) in lines.iter().enumerate().skip(header_idx + 1) {
+        let t = line.trim();
+        if t.starts_with('[') && t.contains(']') {
+            return idx;
+        }
+    }
+    lines.len()
+}
+
+fn fastmemo_count_items_in_bounds(lines: &[String], start: usize, end: usize) -> usize {
+    let mut n = 0usize;
+    for line in lines.iter().take(end).skip(start) {
+        if line.trim().starts_with("- ") {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
+fn fastmemo_clear_section(lines: &mut Vec<String>, header_idx: usize) {
+    let end = fastmemo_next_header_idx(lines, header_idx);
+    // 保留结构：header 后只保留 1 个空行（避免脏结构影响后续插入）。
+    if header_idx + 1 <= end {
+        lines.splice(header_idx + 1..end, [String::new()]);
+    }
+}
+
+fn fastmemo_full_notice(section: &str) -> String {
+    let example = format!(
+        "<tool>{{\"tool\":\"memory_add\",\"brief\":\"fastmemo:{section} 压缩\",\"path\":\"fastmemo\",\"section\":\"{section}\",\"compact\":true,\"content\":\"- (压缩后的1条)\"}}</tool>"
+    );
+    format!(
+        "[{section}区域已满] fastmemo 单区域条目已达到10条。\n请把该区域10条压缩为1条，然后用 memory_add 写回（compact 会先清空该区域再写入1条）。\n示例：\n{example}"
+    )
+}
+
 fn fastmemo_section_counts(text: &str) -> std::collections::HashMap<&'static str, usize> {
     let mut counts: std::collections::HashMap<&'static str, usize> =
         std::collections::HashMap::new();
@@ -6633,35 +7169,105 @@ fn run_memory_add(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let Some((label, path)) = resolve_memory_path_label(raw) else {
         return Ok(tool_format_error("memory_add", "缺少有效 path"));
     };
-    if label != "fastmemo" {
-        return Ok(tool_format_error("memory_add", "仅支持 fastmemo"));
-    }
     let content = call.content.as_deref().unwrap_or("").trim();
     if content.is_empty() {
         return Ok(tool_format_error("memory_add", "缺少 content"));
     }
     let started = Instant::now();
 
+    if label == "metamemo" {
+        // metamemo 由系统自动记录对话；不允许模型手动追加，避免污染/重复与协议混乱。
+        return Ok(tool_format_error("memory_add", "metamemo 不支持 memory_add"));
+    }
+    if label == "datememo" {
+        let kind = MemoKind::Date;
+        let first = content
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        let mut ts = String::new();
+        let mut speaker = String::new();
+        let parts: Vec<&str> = first.split('|').map(|s| s.trim()).collect();
+        if let Some(p) = parts.first() {
+            if !p.is_empty() {
+                ts = p.to_string();
+            }
+        }
+        if let Some(p) = parts.get(1) {
+            if !p.is_empty() {
+                speaker = p.to_string();
+            }
+        }
+        if ts.is_empty() {
+            ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        }
+        if speaker.is_empty() {
+            speaker = "main".to_string();
+        }
+        let db = match MemoDb::open_default() {
+            Ok(db) => db,
+            Err(e) => {
+                return Ok(ToolOutcome {
+                    user_message: "工具执行失败：打开记忆库失败".to_string(),
+                    log_lines: vec!["状态:fail".to_string(), format!("error:{e:#}")],
+                });
+            }
+        };
+        if let Err(e) = db.append_entry(kind, &ts, &speaker, content) {
+            return Ok(ToolOutcome {
+                user_message: "工具执行失败：写入记忆失败".to_string(),
+                log_lines: vec!["状态:fail".to_string(), format!("error:{e:#}")],
+            });
+        }
+        let msg = build_memory_add_message(&path, content);
+        return Ok(ToolOutcome {
+            user_message: msg,
+            log_lines: vec![format!(
+                "状态:0 | 耗时:{}ms | memo:{} | speaker:{} | chars:{}",
+                started.elapsed().as_millis(),
+                label,
+                speaker,
+                content.chars().count()
+            )],
+        });
+    }
+
+    if label != "fastmemo" {
+        return Ok(tool_format_error("memory_add", "仅支持 fastmemo/datememo/metamemo"));
+    }
     ensure_memory_file(&label, &path)?;
     let section_raw = call.section.as_deref().unwrap_or("").trim();
     let Some(section) = normalize_fastmemo_section(section_raw) else {
         return Ok(tool_format_error("memory_add", "fastmemo 需要 section"));
     };
+    let compact = call.compact.unwrap_or(false);
     let mut lines: Vec<String> = fs::read_to_string(&path)
         .unwrap_or_default()
         .lines()
         .map(|s| s.to_string())
         .collect();
     let header_idx = ensure_fastmemo_section(&mut lines, section);
-    let mut next_header_idx = None;
-    for (idx, line) in lines.iter().enumerate().skip(header_idx + 1) {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.contains(']') {
-            next_header_idx = Some(idx);
-            break;
+    if compact {
+        fastmemo_clear_section(&mut lines, header_idx);
+    } else {
+        let end_idx = fastmemo_next_header_idx(&lines, header_idx);
+        let n = fastmemo_count_items_in_bounds(&lines, header_idx + 1, end_idx);
+        if n >= 10 {
+            let notice = fastmemo_full_notice(section);
+            return Ok(ToolOutcome {
+                user_message: notice,
+                log_lines: vec![
+                    "状态:0".to_string(),
+                    format!(
+                        "note:fastmemo_section_full section:{} items:{}/10（未写入；请先压缩再写回）",
+                        section, n
+                    ),
+                ],
+            });
         }
     }
-    let end_idx = next_header_idx.unwrap_or(lines.len());
+
+    let end_idx = fastmemo_next_header_idx(&lines, header_idx);
     let mut insert_idx = end_idx;
     while insert_idx > header_idx + 1 && lines[insert_idx - 1].trim().is_empty() {
         insert_idx = insert_idx.saturating_sub(1);
@@ -6683,30 +7289,36 @@ fn run_memory_add(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     fs::write(&path, &out).with_context(|| format!("写入失败：{path}"))?;
 
     let counts = fastmemo_section_counts(&out);
-    let pending = counts.values().any(|v| *v >= 10);
     let mut msg = build_memory_add_message(&path, content);
-    if pending {
-        msg.push_str("\n\n[fastmemo 达到阈值：已计划压缩（DOG）]");
+    let sec_n = counts.get(section).copied().unwrap_or(0);
+    if sec_n >= 10 && !compact {
+        msg.push_str("\n\n");
+        msg.push_str(&fastmemo_full_notice(section));
+    }
+    let mut log_lines = vec![
+        format!(
+            "状态:0 | 耗时:{}ms | path:{} | section:{} | chars:{}",
+            started.elapsed().as_millis(),
+            shorten_path(&path),
+            section,
+            content.chars().count()
+        ),
+        format!(
+            "fastmemo_counts | 自我:{} | 用户:{} | 环境:{} | 动态:{}",
+            counts.get("自我感知").copied().unwrap_or(0),
+            counts.get("用户感知").copied().unwrap_or(0),
+            counts.get("环境感知").copied().unwrap_or(0),
+            counts.get("动态上下文").copied().unwrap_or(0),
+        ),
+        format!("fastmemo_section_usage | section:{} | items:{}/10", section, sec_n),
+    ];
+    if sec_n >= 10 && !compact {
+        // 供 core 层触发“自动压缩”用的标记；不要把它写进正文（避免污染模型输出）。
+        log_lines.push("fastmemo_compact_pending:1".to_string());
     }
     Ok(ToolOutcome {
         user_message: msg,
-        log_lines: vec![
-            format!(
-                "状态:0 | 耗时:{}ms | path:{} | section:{} | chars:{}",
-                started.elapsed().as_millis(),
-                shorten_path(&path),
-                section,
-                content.chars().count()
-            ),
-            format!(
-                "fastmemo_counts | 自我:{} | 用户:{} | 环境:{} | 事件:{}",
-                counts.get("自我感知").copied().unwrap_or(0),
-                counts.get("用户感知").copied().unwrap_or(0),
-                counts.get("环境感知").copied().unwrap_or(0),
-                counts.get("事件感知").copied().unwrap_or(0),
-            ),
-            format!("fastmemo_compact_pending:{}", if pending { 1 } else { 0 }),
-        ],
+        log_lines,
     })
 }
 
@@ -7116,6 +7728,7 @@ fn memory_paths_for_check(raw: &str) -> Vec<(String, String)> {
     vec![]
 }
 
+#[allow(dead_code)]
 fn pick_path(call: &ToolCall) -> anyhow::Result<String> {
     let raw = call.path.as_deref().unwrap_or(call.input.trim()).trim();
     let path = normalize_tool_path(raw);
@@ -7141,12 +7754,63 @@ fn bytes_preview_hex(bytes: &[u8], limit: usize) -> String {
 
 fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
     fn display_tool_path(path: &str) -> String {
-        let display = short_display_path(path);
+        let raw = path.trim();
+        if raw.is_empty() {
+            return String::new();
+        }
+
+        // 统一工程根目录显示：. ~ home 都指向 AItermux（显示为 AItermux）
+        // ./system 等价于 AItermux/system（显示为 AItermux/system）
+        //
+        // 注意：这里是“展示规则”，不依赖 $HOME，避免当用户环境的 HOME 被改写时出现 ./system 之类的歧义。
+        if raw == "." || raw == "~" || raw.eq_ignore_ascii_case("home") || raw == "$HOME" || raw == "${HOME}" {
+            return "AItermux".to_string();
+        }
+        if let Some(rest) = raw.strip_prefix("./") {
+            let rest = rest.trim_start_matches('/').trim_end_matches('/');
+            if rest.is_empty() {
+                return "AItermux".to_string();
+            }
+            return format!("AItermux/{rest}");
+        }
+        if let Some(rest) = raw.strip_prefix("~/") {
+            let rest = rest.trim_start_matches('/').trim_end_matches('/');
+            if rest.is_empty() {
+                return "AItermux".to_string();
+            }
+            return format!("AItermux/{rest}");
+        }
+        if let Some(rest) = raw.strip_prefix("home/") {
+            let rest = rest.trim_start_matches('/').trim_end_matches('/');
+            if rest.is_empty() {
+                return "AItermux".to_string();
+            }
+            return format!("AItermux/{rest}");
+        }
+        if let Some(rest) = raw.strip_prefix("$HOME/") {
+            let rest = rest.trim_start_matches('/').trim_end_matches('/');
+            if rest.is_empty() {
+                return "AItermux".to_string();
+            }
+            return format!("AItermux/{rest}");
+        }
+        if let Some(rest) = raw.strip_prefix("${HOME}/") {
+            let rest = rest.trim_start_matches('/').trim_end_matches('/');
+            if rest.is_empty() {
+                return "AItermux".to_string();
+            }
+            return format!("AItermux/{rest}");
+        }
+
+        let display = short_display_path(raw);
         if display.is_empty() {
-            return shorten_path(path);
+            return shorten_path(raw);
         }
         if display == "." {
             return ".".to_string();
+        }
+        if display == "AItermux" || display.starts_with("AItermux/") {
+            return display;
         }
         if display.starts_with('/')
             || display.starts_with('~')
@@ -7421,7 +8085,7 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
             }
             build_preview(&display, limit)
         }
-        "memory_edit" | "memory_add" => {
+        "memory_add" => {
             let raw = call.path.as_deref().unwrap_or(call.input.trim()).trim();
             let label = resolve_memory_path_label(raw)
                 .map(|(label, _)| label)
@@ -7492,10 +8156,9 @@ pub fn tool_display_label(tool: &str) -> String {
         "edit_file" => "EDIT",
         "apply_patch" => "PATCH",
         "list" => "LIST",
-        "memory_check" => "MFIND",
-        "memory_read" => "MREAD",
-        "memory_edit" => "MEDIT",
-        "memory_add" => "MADD",
+        "memory_check" => "MemoryCheck",
+        "memory_read" => "MemoryRead",
+        "memory_add" => "MemoryAdd",
         "mind_msg" => "MIND",
         "system_config" => "SYS",
         "skills_mcp" => "SKILLS",
@@ -7532,6 +8195,21 @@ fn short_cwd_display(raw: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let home = home.trim_end_matches('/').to_string();
     if !home.is_empty() {
+        // 工程根目录优先显示为 AItermux（避免 cwd:~/AItermux 与 cwd:./system 这类歧义）。
+        let project = format!("{home}/AItermux");
+        if p == project {
+            return "AItermux".to_string();
+        }
+        let project_prefix = format!("{project}/");
+        if p.starts_with(&project_prefix) {
+            let rest = p[project_prefix.len()..].trim_start_matches('/');
+            if rest.is_empty() {
+                return "AItermux".to_string();
+            }
+            return format!("AItermux/{rest}");
+        }
+
+        // 其次才对系统 HOME 做 ~ 显示。
         let home_prefix = format!("{home}/");
         if p == home {
             return "~".to_string();
@@ -7635,6 +8313,17 @@ pub(crate) fn normalize_tool_path(raw: &str) -> String {
         }
         if path == "home" || path.starts_with("home/") {
             let rest = path.trim_start_matches("home").trim_start_matches('/');
+            if rest.is_empty() {
+                return project;
+            }
+            return format!("{project}/{rest}");
+        }
+        if path == "$HOME" || path == "${HOME}" || path.starts_with("$HOME/") || path.starts_with("${HOME}/") {
+            let rest = path
+                .trim_start_matches("$HOME")
+                .trim_start_matches("${HOME}")
+                .trim_start_matches('/')
+                .trim();
             if rest.is_empty() {
                 return project;
             }

@@ -39,6 +39,14 @@ pub struct MemoRow {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DateMemoDayAgg {
+    pub date: String,       // YYYY-MM-DD (来自 DB 字段)
+    pub latest_ts: String,  // 该日最新一条记录的 ts（来自 DB 字段）
+    pub entries: usize,     // 该日命中条目数量（DB 行数）
+    pub kw_hits: usize,     // 该日命中“不同关键词”的数量（按日聚合）
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MemoStats {
     pub total_rows: usize,
@@ -290,6 +298,185 @@ impl MemoDb {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         let mut rows = Vec::new();
+        for row in iter {
+            rows.push(row?);
+        }
+        Ok(rows)
+    }
+
+    /// 以 OR 语义拉取候选行（用于“按天聚合/多关键词”策略），返回 (date, ts, content)。
+    /// - 这里的 ts/date 来自数据库字段（权威时间线），不依赖 content 内的时间格式。
+    /// - 默认按最新优先（id DESC），便于检索近期日记。
+    #[allow(dead_code)]
+    pub fn fetch_entries_by_keywords_or_with_ts(
+        &self,
+        kind: MemoKind,
+        keywords: &[String],
+        start: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+        limit_rows: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        if limit_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect()?;
+        let (mut clauses, mut params) = build_date_clause(start, end);
+        if !keywords.is_empty() {
+            let mut ors: Vec<String> = Vec::new();
+            for kw in keywords {
+                ors.push("LOWER(content) LIKE ?".to_string());
+                params.push(Value::from(format!("%{}%", kw.to_ascii_lowercase())));
+            }
+            clauses.push(format!("({})", ors.join(" OR ")));
+        }
+        let where_sql = if clauses.is_empty() {
+            "1=1".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        let mut params_with_limit = params;
+        params_with_limit.push(Value::from(limit_rows as i64));
+        let sql = format!(
+            "SELECT date, ts, content FROM {} WHERE {} ORDER BY id DESC LIMIT ?",
+            kind.table(),
+            where_sql
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let iter = stmt.query_map(params_from_iter(params_with_limit), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut rows = Vec::new();
+        for row in iter {
+            rows.push(row?);
+        }
+        Ok(rows)
+    }
+
+    /// datememo 专用：按“日”聚合 OR 关键词命中，返回每一天的：
+    /// - DB 字段 date（权威）
+    /// - 命中条目数（entries）
+    /// - 命中不同关键词数（kw_hits）
+    ///
+    /// 注意：kw_hits 依据“同日内是否出现该关键词”计算，而不是单条记录内。
+    pub fn datememo_aggregate_days_by_keywords_or(
+        &self,
+        keywords: &[String],
+        start: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+    ) -> Result<Vec<DateMemoDayAgg>> {
+        let conn = self.connect()?;
+        let (mut clauses, date_params) = build_date_clause(start, end);
+
+        // 若无关键词，直接返回空（调用方应当先校验）。
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // WHERE：OR 关键词（仅拉取命中过至少 1 个关键词的日记条目）。
+        let mut ors: Vec<String> = Vec::new();
+        for _ in keywords {
+            ors.push("LOWER(content) LIKE ?".to_string());
+        }
+        clauses.push(format!("({})", ors.join(" OR ")));
+
+        // SELECT：对每个关键词做一个按日的存在性标记（0/1）。
+        // 这里也用参数占位，避免拼接 kw 到 SQL 中。
+        let mut kw_cols: Vec<String> = Vec::new();
+        for (i, _) in keywords.iter().enumerate() {
+            kw_cols.push(format!(
+                "MAX(CASE WHEN LOWER(content) LIKE ? THEN 1 ELSE 0 END) AS k{i}"
+            ));
+        }
+        let where_sql = if clauses.is_empty() {
+            "1=1".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        let sql = format!(
+            "SELECT date, MAX(ts) AS latest_ts, COUNT(*) AS entries, {} \
+             FROM datememo \
+             WHERE {} \
+             GROUP BY date \
+             ORDER BY date DESC",
+            kw_cols.join(", "),
+            where_sql
+        );
+
+        // 参数顺序必须与 SQL 中 `?` 的出现顺序一致：
+        // 1) SELECT: 每个 kw 的 CASE WHEN ... LIKE ?
+        // 2) WHERE: date_clause 的参数（start/end）
+        // 3) WHERE: OR 关键词参数（LOWER(content) LIKE ?）
+        let mut params: Vec<Value> = Vec::new();
+        for kw in keywords {
+            params.push(Value::from(format!("%{}%", kw.to_ascii_lowercase())));
+        }
+        params.extend(date_params);
+        for kw in keywords {
+            params.push(Value::from(format!("%{}%", kw.to_ascii_lowercase())));
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let iter = stmt.query_map(params_from_iter(params), |r| {
+            let date: String = r.get(0)?;
+            let latest_ts: String = r.get(1)?;
+            let entries: i64 = r.get(2)?;
+            let mut kw_hits: usize = 0;
+            // k0..kN
+            for i in 0..keywords.len() {
+                let v: i64 = r.get(3 + i)?;
+                if v != 0 {
+                    kw_hits = kw_hits.saturating_add(1);
+                }
+            }
+            Ok(DateMemoDayAgg {
+                date,
+                latest_ts,
+                entries: entries.max(0) as usize,
+                kw_hits,
+            })
+        })?;
+
+        let mut out: Vec<DateMemoDayAgg> = Vec::new();
+        for row in iter {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// datememo 专用：取某一天的最新若干条命中记录（用于 UI/检索预览）。
+    pub fn datememo_fetch_samples_for_day(
+        &self,
+        day: &str, // YYYY-MM-DD
+        keywords: &[String],
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let limit = limit.clamp(1, 10);
+        let conn = self.connect()?;
+        let mut clauses: Vec<String> = vec!["date = ?".to_string()];
+        let mut params: Vec<Value> = vec![Value::from(day.to_string())];
+        if !keywords.is_empty() {
+            let mut ors: Vec<String> = Vec::new();
+            for kw in keywords {
+                ors.push("LOWER(content) LIKE ?".to_string());
+                params.push(Value::from(format!("%{}%", kw.to_ascii_lowercase())));
+            }
+            clauses.push(format!("({})", ors.join(" OR ")));
+        }
+        let where_sql = clauses.join(" AND ");
+        params.push(Value::from(limit as i64));
+        let sql = format!(
+            "SELECT ts, content FROM datememo WHERE {} ORDER BY id DESC LIMIT ?",
+            where_sql
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let iter = stmt.query_map(params_from_iter(params), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut rows: Vec<(String, String)> = Vec::new();
         for row in iter {
             rows.push(row?);
         }

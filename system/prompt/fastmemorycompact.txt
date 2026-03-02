@@ -1,17 +1,22 @@
-系统：fastmemo 已达到阈值，需要进行压缩（由 DOG 执行，静默维护）。
+系统：fastmemo 某分区已达到10条，需要压缩（由 MEMORY 执行）。
 
-任务：
-- 读取 fastmemo（优先使用 memory_read 读取 fastmemo 原文；若上下文已包含 fastmemo，也可直接使用）。
-- fastmemo 包含 4 个固定区域：[自我感知] [用户感知] [环境感知] [事件感知]
-- 你需要把每个区域的内容“迭代压缩”为 1 条 bullet（只保留长期稳定、可复用、关键的信息；不确定就丢弃或标注待确认）。
-- 禁止把工具输出原文/日志/大段代码写回 fastmemo；若需要引用，只写摘要+指针。
+目标：
+只压缩1个分区，然后停止。下次若仍超阈值，系统会再触发你继续压缩下一分区。
 
-输出格式（强制）：
-- 只允许输出工具 JSON（不要输出正文）。
-- 推荐流程：先 1 次 memory_read，然后依次对 4 个区域使用 memory_edit(section=..., content=...) 覆盖为 1 条 bullet。
+步骤：
+1 读取 fastmemo 原文（memory_read path=fastmemo）
+2 找到条目数 >=10 的第一个分区，按固定优先级选择
+  自我感知 > 用户感知 > 环境感知 > 动态上下文
+3 把该分区的10条压缩为1条 bullet
+  只保留长期稳定，可复用，关键的信息
+  不确定或短期信息丢弃
+  不要把工具输出原文，大段日志，大段代码写回
+4 用 memory_add 写回该分区，必须 compact:true
+
+工具输出要求：
+一次回复最多2个tool块，顺序为 memory_read -> memory_add
+tool块只输出JSON，不要解释
 
 示例：
-<tool>{"tool":"memory_read","path":"fastmemo","brief":"读取 fastmemo 原文"}</tool>
-<tool>{"tool":"memory_edit","path":"fastmemo","section":"自我感知","content":"- ...","brief":"压缩自我感知"}</tool>
-
-注意：完成压缩后，不要再输出任何解释性文字。
+<tool>{"tool":"memory_read","brief":"读取fastmemo","path":"fastmemo"}</tool>
+<tool>{"tool":"memory_add","brief":"压缩写回fastmemo","path":"fastmemo","section":"自我感知","compact":true,"content":"- (压缩后的1条)"}</tool>

@@ -3,6 +3,7 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use anyhow::Context;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 
@@ -135,9 +136,7 @@ pub(crate) fn with_stamp_footer(text: &str) -> String {
     strip_stamp_footer(text).trim_end().to_string()
 }
 
-/// DeepSeek rejects some sequences (e.g. consecutive assistant messages).
-/// Keep this normalization strictly protocol-level: no UI summaries, no semantic rewrites.
-pub(crate) fn normalize_messages_for_deepseek(messages: &[ApiMessage]) -> Vec<ApiMessage> {
+fn normalize_messages_basic(messages: &[ApiMessage]) -> Vec<ApiMessage> {
     let mut out: Vec<ApiMessage> = Vec::with_capacity(messages.len());
     for msg in messages {
         let role = msg.role.trim();
@@ -162,6 +161,31 @@ pub(crate) fn normalize_messages_for_deepseek(messages: &[ApiMessage]) -> Vec<Ap
     }
     out
 }
+
+/// Generic, provider-agnostic normalization for building model context snapshots:
+/// - filter empty messages
+/// - merge consecutive assistant messages
+/// This is safe for all providers and all minds.
+pub(crate) fn normalize_messages_for_model_context(messages: &[ApiMessage]) -> Vec<ApiMessage> {
+    normalize_messages_basic(messages)
+}
+
+/// Provider-level normalization:
+/// - Strictly protocol-level (never inject UI strings, never rewrite semantics).
+/// - Keep behavior centralized per provider so Main/Dog/Memory share one rule set.
+pub(crate) fn normalize_messages_for_provider(provider: &str, messages: &[ApiMessage]) -> Vec<ApiMessage> {
+    let p = crate::api::normalize_provider(provider);
+    match p {
+        // DeepSeek rejects some sequences (e.g. consecutive assistant messages).
+        // We pre-merge assistant and strip empties for stability.
+        "deepseek" => normalize_messages_basic(messages),
+        // Codex endpoints are generally tolerant, but we still apply the same basic cleanup.
+        // Keeping this consistent reduces edge cases across minds.
+        "codex" => normalize_messages_basic(messages),
+        _ => normalize_messages_basic(messages),
+    }
+}
+
 
 /// Best-effort detector for "context pollution" where UI-rendered strings leak into model context.
 /// Returns human-readable findings; callers should log, not mutate context here.
@@ -311,6 +335,7 @@ pub(crate) fn score_context_health(provider: &str, messages: &[ApiMessage]) -> C
 
 pub(crate) const FASTMEMO_PATH: &str = "memory/fastmemory.jsonl";
 const FASTMEMO_MAX_INJECT_CHARS: usize = 1800;
+pub(crate) const DYNCONTEXT_PATH_DEFAULT: &str = "memory/context/context.jsonl";
 
 fn truncate_chars_safe(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
@@ -342,13 +367,12 @@ pub(crate) fn read_fastmemo_for_context() -> String {
     truncate_chars_safe(text.trim(), FASTMEMO_MAX_INJECT_CHARS)
 }
 
-
 pub(crate) fn fastmemo_event_count_and_any_ge10(text: &str) -> (usize, bool) {
     let mut current: Option<&str> = None;
     let mut self_n = 0usize;
     let mut user_n = 0usize;
     let mut env_n = 0usize;
-    let mut event_n = 0usize;
+    let mut dyn_n = 0usize;
     for line in text.lines() {
         let t = line.trim();
         if t.starts_with('[') && t.contains(']') {
@@ -356,7 +380,9 @@ pub(crate) fn fastmemo_event_count_and_any_ge10(text: &str) -> (usize, bool) {
                 "[自我感知]" => Some("自我感知"),
                 "[用户感知]" => Some("用户感知"),
                 "[环境感知]" => Some("环境感知"),
-                "[事件感知]" => Some("事件感知"),
+                "[动态上下文]" => Some("动态上下文"),
+                // 兼容旧名
+                "[事件感知]" => Some("动态上下文"),
                 _ => None,
             };
             continue;
@@ -368,76 +394,267 @@ pub(crate) fn fastmemo_event_count_and_any_ge10(text: &str) -> (usize, bool) {
             Some("自我感知") => self_n += 1,
             Some("用户感知") => user_n += 1,
             Some("环境感知") => env_n += 1,
-            Some("事件感知") => event_n += 1,
+            Some("动态上下文") => dyn_n += 1,
             _ => {}
         }
     }
-    let any_ge10 = self_n >= 10 || user_n >= 10 || env_n >= 10 || event_n >= 10;
-    (event_n, any_ge10)
+    let any_ge10 = self_n >= 10 || user_n >= 10 || env_n >= 10 || dyn_n >= 10;
+    (dyn_n, any_ge10)
 }
 
-fn append_fastmemo_event_pool_item(raw: &str) -> anyhow::Result<(usize, bool)> {
-    crate::mcp::ensure_memory_file("fastmemo", FASTMEMO_PATH)?;
-    let mut lines: Vec<String> = std::fs::read_to_string(FASTMEMO_PATH)
-        .unwrap_or_default()
-        .lines()
-        .map(|s| s.to_string())
-        .collect();
-    if lines.is_empty() {
-        // 兜底：若文件异常为空，至少补全 v3 section 结构，避免后续写入失败。
-        lines.push("fastmemo v3 | max_chars: 1800".to_string());
-        lines.push(String::new());
-        for sec in ["自我感知", "用户感知", "环境感知", "事件感知"] {
-            lines.push(format!("[{sec}]"));
-            lines.push(String::new());
+pub(crate) fn fastmemo_max_section_usage(text: &str) -> Option<(&'static str, usize)> {
+    // 返回“最接近 10 的那一栏”，并在并列时按固定优先级选择：
+    // 自我感知 > 用户感知 > 环境感知 > 动态上下文
+    let mut current: Option<&'static str> = None;
+    let mut self_n = 0usize;
+    let mut user_n = 0usize;
+    let mut env_n = 0usize;
+    let mut dyn_n = 0usize;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.contains(']') {
+            current = match t {
+                "[自我感知]" => Some("自我感知"),
+                "[用户感知]" => Some("用户感知"),
+                "[环境感知]" => Some("环境感知"),
+                "[动态上下文]" => Some("动态上下文"),
+                // 兼容旧名
+                "[事件感知]" => Some("动态上下文"),
+                _ => None,
+            };
+            continue;
+        }
+        if !t.starts_with("- ") {
+            continue;
+        }
+        match current {
+            Some("自我感知") => self_n += 1,
+            Some("用户感知") => user_n += 1,
+            Some("环境感知") => env_n += 1,
+            Some("动态上下文") => dyn_n += 1,
+            _ => {}
         }
     }
-
-    let header = "[事件感知]";
-    let header_idx = if let Some(pos) = lines.iter().position(|l| l.trim() == header) {
-        pos
+    let mut best_label = "自我感知";
+    let mut best_n = self_n;
+    for (label, n) in [
+        ("用户感知", user_n),
+        ("环境感知", env_n),
+        ("动态上下文", dyn_n),
+    ] {
+        if n > best_n {
+            best_label = label;
+            best_n = n;
+        }
+    }
+    if best_n == 0 {
+        None
     } else {
-        if !lines.last().is_some_and(|l| l.trim().is_empty()) {
-            lines.push(String::new());
+        Some((best_label, best_n))
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn read_dyncontext_for_context(path: &str) -> String {
+    // 兼容遗留：旧版会把 dyncontext 作为 system 原文注入。
+    // 目前我们把该文件作为“会话上下文日志”（JSONL）；不建议再把原文直接注入 system。
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn dyncontext_ts() -> String {
+    // 秒级即可；动态上下文注入本身会带入完整原文。
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
+}
+
+fn append_dyncontext(
+    path: &str,
+    mind: &str,
+    role: &str,
+    text: &str,
+    tool: Option<&str>,
+    meta: Option<&[String]>,
+) -> anyhow::Result<()> {
+    let clean = text.trim();
+    if clean.is_empty() {
+        return Ok(());
+    }
+    let mut entry = json!({
+        "time": dyncontext_ts(),
+        "mind": mind,
+        "role": role,
+        "content": clean,
+    });
+    if let Some(t) = tool.map(str::trim).filter(|s| !s.is_empty()) {
+        entry["tool"] = json!(t);
+    }
+    if let Some(m) = meta {
+        if !m.is_empty() {
+            entry["meta"] = json!(m);
         }
-        lines.push(header.to_string());
-        lines.push(String::new());
-        lines.len().saturating_sub(2)
+    }
+    let line = serde_json::to_string(&entry)?;
+    let p = Path::new(path);
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建目录失败：{}", parent.display()))?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+        .with_context(|| format!("写入失败：{}", p.display()))?;
+    writeln!(f, "{line}").ok();
+    Ok(())
+}
+
+pub(crate) fn log_dyncontext(
+    path: &str,
+    mind: &str,
+    role: &str,
+    text: &str,
+    tool: Option<&str>,
+    meta: Option<&[String]>,
+) {
+    if let Err(e) = append_dyncontext(path, mind, role, text, tool, meta) {
+        eprintln!("dyncontext 写入失败: {e:#}");
+    }
+}
+
+pub(crate) fn clear_dyncontext_file(path: &str) {
+    let p = Path::new(path);
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = fs::create_dir_all(parent);
+    }
+    // best-effort：重启清空会话上下文；失败不阻断启动
+    let _ = fs::write(p, "");
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextLogEntry {
+    #[serde(default)]
+    #[allow(dead_code)]
+    time: String,
+    #[serde(default)]
+    mind: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    meta: Option<Vec<String>>,
+}
+
+fn render_tool_result_system_message(
+    seq: u64,
+    tool: &str,
+    result_text: &str,
+    meta: &[String],
+    template: &str,
+) -> ApiMessage {
+    let clean = result_text.trim();
+    let status = infer_mcp_exec_status_from_meta(meta);
+    let elapsed = extract_meta_kv(meta, "elapsed_ms")
+        .map(|v| format!(" 耗时：{v}ms"))
+        .or_else(|| extract_meta_kv(meta, "耗时").map(|v| format!(" 耗时：{v}")))
+        .unwrap_or_default();
+    let path = extract_meta_kv(meta, "cwd")
+        .or_else(|| extract_meta_kv(meta, "path"))
+        .map(|v| format!(" 路径：{v}"))
+        .unwrap_or_default();
+    let saved = meta
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("saved:").map(str::trim))
+        .filter(|s| !s.is_empty())
+        .map(|v| format!(" 保存：{v}"))
+        .unwrap_or_default();
+    let reason = if status == "成功" {
+        String::new()
+    } else {
+        failure_reason_preview(clean)
+            .map(|r| format!(" 原因：{r}"))
+            .unwrap_or_default()
     };
-    let mut next_header_idx = None;
-    for (idx, line) in lines.iter().enumerate().skip(header_idx + 1) {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.contains(']') {
-            next_header_idx = Some(idx);
-            break;
+    let code = format!("code{:03}", seq);
+    let header = format!(
+        "[MCP:工具输出{code}]工具名：{} 状态：{status}{reason}{elapsed}{path}{saved}",
+        tool.trim()
+    );
+    let body = crate::messages::render_template(template, &[("HEADER", &header), ("RESULT", clean)]);
+    ApiMessage {
+        role: "system".to_string(),
+        content: body,
+    }
+}
+
+pub(crate) fn read_contextlog_messages_for_mind(
+    path: &str,
+    mind: &str,
+    tool_result_assistant_template: &str,
+) -> Vec<ApiMessage> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let want = mind.trim();
+    let mut out: Vec<ApiMessage> = Vec::new();
+    let mut tool_seq: u64 = 0;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<ContextLogEntry>(t) else {
+            continue;
+        };
+        if entry.mind.trim() != want {
+            continue;
+        }
+        let role = entry.role.trim().to_ascii_lowercase();
+        let content = entry.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        match role.as_str() {
+            "user" => out.push(ApiMessage {
+                role: "user".to_string(),
+                content: content.to_string(),
+            }),
+            "assistant" => out.push(ApiMessage {
+                role: "assistant".to_string(),
+                content: content.to_string(),
+            }),
+            "system" => out.push(ApiMessage {
+                role: "system".to_string(),
+                content: content.to_string(),
+            }),
+            "tool" => {
+                tool_seq = tool_seq.saturating_add(1);
+                let tool = entry
+                    .tool
+                    .as_deref()
+                    .unwrap_or("tool")
+                    .trim();
+                let meta = entry.meta.as_deref().unwrap_or(&[]);
+                out.push(render_tool_result_system_message(
+                    tool_seq,
+                    tool,
+                    content,
+                    meta,
+                    tool_result_assistant_template,
+                ));
+            }
+            _ => {}
         }
     }
-    let end_idx = next_header_idx.unwrap_or(lines.len());
-    let mut insert_idx = end_idx;
-    while insert_idx > header_idx + 1 && lines[insert_idx - 1].trim().is_empty() {
-        insert_idx = insert_idx.saturating_sub(1);
-    }
-    let merged = crate::compact_ws_inline(raw.trim());
-    if merged.is_empty() {
-        let text = std::fs::read_to_string(FASTMEMO_PATH).unwrap_or_default();
-        return Ok(fastmemo_event_count_and_any_ge10(&text));
-    }
-    let mut bullet = merged;
-    if bullet.chars().count() > 420 {
-        bullet = bullet.chars().take(420).collect::<String>();
-        bullet.push('…');
-    }
-    let mut injected: Vec<String> = vec![format!("- {bullet}")];
-    if insert_idx < lines.len() && !lines[insert_idx].trim().is_empty() {
-        injected.push(String::new());
-    }
-    lines.splice(insert_idx..insert_idx, injected);
-    let mut out = lines.join("\n");
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    std::fs::write(FASTMEMO_PATH, &out).context("写入 fastmemo 失败")?;
-    Ok(fastmemo_event_count_and_any_ge10(&out))
+    out
 }
 
 // ===== contextmemo（上下文审计日志）=====
@@ -551,6 +768,12 @@ pub(crate) fn clear_contextmemo(path: &str) {
     }
 }
 
+pub(crate) fn contextmemo_size_kb(path: &str) -> usize {
+    let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // 0 bytes => 0KB；其余向上取整，便于阈值直观控制。
+    ((bytes + 1023) / 1024) as usize
+}
+
 fn infer_mcp_exec_status_from_meta(meta: &[String]) -> &'static str {
     // 只依据 meta 推断状态：绝不能扫描 output 文本，否则会被 `ps` 等输出里的单词（如 `timeout` 进程名）
     // 误判为“超时/失败”，污染上下文与 UI 展示。
@@ -604,12 +827,11 @@ fn extract_meta_kv(meta: &[String], key: &str) -> Option<String> {
 
 // ===== DogState（上下文状态机）=====
 
-const CTX_KEEP_RECENT_ROUNDS: usize = 3;
-
 #[derive(Debug, Clone)]
 pub(crate) struct DogState {
     messages: Vec<ApiMessage>,
     pub(crate) prompt: String,
+    #[allow(dead_code)]
     prompt_reinject_pct: u8,
     tool_result_assistant_template: String,
     tool_output_seq: u64,
@@ -619,8 +841,7 @@ pub(crate) struct DogState {
     used_tokens_est: usize,
     last_usage_total_tokens: u64,
     fastmemo_idx: Option<usize>,
-    ctx_compact_pending: bool,
-    pub(crate) ctx_compact_inflight: bool,
+    dyncontext_idx: Option<usize>,
     pub(crate) fastmemo_compact_pending: bool,
     include_tool_context: bool,
     date_injected: bool,
@@ -632,6 +853,7 @@ impl DogState {
         chrono::Local::now().format("%Y-%m-%d %:z").to_string()
     }
 
+    #[allow(dead_code)]
     fn now_time_tz() -> String {
         // 仅秒级：足够让模型感知时间流动，且 token 成本低；ms 级对模型决策通常无价值。
         chrono::Local::now().format("%H:%M:%S %:z").to_string()
@@ -662,14 +884,73 @@ impl DogState {
             used_tokens_est: 0,
             last_usage_total_tokens: 0,
             fastmemo_idx: None,
-            ctx_compact_pending: false,
-            ctx_compact_inflight: false,
+            dyncontext_idx: None,
             fastmemo_compact_pending: false,
             include_tool_context: true,
             date_injected: false,
         };
         s.inject_prompt();
         s
+    }
+
+    fn remove_message_at(&mut self, pos: usize) -> Option<ApiMessage> {
+        if pos >= self.messages.len() {
+            return None;
+        }
+        let removed = self.messages.remove(pos);
+        let old = crate::estimate_tokens(&removed.content);
+        self.used_tokens_est = self.used_tokens_est.saturating_sub(old);
+        Some(removed)
+    }
+
+    fn relocate_pinned_systems_after_prompt(&mut self) {
+        // 确保“prompt → fastmemo → dyncontext”的相对顺序稳定：
+        // 每次 inject_prompt() 发生时，把 pinned system blocks 重新移动到 prompt 之后（列表尾部）。
+        let mut fast: Option<ApiMessage> = None;
+        let mut dynctx: Option<ApiMessage> = None;
+
+        let mut pins: Vec<(usize, &'static str)> = Vec::new();
+        if let Some(i) = self.fastmemo_idx {
+            if i < self.messages.len() {
+                pins.push((i, "fast"));
+            } else {
+                self.fastmemo_idx = None;
+            }
+        }
+        if let Some(i) = self.dyncontext_idx {
+            if i < self.messages.len() {
+                pins.push((i, "dyn"));
+            } else {
+                self.dyncontext_idx = None;
+            }
+        }
+        if pins.is_empty() {
+            return;
+        }
+        // 倒序删除，避免索引漂移。
+        pins.sort_by_key(|(i, _)| *i);
+        for (i, kind) in pins.into_iter().rev() {
+            if let Some(msg) = self.remove_message_at(i) {
+                match kind {
+                    "fast" => fast = Some(msg),
+                    "dyn" => dynctx = Some(msg),
+                    _ => {}
+                }
+            }
+        }
+        self.fastmemo_idx = None;
+        self.dyncontext_idx = None;
+
+        if let Some(m) = fast {
+            let pos = self.messages.len();
+            self.push_message("system", Self::strip_stamp_footer(&m.content).to_string());
+            self.fastmemo_idx = Some(pos);
+        }
+        if let Some(m) = dynctx {
+            let pos = self.messages.len();
+            self.push_message("system", Self::strip_stamp_footer(&m.content).to_string());
+            self.dyncontext_idx = Some(pos);
+        }
     }
 
     fn inject_prompt(&mut self) {
@@ -683,6 +964,8 @@ impl DogState {
             return;
         }
         self.push_message("system", prompt.to_string());
+        // prompt reinject 之后，把 fastmemo/dyncontext 固定移动到 prompt 后面，避免顺序倒置。
+        self.relocate_pinned_systems_after_prompt();
     }
 
     fn push_message(&mut self, role: &str, content: String) {
@@ -725,6 +1008,7 @@ impl DogState {
         });
     }
 
+    #[allow(dead_code)]
     pub(crate) fn push_user(&mut self, text: &str, limit: usize) -> bool {
         self.user_count = self.user_count.saturating_add(1);
         let added = crate::estimate_tokens(text);
@@ -742,6 +1026,7 @@ impl DogState {
         reinject_now
     }
 
+    #[allow(dead_code)]
     pub(crate) fn push_assistant(&mut self, text: &str) {
         self.push_message("assistant", text.trim().to_string());
     }
@@ -859,30 +1144,18 @@ impl DogState {
         self.last_prompt_inject_user = 0;
         self.last_usage_total_tokens = 0;
         self.fastmemo_idx = None;
-        self.ctx_compact_pending = false;
-        self.ctx_compact_inflight = false;
+        self.dyncontext_idx = None;
         self.fastmemo_compact_pending = false;
         self.tool_output_seq = 0;
         self.last_tool_output_code = None;
         self.inject_prompt();
     }
 
-    pub(crate) fn push_ctx_pool_item(
-        &mut self,
-        _sys_cfg: &crate::config::SystemConfig,
-        item: &str,
-    ) {
-        if let Ok((_event_n, pending)) = append_fastmemo_event_pool_item(item) {
-            if pending {
-                self.fastmemo_compact_pending = true;
-            }
-        }
-    }
-
     pub(crate) fn messages_clone(&self) -> Vec<ApiMessage> {
         self.messages.clone()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn message_snapshot(&self, extra_system: Option<&str>) -> Vec<ApiMessage> {
         // Provider-facing: strip any historical `[t:HHMMSS]` stamps to avoid models echoing them.
         let mut out: Vec<ApiMessage> = self
@@ -904,46 +1177,52 @@ impl DogState {
                 });
             }
         }
-        normalize_messages_for_deepseek(&out)
+        normalize_messages_for_model_context(&out)
+    }
+
+    pub(crate) fn message_snapshot_with_context_file(
+        &self,
+        extra_system: Option<&str>,
+        context_path: &str,
+        mind: &str,
+    ) -> Vec<ApiMessage> {
+        // Provider-facing: pinned blocks come from in-memory snapshot (prompt/fastmemo),
+        // while turn history & tool receipts are replayed from the external context JSONL.
+        let mut out: Vec<ApiMessage> = self
+            .messages
+            .iter()
+            .map(|m| ApiMessage {
+                role: m.role.clone(),
+                content: Self::strip_stamp_footer(&m.content).trim().to_string(),
+            })
+            .filter(|m| !m.role.trim().is_empty() && !m.content.trim().is_empty())
+            .collect();
+        let mut ctx = read_contextlog_messages_for_mind(
+            context_path,
+            mind,
+            self.tool_result_assistant_template.as_str(),
+        );
+        // strip any legacy stamps (should be rare, but keep consistent)
+        for m in &mut ctx {
+            m.content = Self::strip_stamp_footer(&m.content).trim().to_string();
+        }
+        out.append(&mut ctx);
+        if let Some(extra) = extra_system {
+            let clean = extra.trim();
+            if !clean.is_empty() {
+                out.push(ApiMessage {
+                    role: "system".to_string(),
+                    content: Self::with_stamp_footer(clean),
+                });
+            }
+        }
+        normalize_messages_for_model_context(&out)
     }
 
     pub(crate) fn set_include_tool_context(&mut self, enabled: bool) {
         self.include_tool_context = enabled;
     }
 
-    fn estimate_total_tokens(&self) -> usize {
-        self.messages
-            .iter()
-            .map(|m| crate::estimate_tokens(&m.content))
-            .sum()
-    }
-
-    pub(crate) fn estimate_chat_tokens(&self) -> usize {
-        self.messages
-            .iter()
-            .filter(|m| m.role == "user" || m.role == "assistant")
-            .map(|m| crate::estimate_tokens(&m.content))
-            .sum()
-    }
-
-    fn recent_chat_window(&self, rounds: usize) -> Vec<ApiMessage> {
-        if rounds == 0 {
-            return Vec::new();
-        }
-        let keep = rounds.saturating_mul(2).max(1);
-        let chat: Vec<ApiMessage> = self
-            .messages
-            .iter()
-            .filter(|m| (m.role == "user" || m.role == "assistant") && !m.content.trim().is_empty())
-            .cloned()
-            .collect();
-        let start = chat.len().saturating_sub(keep);
-        chat[start..].to_vec()
-    }
-
-    fn recalc_used_tokens_est(&mut self) {
-        self.used_tokens_est = self.estimate_total_tokens();
-    }
 
     pub(crate) fn refresh_fastmemo_system(&mut self, text: &str) {
         let clean = text.trim();
@@ -957,82 +1236,16 @@ impl DogState {
         self.fastmemo_idx = idx;
     }
 
-    pub(crate) fn arm_context_compact_if_needed(
-        &mut self,
-        sys_cfg: &crate::config::SystemConfig,
-    ) -> bool {
-        if !sys_cfg.context_compact_enabled {
-            self.ctx_compact_pending = false;
-            self.ctx_compact_inflight = false;
-            return false;
+    #[allow(dead_code)]
+    pub(crate) fn refresh_dyncontext_system(&mut self, text: &str) {
+        let clean = text.trim();
+        if clean.is_empty() {
+            self.dyncontext_idx = None;
+            return;
         }
-        if self.ctx_compact_pending || self.ctx_compact_inflight {
-            return false;
-        }
-        let tokens = self.estimate_chat_tokens();
-        if tokens >= sys_cfg.ctx_recent_max_tokens {
-            let chat_total = self
-                .messages
-                .iter()
-                .filter(|m| m.role == "user" || m.role == "assistant")
-                .count();
-            if chat_total <= CTX_KEEP_RECENT_ROUNDS.saturating_mul(2) {
-                return false;
-            }
-            self.ctx_compact_pending = true;
-            return true;
-        }
-        false
-    }
-
-    pub(crate) fn begin_context_compact(&mut self) -> bool {
-        if self.ctx_compact_pending && !self.ctx_compact_inflight {
-            self.ctx_compact_pending = false;
-            self.ctx_compact_inflight = true;
-            return true;
-        }
-        false
-    }
-
-    pub(crate) fn abort_context_compact(&mut self) {
-        if self.ctx_compact_inflight {
-            self.ctx_compact_inflight = false;
-            self.ctx_compact_pending = true;
-        }
-    }
-
-    pub(crate) fn apply_context_compact(
-        &mut self,
-        _sys_cfg: &crate::config::SystemConfig,
-        summary: &str,
-    ) -> (usize, usize) {
-        let clean = summary.trim();
-        let chat_tokens_before = self.estimate_chat_tokens();
-        // 清空可压缩聊天记录：保留最近 3 轮对话 + 所有 system 头部（保持连贯性，避免彻底“断片”）。
-        let kept_recent = self.recent_chat_window(CTX_KEEP_RECENT_ROUNDS);
-        let mut kept: Vec<ApiMessage> = self
-            .messages
-            .iter()
-            .filter(|m| m.role == "system")
-            .cloned()
-            .collect();
-        if !kept_recent.is_empty() {
-            kept.extend(kept_recent);
-        }
-        self.messages = kept;
-        self.ctx_compact_inflight = false;
-        self.recalc_used_tokens_est();
-        let chat_tokens_after = self.estimate_chat_tokens();
-        let cleared = chat_tokens_before.saturating_sub(chat_tokens_after);
-        let mut pool_len = 0usize;
-        if !clean.is_empty() {
-            if let Ok((event_n, pending)) = append_fastmemo_event_pool_item(clean) {
-                pool_len = event_n;
-                if pending {
-                    self.fastmemo_compact_pending = true;
-                }
-            }
-        }
-        (cleared, pool_len)
+        let body = format!("【动态上下文 context】\n{clean}");
+        let mut idx = self.dyncontext_idx;
+        self.upsert_system_message(&mut idx, &body);
+        self.dyncontext_idx = idx;
     }
 }

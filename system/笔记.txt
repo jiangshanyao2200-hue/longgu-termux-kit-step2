@@ -1,0 +1,37 @@
+● Ran Bash · 获取系统信息
+             ↳ uname -a; echo '---'; pwd in ./system
+
+● SHELL · 检查设备连接
+          ↳ devices
+
+● TERMUX · 检查电源状态
+           ↳ termux-battery-status
+
+● Ran Bash · 获取系统信息
+             ↳ uname -a; echo '---'; pwd in ./system
+
+● SHELL · 检查设备连接
+          ↳ devices
+
+● TERMUX · 检查电源状态
+
+执行一轮显示优化
+这里 工具名称为黄色 非工具名称正常颜色 brief也是黄色（目前已是）需要优化其它工具的聊天区域解析显示优化
+如 ● Ran Bash
+adb为 ● ADB Shell （adb为白色不视为工具）
+TERMUX为● TERMUX api （api白色）
+list改为 ●Get List （get为白色）
+applypatch改为●Edited Ap（edited为白色 ap为黄色工具名）
+●memory系列修改优化
+●Memory Cheak（黄色）
+●Memory Read（黄色）
+●Memory Add（黄色）
+对各个工具的SHELL · 检查设备连接
+          ↳ devices（这里区域增加优化 使得其可以显示更多关键内容 尤其是执行memory工具和list等工具时） 然后优化applypatch 这个工具展开详情后不做截断优化，将模型写的++++----按顺序整理 按行数排版 单行信息过多做尾部截断
+          完整显示。
+然后优化每个工具的解析逻辑
+先解析工具类型 显示出来 如 ●Bash ·
+然后解析brief 显示出来 ●Bash · brief
+然后下方的内容才可以是Typing... 而非解析中。
+这个优化预期做到 瞬间解析工具类型与brief，至于后续命令慢慢解析。我希望↳ devices 这一行 在流式下能解析为跑马形式的，单行跑马显示AI在编辑什么 直到tool首尾 显示解析后内容
+那么需要做到这样就要改变数组 让inpput数组也就是模型可能编辑最多的地方始终置于tool name和brief的后面，方便前端解析toolname和brief 剩下的慢慢解析 跑马形式。单行 不超行。仅SSE下生效。非sse都走一次性解析。

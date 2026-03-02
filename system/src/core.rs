@@ -46,9 +46,11 @@ mod test;
 mod ui;
 
 pub(crate) use context::{
-    ApiMessage, ContextUsage, DogState, FASTMEMO_PATH, clear_contextmemo,
-    fastmemo_event_count_and_any_ge10, load_contextmemo_tokens, log_contextmemo,
-    normalize_messages_for_deepseek, read_contextmemo_text, read_fastmemo_for_context,
+    ApiMessage, ContextUsage, DogState, FASTMEMO_PATH, clear_contextmemo, clear_dyncontext_file,
+    contextmemo_size_kb,
+    fastmemo_event_count_and_any_ge10, fastmemo_max_section_usage, load_contextmemo_tokens,
+    log_contextmemo, log_dyncontext, normalize_messages_for_model_context, read_contextmemo_text,
+    read_fastmemo_for_context,
 };
 use providers::DogClient;
 
@@ -380,10 +382,101 @@ fn extract_tool_name_hint(text: &str) -> Option<String> {
     Some(quoted[..end].to_string())
 }
 
+fn extract_json_string_field_hint(text: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let pos = text.find(&needle)?;
+    let rest = &text[pos + needle.len()..];
+    let mut iter = rest.chars();
+    for ch in iter.by_ref() {
+        if ch == ':' {
+            break;
+        }
+        if !ch.is_whitespace() {
+            return None;
+        }
+    }
+    let rest: String = iter.collect();
+    let trimmed = rest.trim_start();
+    let quoted = trimmed.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    Some(quoted[..end].to_string())
+}
+
+fn extract_json_array_first_string_hint(text: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let pos = text.find(&needle)?;
+    let rest = &text[pos + needle.len()..];
+    let mut iter = rest.chars();
+    for ch in iter.by_ref() {
+        if ch == ':' {
+            break;
+        }
+        if !ch.is_whitespace() {
+            return None;
+        }
+    }
+    let rest: String = iter.collect();
+    let trimmed = rest.trim_start();
+    let arr = trimmed.strip_prefix('[')?;
+    let qpos = arr.find('"')?;
+    let after = &arr[qpos + 1..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+fn safe_tail_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut buf: Vec<char> = Vec::with_capacity(max_chars.min(256));
+    for ch in text.chars() {
+        if buf.len() == max_chars {
+            buf.remove(0);
+        }
+        buf.push(ch);
+    }
+    buf.into_iter().collect()
+}
+
+fn build_tool_stream_stub_text(label: &str, tool_slice: &str) -> String {
+    let brief = extract_json_string_field_hint(tool_slice, "brief")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "...".to_string());
+
+    let mut input = extract_json_string_field_hint(tool_slice, "input")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            extract_json_array_first_string_hint(tool_slice, "commands")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
+
+    if input.is_empty() {
+        // 兜底：展示正在输出的 JSON 尾部（压缩空白），用于“跑马提示”。
+        let compact = tool_slice
+            .replace('\n', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        input = safe_tail_chars(&compact, 160);
+        if input.is_empty() {
+            input = "...".to_string();
+        }
+    }
+
+    format!(
+        "操作: {label}\nexplain: {brief}\ninput: {input}\noutput:\n```text\n...\n```\nmeta:\n```text\n状态:parsing\n```\n"
+    )
+}
+
 fn mind_label(kind: MindKind) -> &'static str {
     match kind {
         MindKind::Main => "MAIN",
         MindKind::Sub => "DOG",
+        MindKind::Memory => "MEM",
     }
 }
 
@@ -406,6 +499,7 @@ fn normalize_mind_target_kind(raw: &str) -> Option<MindKind> {
     match t.as_str() {
         "dog" | "sub" | "todog" | "to_dog" | "to-dog" | "潜意识" => Some(MindKind::Sub),
         "main" | "tomain" | "to_main" | "to-main" | "主意识" | "萤" => Some(MindKind::Main),
+        "memory" | "mem" | "tomemory" | "to_memory" | "to-memory" | "记忆" => Some(MindKind::Memory),
         _ => None,
     }
 }
@@ -518,8 +612,6 @@ struct ActiveStatusArgs<'a> {
     tool_preview: &'a str,
     pending_tool_confirm: Option<&'a ToolCall>,
     active_tool_stream: Option<&'a ToolStreamState>,
-    ctx_compact_main: bool,
-    ctx_compact_dog: bool,
     mind_pulse: Option<PulseDir>,
     input_active: bool,
     diary_active: bool,
@@ -541,8 +633,6 @@ fn build_active_status(args: ActiveStatusArgs<'_>) -> Option<String> {
         tool_preview,
         pending_tool_confirm,
         active_tool_stream,
-        ctx_compact_main,
-        ctx_compact_dog,
         mind_pulse,
         input_active,
         diary_active,
@@ -550,7 +640,8 @@ fn build_active_status(args: ActiveStatusArgs<'_>) -> Option<String> {
     fn mind_name(kind: MindKind) -> &'static str {
         match kind {
             MindKind::Main => "Main",
-            MindKind::Sub => "Memory",
+            MindKind::Sub => "Dog",
+            MindKind::Memory => "Memory",
         }
     }
     fn tool_name(tool: &str) -> String {
@@ -563,9 +654,7 @@ fn build_active_status(args: ActiveStatusArgs<'_>) -> Option<String> {
             "memory_add" => "MAdd".to_string(),
             "memory_check" => "MFind".to_string(),
             "memory_read" => "MRead".to_string(),
-            "memory_edit" => "MEdit".to_string(),
             "mind_msg" => "Mind".to_string(),
-            "context_compact" => "CtxCompact".to_string(),
             other => other.to_string(),
         }
     }
@@ -582,13 +671,10 @@ fn build_active_status(args: ActiveStatusArgs<'_>) -> Option<String> {
     }
     if let Some(dir) = mind_pulse {
         let s = match dir {
-            PulseDir::MainToDog => "Linking Main → Memory",
-            PulseDir::DogToMain => "Linking Memory → Main",
+            PulseDir::MainToDog => "Linking Main → Dog",
+            PulseDir::DogToMain => "Linking Dog → Main",
         };
         return Some(s.to_string());
-    }
-    if ctx_compact_main || ctx_compact_dog {
-        return Some("Compacting context".to_string());
     }
     if let Some(call) = pending_tool_confirm {
         return Some(format!("Approve tool: {}", tool_name(&call.tool)));
@@ -650,9 +736,6 @@ fn settings_field_hint(section: SettingsSection, kind: SettingsFieldKind) -> &'s
         (SettingsSection::PromptCenter, SettingsFieldKind::ContextMainPrompt) => {
             "Edit MAIN context prompt"
         }
-        (SettingsSection::PromptCenter, SettingsFieldKind::ContextCompactPrompt) => {
-            "Edit context compact prompt"
-        }
         _ => match kind {
             SettingsFieldKind::Static => "",
             SettingsFieldKind::Provider => "Select provider",
@@ -662,17 +745,14 @@ fn settings_field_hint(section: SettingsSection, kind: SettingsFieldKind) -> &'s
             SettingsFieldKind::ReasoningEffort => "Reasoning effort",
             SettingsFieldKind::Temperature => "Temperature (0~2)",
             SettingsFieldKind::MaxTokens => "Max tokens",
-            SettingsFieldKind::ContextK => "Context compaction threshold (k)",
+            SettingsFieldKind::DateKbLimit => "Diary trigger threshold (KB, 0=off)",
             SettingsFieldKind::HeartbeatMinutes => "Heartbeat interval (min, 0=off)",
             SettingsFieldKind::SseEnabled => "Toggle SSE",
-            SettingsFieldKind::ContextMaxTokens => "Dynamic context threshold (tokens)",
-            SettingsFieldKind::ContextPoolMaxItems => "Summary pool size",
-            SettingsFieldKind::ChatTarget => "Switch model (Main/Memory)",
+            SettingsFieldKind::ChatTarget => "Switch model (Main/Dog)",
             SettingsFieldKind::ExecPermission => "Tool execution permission (safe/full)",
             SettingsFieldKind::DogPrompt => "Edit DOG prompt",
             SettingsFieldKind::MainPrompt => "Edit MAIN prompt",
             SettingsFieldKind::ContextMainPrompt => "Edit context prompt",
-            SettingsFieldKind::ContextCompactPrompt => "Edit context compact prompt",
         },
     }
 }
@@ -1357,7 +1437,7 @@ mod message_normalize_tests {
                 content: "b".to_string(),
             },
         ];
-        let snap = normalize_messages_for_deepseek(&msgs);
+        let snap = crate::context::normalize_messages_for_provider("deepseek", &msgs);
         let assistants: Vec<&ApiMessage> = snap.iter().filter(|m| m.role == "assistant").collect();
         assert_eq!(assistants.len(), 1);
         assert!(assistants[0].content.contains("a"));
@@ -1566,15 +1646,144 @@ fn load_main_api_config() -> (MainApiConfig, Option<String>, PathBuf) {
 }
 
 
-fn load_memory_api_config() -> (MainApiConfig, Option<String>, PathBuf) {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct MainApiOverrides {
+    api_key: Option<String>,
+    provider: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    temperature: Option<f32>,
+    timeout_secs: Option<u64>,
+    max_tokens: Option<u32>,
+    provider_profiles: Option<ApiProviderProfilesOverrides>,
+    prompt_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ApiProviderProfilesOverrides {
+    deepseek: Option<ApiProviderProfileOverrides>,
+    codex: Option<ApiProviderProfileOverrides>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ApiProviderProfileOverrides {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+}
+
+fn merge_main_api_overrides(mut base: MainApiConfig, ov: MainApiOverrides) -> MainApiConfig {
+    let set_opt_str = |dst: &mut String, v: Option<String>| {
+        if let Some(v) = v {
+            let t = v.trim().to_string();
+            if !t.is_empty() {
+                *dst = t;
+            }
+        }
+    };
+    let set_opt_u64 = |dst: &mut u64, v: Option<u64>| {
+        if let Some(v) = v {
+            if v > 0 {
+                *dst = v;
+            }
+        }
+    };
+    let set_opt_u32 = |dst: &mut Option<u32>, v: Option<u32>| {
+        if let Some(v) = v {
+            if v > 0 {
+                *dst = Some(v);
+            }
+        }
+    };
+
+    if let Some(v) = ov.api_key {
+        if !v.trim().is_empty() {
+            base.api_key = Some(v.trim().to_string());
+        }
+    }
+    set_opt_str(&mut base.provider, ov.provider);
+    set_opt_str(&mut base.base_url, ov.base_url);
+    set_opt_str(&mut base.model, ov.model);
+    if let Some(v) = ov.reasoning_effort {
+        let t = v.trim().to_string();
+        if !t.is_empty() {
+            base.reasoning_effort = Some(t);
+        }
+    }
+    if let Some(v) = ov.temperature {
+        base.temperature = Some(v);
+    }
+    set_opt_u64(&mut base.timeout_secs, ov.timeout_secs);
+    set_opt_u32(&mut base.max_tokens, ov.max_tokens);
+    if let Some(v) = ov.prompt_path {
+        let t = v.trim().to_string();
+        if !t.is_empty() {
+            base.prompt_path = t;
+        }
+    }
+
+    if let Some(pp) = ov.provider_profiles {
+        if let Some(p) = pp.deepseek {
+            set_opt_str(&mut base.provider_profiles.deepseek.base_url, p.base_url);
+            if let Some(v) = p.api_key {
+                if !v.trim().is_empty() {
+                    base.provider_profiles.deepseek.api_key = Some(v.trim().to_string());
+                }
+            }
+            set_opt_str(&mut base.provider_profiles.deepseek.model, p.model);
+            if let Some(v) = p.reasoning_effort {
+                let t = v.trim().to_string();
+                if !t.is_empty() {
+                    base.provider_profiles.deepseek.reasoning_effort = Some(t);
+                }
+            }
+            if let Some(v) = p.temperature {
+                base.provider_profiles.deepseek.temperature = Some(v);
+            }
+            set_opt_u32(&mut base.provider_profiles.deepseek.max_tokens, p.max_tokens);
+        }
+        if let Some(p) = pp.codex {
+            set_opt_str(&mut base.provider_profiles.codex.base_url, p.base_url);
+            if let Some(v) = p.api_key {
+                if !v.trim().is_empty() {
+                    base.provider_profiles.codex.api_key = Some(v.trim().to_string());
+                }
+            }
+            set_opt_str(&mut base.provider_profiles.codex.model, p.model);
+            if let Some(v) = p.reasoning_effort {
+                let t = v.trim().to_string();
+                if !t.is_empty() {
+                    base.provider_profiles.codex.reasoning_effort = Some(t);
+                }
+            }
+            if let Some(v) = p.temperature {
+                base.provider_profiles.codex.temperature = Some(v);
+            }
+            set_opt_u32(&mut base.provider_profiles.codex.max_tokens, p.max_tokens);
+        }
+    }
+
+    base
+}
+
+fn load_memory_api_config(main_cfg: &MainApiConfig) -> (MainApiConfig, Option<String>, PathBuf) {
+    // Memory 默认复用 MAIN 配置（保持同步）。memoryAPI.json 仅作为可选 overrides。
     let path_buf = resolve_config_path_from_env("YING_MEMORY_CONFIG", "config/memoryAPI.json");
-    let (mut cfg, err) = load_json_config::<MainApiConfig>(&path_buf, "MEMORY 配置");
+    let (mut ov, err) = load_json_config::<MainApiOverrides>(&path_buf, "MEMORY 配置");
     if let Ok(key) =
         std::env::var("DEEPSEEK_API_KEY").or_else(|_| std::env::var("YING_MEMORY_API_KEY"))
         && !key.trim().is_empty()
     {
-        cfg.api_key = Some(key);
+        ov.api_key = Some(key);
     }
+    let mut cfg = merge_main_api_overrides(main_cfg.clone(), ov);
     normalize_common_api_fields(
         &mut cfg.provider,
         &mut cfg.temperature,
@@ -1591,16 +1800,11 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
     if cfg.context_k < 8 || cfg.context_k > 1024 {
         cfg.context_k = 128;
     }
+    // 日记压缩阈值：以 contextmemo 文件大小（KB）计算；0 表示关闭自动写日记。
+    if cfg.date_kb_limit > 200_000 {
+        cfg.date_kb_limit = 256;
+    }
     cfg.heartbeat_minutes = normalize_heartbeat_minutes(cfg.heartbeat_minutes);
-    if cfg.ctx_recent_max_tokens < 500 || cfg.ctx_recent_max_tokens > 200_000 {
-        cfg.ctx_recent_max_tokens = 3000;
-    }
-    if cfg.ctx_pool_max_items == 0 || cfg.ctx_pool_max_items > 50 {
-        cfg.ctx_pool_max_items = 10;
-    }
-    if cfg.context_compact_prompt_path.trim().is_empty() {
-        cfg.context_compact_prompt_path = "prompt/contextsummary.txt".to_string();
-    }
     if cfg.pty_audit_prompt_path.trim().is_empty() {
         cfg.pty_audit_prompt_path = "prompt/ptycheck.txt".to_string();
     }
@@ -1665,10 +1869,9 @@ fn normalize_heartbeat_minutes(value: usize) -> usize {
 }
 
 fn parse_chat_target(raw: &str) -> MindKind {
-    if normalize_chat_target_value(raw) == "main" {
-        MindKind::Main
-    } else {
-        MindKind::Sub
+    match normalize_chat_target_value(raw).as_str() {
+        "main" => MindKind::Main,
+        _ => MindKind::Sub,
     }
 }
 
@@ -1676,8 +1879,10 @@ fn reset_state_for_target(
     target: MindKind,
     dog_state: &mut DogState,
     main_state: &mut DogState,
+    memory_state: &mut DogState,
     mind_ctx_idx_main: &mut Option<usize>,
     mind_ctx_idx_dog: &mut Option<usize>,
+    mind_ctx_idx_memory: &mut Option<usize>,
 ) {
     match target {
         MindKind::Main => {
@@ -1687,6 +1892,10 @@ fn reset_state_for_target(
         MindKind::Sub => {
             dog_state.reset_context();
             *mind_ctx_idx_dog = None;
+        }
+        MindKind::Memory => {
+            memory_state.reset_context();
+            *mind_ctx_idx_memory = None;
         }
     }
 }
@@ -1790,7 +1999,6 @@ fn info_label_for_tool(tool: &str) -> &'static str {
     match tool {
         "memory_add" => "日记",
         "memory_check" | "memory_read" => "回忆",
-        "memory_edit" => "记录",
         "bash" => "命令",
         "adb" | "termux_api" => "调试",
         "list" => "文件",
@@ -1973,15 +2181,6 @@ fn load_context_prompts() -> (ContextPromptConfig, Vec<String>, PathBuf) {
     (ContextPromptConfig { main_prompt }, errors, main_path)
 }
 
-const DEFAULT_CONTEXT_COMPACT_PROMPT: &str = "系统：聊天窗口已达到动态压缩阈值（请严格按要求执行）。\n\n你将看到：提示词、fastmemo、动态摘要池、以及最近的聊天记录。\n\n任务：\n- 只压缩“本条用户消息之前”的聊天记录（不包含提示词/fastmemo/动态摘要池，也不包含本条用户消息）。\n- 仅压缩较旧聊天记录：保留最近 3 轮对话不写入压缩产物（用于保持连贯性）。\n- 压缩产物只需一段纯文本：简短描述聊了什么、记录关键事实/约束/进度/待办，避免失忆。\n- 压缩要与动态摘要池形成连续记忆：避免机械重复旧摘要，能增量更新就增量更新。\n\n输出格式：\n- 本轮只允许输出 1 条工具 JSON（不要附加说明/不要输出正文/不要调用其他工具）。\n- 工具名固定为 context_compact。\n\n工具 JSON 示例：\n<tool>{\"tool\":\"context_compact\",\"target\":\"{TARGET}\",\"content\":\"(你的压缩文本)\",\"brief\":\"↻ context summary\"}</tool>\n\n注意：target 必须是 {TARGET}（main 或 dog）。\n用户最新消息（不要写入压缩内容）：\n{USER}\n";
-
-fn load_context_compact_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
-    let path = resolve_config_path(&sys_cfg.context_compact_prompt_path, true);
-    let (text, err) =
-        load_prompt_file_with_default(&path, DEFAULT_CONTEXT_COMPACT_PROMPT, "CONTEXT-COMPACT");
-    (text, err, path)
-}
-
 const DEFAULT_PTY_AUDIT_PROMPT: &str = "[sys:PTY审计]后台 PTY 仍在运行（已到审计间隔）。\nowner:{OWNER} | running_total:{RUNNING_TOTAL} | running_owner:{RUNNING_OWNER}\n\n请先调用 1 次 `pty.list`。\n然后用 2-4 行回答：是否仍在运行、是否建议 `pty.kill(job_id)`；不要输出键位/触控说明；不要反复轮询。";
 
 fn load_pty_audit_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, PathBuf) {
@@ -1990,7 +2189,8 @@ fn load_pty_audit_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, Pat
     (text, err, path)
 }
 
-const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str = "系统：fastmemo 已达到阈值，需要进行压缩（由 DOG 执行，静默维护）。\n\n任务：\n- 读取 fastmemo（优先使用 memory_read 读取 fastmemo 原文；若上下文已包含 fastmemo，也可直接使用）。\n- fastmemo 包含 4 个固定区域：[自我感知] [用户感知] [环境感知] [事件感知]\n- 你需要把每个区域的内容“迭代压缩”为 1 条 bullet（只保留长期稳定、可复用、关键的信息；不确定就丢弃或标注待确认）。\n- 禁止把工具输出原文/日志/大段代码写回 fastmemo；若需要引用，只写摘要+指针。\n\n输出格式（强制）：\n- 只允许输出工具 JSON（不要输出正文）。\n- 推荐流程：先 1 次 memory_read，然后依次对 4 个区域使用 memory_edit(section=..., content=...) 覆盖为 1 条 bullet。\n\n示例：\n<tool>{\"tool\":\"memory_read\",\"path\":\"fastmemo\",\"brief\":\"读取 fastmemo 原文\"}</tool>\n<tool>{\"tool\":\"memory_edit\",\"path\":\"fastmemo\",\"section\":\"自我感知\",\"content\":\"- ...\",\"brief\":\"压缩自我感知\"}</tool>\n\n注意：完成压缩后，不要再输出任何解释性文字。";
+const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str =
+    "系统：fastmemo 某分区已达到10条，需要压缩（由 MEMORY 执行）。\n\n目标：只压缩1个分区，然后停止。\n步骤：\n1 调用 memory_read(path=fastmemo) 读取原文\n2 找到条目数>=10的第一个分区，优先级：自我感知>用户感知>环境感知>动态上下文\n3 将该分区10条压缩为1条 bullet（长期稳定/可复用/关键信息；不确定丢弃；不要写回大段日志/代码）\n4 调用 memory_add(path=fastmemo, section=..., compact=true, content=\"- ...\") 写回";
 
 fn load_fastmemo_compact_prompt() -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path_from_env(
@@ -2012,30 +2212,6 @@ fn load_welcome_shortcuts_prompt(sys_cfg: &SystemConfig) -> (String, Option<Stri
         DEFAULT_WELCOME_SHORTCUTS_PROMPT_LABEL,
     );
     (text, err, path)
-}
-
-fn render_context_compact_prompt(
-    template: &str,
-    target: MindKind,
-    sys_cfg: &SystemConfig,
-    latest_user: &str,
-) -> String {
-    let t = template.trim();
-    let tpl = if t.is_empty() {
-        DEFAULT_CONTEXT_COMPACT_PROMPT
-    } else {
-        t
-    };
-    let target_label = if matches!(target, MindKind::Main) {
-        "main"
-    } else {
-        "dog"
-    };
-    tpl.replace("{TARGET}", target_label)
-        // 兼容旧模板：ROUNDS 已弃用（改为 token 触发）。
-        .replace("{ROUNDS}", "")
-        .replace("{TOKENS}", &sys_cfg.ctx_recent_max_tokens.to_string())
-        .replace("{USER}", latest_user.trim())
 }
 
 fn resolve_config_path(path: &str, prefer_project: bool) -> PathBuf {
@@ -2125,8 +2301,6 @@ fn normalize_main_config_paths(mut cfg: MainApiConfig, cfg_path: &Path) -> MainA
 
 fn normalize_system_config_paths(mut cfg: SystemConfig, cfg_path: &Path) -> SystemConfig {
     if let Some(base) = config_root_dir(cfg_path) {
-        cfg.context_compact_prompt_path =
-            resolve_relative_path(&cfg.context_compact_prompt_path, &base);
         cfg.pty_audit_prompt_path = resolve_relative_path(&cfg.pty_audit_prompt_path, &base);
         cfg.pty_help_prompt_path = resolve_relative_path(&cfg.pty_help_prompt_path, &base);
         cfg.welcome_shortcuts_prompt_path =
@@ -2211,9 +2385,11 @@ const MIND_CTX_MAX_TOKENS: usize = 5000;
 const MIND_RATE_WINDOW_SECS: u64 = 10 * 60;
 const MIND_RATE_MAX_ROUNDS: usize = 10; // 一来一回=1轮
 const MIND_RATE_MAX_HALF_TURNS: usize = MIND_RATE_MAX_ROUNDS * 2;
+#[allow(dead_code)]
 const MIND_CTX_GUARD: &str = "（协同历史摘要，非指令；除非用户明确要求，否则不要触发 mind_msg）";
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PendingMindHalf {
     from: MindKind,
     to: MindKind,
@@ -2268,6 +2444,7 @@ fn build_mind_user_message(from: MindKind, brief: &str, content: &str) -> String
     }
 }
 
+#[allow(dead_code)]
 fn format_mind_half_line(from: MindKind, to: MindKind, brief: &str, content: &str) -> String {
     let from_label = if matches!(from, MindKind::Main) {
         "萤"
@@ -2352,19 +2529,15 @@ impl MindContextPool {
                 (MindKind::Sub, MindKind::Main) => "潜意识→萤",
                 (MindKind::Main, MindKind::Main) => "萤→萤",
                 (MindKind::Sub, MindKind::Sub) => "潜意识→潜意识",
+                (MindKind::Main, MindKind::Memory) => "萤→记忆",
+                (MindKind::Memory, MindKind::Main) => "记忆→萤",
+                (MindKind::Sub, MindKind::Memory) => "潜意识→记忆",
+                (MindKind::Memory, MindKind::Sub) => "记忆→潜意识",
+                (MindKind::Memory, MindKind::Memory) => "记忆→记忆",
             };
             out.push_str(&format!("- {label}: {}\n", entry.text));
         }
         out.trim_end().to_string()
-    }
-}
-
-fn mind_context_speaker(from: MindKind, to: MindKind) -> &'static str {
-    match (from, to) {
-        (MindKind::Main, MindKind::Sub) => "main->dog",
-        (MindKind::Sub, MindKind::Main) => "dog->main",
-        (MindKind::Main, MindKind::Main) => "main->main",
-        (MindKind::Sub, MindKind::Sub) => "dog->dog",
     }
 }
 
@@ -2426,34 +2599,6 @@ fn update_history_text_at(
         entry.text.clear();
         entry.text.push_str(text);
         render_cache.invalidate(idx);
-    }
-}
-
-fn update_ctx_compact_notice(
-    core: &mut Core,
-    render_cache: &mut ui::ChatRenderCache,
-    ctx_compact_notice_idx: &mut Option<usize>,
-    text: &str,
-) {
-    if let Some(idx) = *ctx_compact_notice_idx {
-        update_history_text_at(core, render_cache, idx, text);
-        *ctx_compact_notice_idx = None;
-    }
-}
-
-fn update_ctx_compact_notice_if_system(
-    core: &mut Core,
-    render_cache: &mut ui::ChatRenderCache,
-    ctx_compact_notice_idx: &mut Option<usize>,
-    text: &str,
-) {
-    if let Some(idx) = *ctx_compact_notice_idx
-        && core
-            .history
-            .get(idx)
-            .is_some_and(|m| m.role == Role::System)
-    {
-        update_ctx_compact_notice(core, render_cache, ctx_compact_notice_idx, text);
     }
 }
 
@@ -2818,17 +2963,14 @@ enum SettingsFieldKind {
     ReasoningEffort,
     Temperature,
     MaxTokens,
-    ContextK,
+    DateKbLimit,
     HeartbeatMinutes,
     SseEnabled,
-    ContextMaxTokens,
-    ContextPoolMaxItems,
     ChatTarget,
     ExecPermission,
     DogPrompt,
     MainPrompt,
     ContextMainPrompt,
-    ContextCompactPrompt,
 }
 
 struct SettingsFieldSpec {
@@ -3137,17 +3279,18 @@ struct CommitSettingsInputArgs<'a> {
     sys_cfg_path: &'a Path,
     dog_state: &'a mut DogState,
     main_state: &'a mut DogState,
+    memory_state: &'a mut DogState,
     mind_ctx_idx_main: &'a mut Option<usize>,
     mind_ctx_idx_dog: &'a mut Option<usize>,
+    mind_ctx_idx_memory: &'a mut Option<usize>,
     main_prompt_text: &'a mut String,
-    context_compact_prompt_text: &'a mut String,
     dog_client: &'a mut Option<DogClient>,
     main_client: &'a mut Option<DogClient>,
+    memory_client: &'a mut Option<DogClient>,
     sys_log: &'a mut VecDeque<String>,
     sys_log_limit: usize,
     context_prompts: &'a mut ContextPromptConfig,
     context_prompt_path: &'a Path,
-    context_compact_prompt_path: &'a Path,
     sse_enabled: &'a mut bool,
     chat_target: &'a mut MindKind,
 }
@@ -3169,17 +3312,18 @@ fn commit_settings_input(args: CommitSettingsInputArgs<'_>) {
         sys_cfg_path,
         dog_state,
         main_state,
+        memory_state,
         mind_ctx_idx_main,
         mind_ctx_idx_dog,
+        mind_ctx_idx_memory,
         main_prompt_text,
-        context_compact_prompt_text,
         dog_client,
         main_client,
+        memory_client,
         sys_log,
         sys_log_limit,
         context_prompts,
         context_prompt_path,
-        context_compact_prompt_path,
         sse_enabled,
         chat_target,
     } = args;
@@ -3200,17 +3344,18 @@ fn commit_settings_input(args: CommitSettingsInputArgs<'_>) {
         sys_cfg_path,
         dog_state,
         main_state,
+        memory_state,
         mind_ctx_idx_main,
         mind_ctx_idx_dog,
+        mind_ctx_idx_memory,
         main_prompt_text,
-        context_compact_prompt_text,
         dog_client,
         main_client,
+        memory_client,
         sys_log,
         sys_log_limit,
         context_prompts,
         context_prompt_path,
-        context_compact_prompt_path,
     });
     sync_system_toggles(sys_cfg, sse_enabled, chat_target);
     settings.focus = SettingsFocus::Fields;
@@ -3248,7 +3393,6 @@ fn is_prompt_kind(kind: SettingsFieldKind) -> bool {
         SettingsFieldKind::DogPrompt
             | SettingsFieldKind::MainPrompt
             | SettingsFieldKind::ContextMainPrompt
-            | SettingsFieldKind::ContextCompactPrompt
     )
 }
 
@@ -3279,6 +3423,7 @@ fn chat_target_is_codex(
     chat_target: MindKind,
     dog_client: &Option<DogClient>,
     main_client: &Option<DogClient>,
+    memory_client: &Option<DogClient>,
 ) -> bool {
     let provider = match chat_target {
         MindKind::Sub => dog_client
@@ -3286,6 +3431,10 @@ fn chat_target_is_codex(
             .map(|c| c.provider())
             .unwrap_or("deepseek"),
         MindKind::Main => main_client
+            .as_ref()
+            .map(|c| c.provider())
+            .unwrap_or("deepseek"),
+        MindKind::Memory => memory_client
             .as_ref()
             .map(|c| c.provider())
             .unwrap_or("deepseek"),
@@ -3371,7 +3520,6 @@ struct BuildSettingsFieldsArgs<'a> {
     dog_prompt_text: &'a str,
     main_prompt_text: &'a str,
     context_prompts: &'a ContextPromptConfig,
-    context_compact_prompt_text: &'a str,
 }
 
 fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsFieldSpec> {
@@ -3384,7 +3532,6 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
         dog_prompt_text,
         main_prompt_text,
         context_prompts,
-        context_compact_prompt_text,
     } = args;
     match section {
         SettingsSection::Api => {
@@ -3607,11 +3754,16 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
         }
         SettingsSection::System => vec![
             SettingsFieldSpec {
-                label: "Ctx compact (k)",
-                value: format!("{}k", sys_cfg.context_k),
-                kind: SettingsFieldKind::ContextK,
+                label: "Date diary (KB)",
+                value: if sys_cfg.date_kb_limit == 0 {
+                    "Off".to_string()
+                } else {
+                    format!("{}KB", sys_cfg.date_kb_limit)
+                },
+                kind: SettingsFieldKind::DateKbLimit,
                 api_kind: None,
-                },            SettingsFieldSpec {
+            },
+            SettingsFieldSpec {
                 label: "Heartbeat",
                 value: if sys_cfg.heartbeat_minutes == 0 {
                     "Off".to_string()
@@ -3620,22 +3772,14 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 },
                 kind: SettingsFieldKind::HeartbeatMinutes,
                 api_kind: None,
-                },            SettingsFieldSpec {
-                label: "Dyn ctx (tok)",
-                value: format!("{}", sys_cfg.ctx_recent_max_tokens),
-                kind: SettingsFieldKind::ContextMaxTokens,
-                api_kind: None,
-                },            SettingsFieldSpec {
-                label: "Summary pool",
-                value: format!("{} items", sys_cfg.ctx_pool_max_items),
-                kind: SettingsFieldKind::ContextPoolMaxItems,
-                api_kind: None,
-                },            SettingsFieldSpec {
+            },
+            SettingsFieldSpec {
                 label: "Chat target",
                 value: format_chat_target(&sys_cfg.chat_target),
                 kind: SettingsFieldKind::ChatTarget,
                 api_kind: None,
-                },            SettingsFieldSpec {
+            },
+            SettingsFieldSpec {
                 label: "Exec perm",
                 value: if sys_cfg.tool_full_access {
                     "Full".to_string()
@@ -3644,12 +3788,14 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 },
                 kind: SettingsFieldKind::ExecPermission,
                 api_kind: None,
-                },            SettingsFieldSpec {
+            },
+            SettingsFieldSpec {
                 label: "SSE",
                 value: format_toggle(sys_cfg.sse_enabled),
                 kind: SettingsFieldKind::SseEnabled,
                 api_kind: None,
-                },        ],
+            },
+        ],
         SettingsSection::PromptCenter => vec![
             SettingsFieldSpec {
                 label: "1 DOG prompt",
@@ -3666,11 +3812,6 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 value: summarize_prompt(&context_prompts.main_prompt),
                 kind: SettingsFieldKind::ContextMainPrompt,
                 api_kind: None,
-                },            SettingsFieldSpec {
-                label: "4 Context compact",
-                value: summarize_prompt(context_compact_prompt_text),
-                kind: SettingsFieldKind::ContextCompactPrompt,
-                api_kind: None,
                 },        ],
     }
 }
@@ -3686,7 +3827,6 @@ struct FieldRawValueArgs<'a> {
     dog_prompt_text: &'a str,
     main_prompt_text: &'a str,
     context_prompts: &'a ContextPromptConfig,
-    context_compact_prompt_text: &'a str,
 }
 
 fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
@@ -3701,7 +3841,6 @@ fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
         dog_prompt_text,
         main_prompt_text,
         context_prompts,
-        context_compact_prompt_text,
     } = args;
     match kind {
         SettingsFieldKind::Static => String::new(),
@@ -3763,10 +3902,8 @@ fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
         },
         SettingsFieldKind::DogPrompt => dog_prompt_text.to_string(),
         SettingsFieldKind::MainPrompt => main_prompt_text.to_string(),
-        SettingsFieldKind::ContextK => sys_cfg.context_k.to_string(),
+        SettingsFieldKind::DateKbLimit => sys_cfg.date_kb_limit.to_string(),
         SettingsFieldKind::HeartbeatMinutes => sys_cfg.heartbeat_minutes.to_string(),
-        SettingsFieldKind::ContextMaxTokens => sys_cfg.ctx_recent_max_tokens.to_string(),
-        SettingsFieldKind::ContextPoolMaxItems => sys_cfg.ctx_pool_max_items.to_string(),
         SettingsFieldKind::SseEnabled => {
             if sys_cfg.sse_enabled {
                 "on".to_string()
@@ -3783,7 +3920,6 @@ fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
             }
         }
         SettingsFieldKind::ContextMainPrompt => context_prompts.main_prompt.to_string(),
-        SettingsFieldKind::ContextCompactPrompt => context_compact_prompt_text.to_string(),
     }
 }
 
@@ -3973,17 +4109,18 @@ struct ApplySettingsEditArgs<'a> {
     sys_cfg_path: &'a Path,
     dog_state: &'a mut DogState,
     main_state: &'a mut DogState,
+    memory_state: &'a mut DogState,
     mind_ctx_idx_main: &'a mut Option<usize>,
     mind_ctx_idx_dog: &'a mut Option<usize>,
+    mind_ctx_idx_memory: &'a mut Option<usize>,
     main_prompt_text: &'a mut String,
-    context_compact_prompt_text: &'a mut String,
     dog_client: &'a mut Option<DogClient>,
     main_client: &'a mut Option<DogClient>,
+    memory_client: &'a mut Option<DogClient>,
     sys_log: &'a mut VecDeque<String>,
     sys_log_limit: usize,
     context_prompts: &'a mut ContextPromptConfig,
     context_prompt_path: &'a Path,
-    context_compact_prompt_path: &'a Path,
 }
 
 fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String> {
@@ -4001,17 +4138,18 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
         sys_cfg_path,
         dog_state,
         main_state,
+        memory_state,
         mind_ctx_idx_main,
         mind_ctx_idx_dog,
+        mind_ctx_idx_memory,
         main_prompt_text,
-        context_compact_prompt_text,
         dog_client,
         main_client,
+        memory_client,
         sys_log,
         sys_log_limit,
         context_prompts,
         context_prompt_path,
-        context_compact_prompt_path,
     } = args;
 
     let trimmed = value.trim();
@@ -4214,18 +4352,20 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                 }
             }
         }
-        SettingsFieldKind::ContextK => {
+        SettingsFieldKind::DateKbLimit => {
             if trimmed.is_empty() {
-                return Err("上下文压缩阈值不能为空".to_string());
+                return Err("日记阈值不能为空".to_string());
             }
-            let raw = trimmed.trim_end_matches(['k', 'K']);
+            let raw = trimmed
+                .trim_end_matches(['k', 'K', 'b', 'B'])
+                .trim_end_matches(['k', 'K']); // 兼容输入 "256KB"/"256k"
             let v: usize = raw
                 .parse()
-                .map_err(|_| "上下文压缩阈值需为数字".to_string())?;
-            if !(8..=1024).contains(&v) {
-                return Err("上下文压缩阈值范围 8~1024k".to_string());
+                .map_err(|_| "日记阈值需为数字".to_string())?;
+            if v > 200_000 {
+                return Err("日记阈值范围 0~200000KB（0=关闭）".to_string());
             }
-            sys_cfg.context_k = v;
+            sys_cfg.date_kb_limit = v;
             store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
         }
         SettingsFieldKind::HeartbeatMinutes => {
@@ -4238,31 +4378,6 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                 return Err("心跳仅支持 0/5/10/30/60 分钟（0=关闭）".to_string());
             }
             sys_cfg.heartbeat_minutes = v;
-            store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
-        }
-        SettingsFieldKind::ContextMaxTokens => {
-            if trimmed.is_empty() {
-                return Err("动态上下文阈值不能为空".to_string());
-            }
-            let v: usize = trimmed
-                .parse()
-                .map_err(|_| "动态上下文阈值需为数字".to_string())?;
-            if !(500..=200_000).contains(&v) {
-                return Err("动态上下文阈值范围 500~200000".to_string());
-            }
-            sys_cfg.ctx_recent_max_tokens = v;
-            store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
-        }
-        SettingsFieldKind::ContextPoolMaxItems => {
-            if trimmed.is_empty() {
-                return Err("摘要池不能为空".to_string());
-            }
-            let raw = trimmed.trim_end_matches(['条']);
-            let v: usize = raw.parse().map_err(|_| "摘要池需为数字".to_string())?;
-            if v == 0 || v > 30 {
-                return Err("摘要池范围 1~30".to_string());
-            }
-            sys_cfg.ctx_pool_max_items = v;
             store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
         }
         SettingsFieldKind::SseEnabled => {
@@ -4306,8 +4421,10 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                 target,
                 dog_state,
                 main_state,
+                memory_state,
                 mind_ctx_idx_main,
                 mind_ctx_idx_dog,
+                mind_ctx_idx_memory,
             );
         }
         SettingsFieldKind::DogPrompt => {
@@ -4328,11 +4445,6 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             context_prompts.main_prompt = value.to_string();
             store_prompt_file(context_prompt_path, &context_prompts.main_prompt)
                 .map_err(|e| e.to_string())?;
-        }
-        SettingsFieldKind::ContextCompactPrompt => {
-            let text = value.to_string();
-            store_prompt_file(context_compact_prompt_path, &text).map_err(|e| e.to_string())?;
-            *context_compact_prompt_text = text;
         }
     }
 
@@ -4382,6 +4494,29 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             }
         }
     }
+    if matches!(section, SettingsSection::Api) && matches!(api_kind, ApiConfigKind::Memory)
+        && matches!(
+            kind,
+            SettingsFieldKind::Provider
+                | SettingsFieldKind::BaseUrl
+                | SettingsFieldKind::ApiKey
+                | SettingsFieldKind::Model
+                | SettingsFieldKind::ReasoningEffort
+                | SettingsFieldKind::Temperature
+                | SettingsFieldKind::MaxTokens
+        )
+    {
+        match build_main_client(memory_cfg) {
+            Ok(client) => {
+                *memory_client = Some(client);
+                push_sys_log(sys_log, sys_log_limit, "MEM: 配置已更新");
+            }
+            Err(e) => {
+                *memory_client = None;
+                push_sys_log(sys_log, sys_log_limit, format!("MEM: 配置无效 {e}"));
+            }
+        }
+    }
 
     Ok("已保存".to_string())
 }
@@ -4403,17 +4538,18 @@ struct ApplySettingsWithNoticeArgs<'a> {
     sys_cfg_path: &'a Path,
     dog_state: &'a mut DogState,
     main_state: &'a mut DogState,
+    memory_state: &'a mut DogState,
     mind_ctx_idx_main: &'a mut Option<usize>,
     mind_ctx_idx_dog: &'a mut Option<usize>,
+    mind_ctx_idx_memory: &'a mut Option<usize>,
     main_prompt_text: &'a mut String,
-    context_compact_prompt_text: &'a mut String,
     dog_client: &'a mut Option<DogClient>,
     main_client: &'a mut Option<DogClient>,
+    memory_client: &'a mut Option<DogClient>,
     sys_log: &'a mut VecDeque<String>,
     sys_log_limit: usize,
     context_prompts: &'a mut ContextPromptConfig,
     context_prompt_path: &'a Path,
-    context_compact_prompt_path: &'a Path,
 }
 
 fn apply_settings_with_notice(args: ApplySettingsWithNoticeArgs<'_>) {
@@ -4433,17 +4569,18 @@ fn apply_settings_with_notice(args: ApplySettingsWithNoticeArgs<'_>) {
         sys_cfg_path,
         dog_state,
         main_state,
+        memory_state,
         mind_ctx_idx_main,
         mind_ctx_idx_dog,
+        mind_ctx_idx_memory,
         main_prompt_text,
-        context_compact_prompt_text,
         dog_client,
         main_client,
+        memory_client,
         sys_log,
         sys_log_limit,
         context_prompts,
         context_prompt_path,
-        context_compact_prompt_path,
     } = args;
 
     match apply_settings_edit(ApplySettingsEditArgs {
@@ -4460,17 +4597,18 @@ fn apply_settings_with_notice(args: ApplySettingsWithNoticeArgs<'_>) {
         sys_cfg_path,
         dog_state,
         main_state,
+        memory_state,
         mind_ctx_idx_main,
         mind_ctx_idx_dog,
+        mind_ctx_idx_memory,
         main_prompt_text,
-        context_compact_prompt_text,
         dog_client,
         main_client,
+        memory_client,
         sys_log,
         sys_log_limit,
         context_prompts,
         context_prompt_path,
-        context_compact_prompt_path,
     }) {
         Ok(msg) => set_settings_notice(settings, now, msg),
         Err(e) => set_settings_notice(settings, now, e),
@@ -4623,17 +4761,6 @@ fn spawn_tool_execution(
         call: Box::new(call.clone()),
         sys_msg: Some("工具执行中".to_string()),
     });
-    if call.tool == "context_compact" {
-        let outcome = ToolOutcome {
-            user_message: "context_compact: ok".to_string(),
-            log_lines: vec![],
-        };
-        let _ = tx.send(AsyncEvent::ToolStreamEnd {
-            outcome,
-            sys_msg: Some("上下文压缩完成".to_string()),
-        });
-        return;
-    }
     if call.tool == "pty" {
         let _ = tx.send(AsyncEvent::PtyToolRequest {
             owner,
@@ -4674,6 +4801,7 @@ struct StartUserChatRequestArgs<'a> {
     pending_mind_half: &'a mut Option<PendingMindHalf>,
     dog_state: &'a mut DogState,
     main_state: &'a mut DogState,
+    memory_state: &'a mut DogState,
     sys_cfg: &'a SystemConfig,
     config: &'a AppConfig,
     tx: &'a mpsc::Sender<AsyncEvent>,
@@ -4698,12 +4826,12 @@ struct StartUserChatRequestArgs<'a> {
     expanded_thinking_idxs: &'a mut BTreeSet<usize>,
     scroll: &'a mut u16,
     follow_bottom: &'a mut bool,
-    context_compact_prompt_text: &'a str,
     token_totals: &'a mut TokenTotals,
     token_total_path: &'a Path,
     active_request_in_tokens: &'a mut Option<u64>,
     dog_client: &'a Option<DogClient>,
     main_client: &'a Option<DogClient>,
+    memory_client: &'a Option<DogClient>,
 }
 
 fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result<()> {
@@ -4719,6 +4847,7 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
         pending_mind_half,
         dog_state,
         main_state,
+        memory_state,
         sys_cfg,
         config,
         tx,
@@ -4743,17 +4872,37 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
         expanded_thinking_idxs: _expanded_thinking_idxs,
         scroll,
         follow_bottom,
-        context_compact_prompt_text,
         token_totals,
         token_total_path,
         active_request_in_tokens,
         dog_client,
         main_client,
+        memory_client,
     } = args;
 
     let ui_text = ui_text.trim_end().to_string();
     let model_text = model_text.trim_end().to_string();
     if model_text.trim().is_empty() {
+        return Ok(());
+    }
+    // Memory 测试入口：发送 `test` 给 Memory 时，直接把主 contextmemo 填充到 Date 阈值，
+    // 以验证“计数→触发写日记→写入 datememo→清空 contextmemo”的闭环。
+    //
+    // 注意：
+    // - 写入内容带 `[TEST-FILL]` 标记；datesummary 提示词会明确要求忽略这些行。
+    // - 本次不向模型发起对话请求，只触发“即将写日记”的条件。
+    if target == MindKind::Memory && model_text.trim().eq_ignore_ascii_case("test") {
+        let kb_limit = sys_cfg.date_kb_limit;
+        if kb_limit > 0 {
+            fill_contextmemo_to_kb_limit_for_test(&config.contextmemo_path, context_usage, kb_limit);
+        }
+        core.history.push(Message {
+            role: Role::System,
+            text: "··· 已触发日记测试：Date 计数已填充到阈值（空闲时将启动写日记）".to_string(),
+            mind: Some(MindKind::Memory),
+        });
+        *scroll = u16::MAX;
+        *follow_bottom = true;
         return Ok(());
     }
     // Internal DeepSeek role-needed placeholder:
@@ -4764,16 +4913,18 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
     let internal_role_needed_placeholder =
         ui_text.trim().is_empty() && crate::context::is_role_needed_user_placeholder(&model_text);
     *active_request_is_internal_placeholder = internal_role_needed_placeholder;
-    if let Some(pending) = pending_mind_half.take() {
-        let item = format!(
-            "{MIND_CTX_GUARD}\n协同记录（未完成一轮）：{}",
-            format_mind_half_line(pending.from, pending.to, &pending.brief, &pending.content)
-        );
-        main_state.push_ctx_pool_item(sys_cfg, &item);
-        dog_state.push_ctx_pool_item(sys_cfg, &item);
-    }
+    let _ = pending_mind_half.take();
 
-    core.push_user(ui_text.clone());
+    // Memory 专属聊天界面：用户输入不进入主聊天时间线（避免污染），改为写入 Memory 频道。
+    if target == MindKind::Memory && !ui_text.trim().is_empty() {
+        core.history.push(Message {
+            role: Role::User,
+            text: ui_text.clone(),
+            mind: Some(MindKind::Memory),
+        });
+    } else {
+        core.push_user(ui_text.clone());
+    }
     thinking_text.clear();
     thinking_full_text.clear();
     *thinking_started_at = None;
@@ -4794,6 +4945,13 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
         if matches!(target, MindKind::Main) {
             log_contextmemo(&config.contextmemo_path, context_usage, "user", &model_text);
         }
+        let mind = match target {
+            MindKind::Main => "main",
+            MindKind::Sub => "dog",
+            MindKind::Memory => "memory",
+        };
+        let p = context_path_for_mind(config, mind);
+        log_dyncontext(p, mind, "user", &model_text, None, None);
     }
 
     defer_heartbeat(next_heartbeat_at, now);
@@ -4802,49 +4960,20 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
     *follow_bottom = true;
 
     *active_kind = target;
-    let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
 
     if sys_cfg.fastmemo_inject_enabled {
         let fastmemo = read_fastmemo_for_context();
         match target {
             MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
             MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
-        }
-    }
-    if !internal_role_needed_placeholder {
-        match target {
-            MindKind::Main => {
-                let _ = main_state.push_user(&model_text, ctx_limit);
-            }
-            MindKind::Sub => {
-                let _ = dog_state.push_user(&model_text, ctx_limit);
-            }
+            MindKind::Memory => memory_state.refresh_fastmemo_system(&fastmemo),
         }
     }
 
-    let extra_system_compact = if match target {
-        MindKind::Main => main_state.begin_context_compact(),
-        MindKind::Sub => dog_state.begin_context_compact(),
-    } {
-        push_sys_log(sys_log, config.sys_log_limit, "↻ Context Summary 压缩中");
-        Some(render_context_compact_prompt(
-            context_compact_prompt_text,
-            target,
-            sys_cfg,
-            &model_text,
-        ))
-    } else {
-        None
-    };
-    let extra_system = match (extra_system_override, extra_system_compact) {
-        (None, None) => None,
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (Some(a), Some(b)) => Some(format!("{}\n\n{}", a.trim_end(), b.trim_start())),
-    };
+    let extra_system = extra_system_override;
 
-    let started = if matches!(target, MindKind::Main) {
-        try_start_main_generation(TryStartMainGenerationArgs {
+    let started = match target {
+        MindKind::Main => try_start_main_generation(TryStartMainGenerationArgs {
             main_client,
             main_state,
             extra_system: extra_system.clone(),
@@ -4860,9 +4989,8 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
             active_request_id,
             active_cancel,
             sse_enabled,
-        })
-    } else {
-        try_start_dog_generation(TryStartDogGenerationArgs {
+        }),
+        MindKind::Sub => try_start_dog_generation(TryStartDogGenerationArgs {
             kind: MindKind::Sub,
             dog_client,
             dog_state,
@@ -4879,7 +5007,24 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
             active_request_id,
             active_cancel,
             sse_enabled,
-        })
+        }),
+        MindKind::Memory => try_start_memory_generation(TryStartMemoryGenerationArgs {
+            memory_client,
+            memory_state,
+            extra_system,
+            tx,
+            config,
+            mode,
+            active_kind,
+            sending_until,
+            sys_log,
+            sys_log_limit: config.sys_log_limit,
+            streaming_state,
+            request_seq,
+            active_request_id,
+            active_cancel,
+            sse_enabled,
+        }),
     };
     if let Some(in_tokens) = started {
         record_request_in_tokens(
@@ -4919,8 +5064,10 @@ fn handle_send_text(
     chat_target: &mut MindKind,
     dog_state: &mut DogState,
     main_state: &mut DogState,
+    memory_state: &mut DogState,
     mind_ctx_idx_main: &mut Option<usize>,
     mind_ctx_idx_dog: &mut Option<usize>,
+    mind_ctx_idx_memory: &mut Option<usize>,
     screen: &mut Screen,
     help_ui: &mut HelpUiState,
     should_exit: &mut bool,
@@ -4949,7 +5096,6 @@ fn handle_send_text(
     scroll: &mut u16,
     follow_bottom: &mut bool,
     next_heartbeat_at: &mut Instant,
-    context_compact_prompt_text: &str,
     dog_client: &Option<DogClient>,
     main_client: &Option<DogClient>,
     token_totals: &mut TokenTotals,
@@ -4965,6 +5111,7 @@ fn handle_send_text(
         return Ok(());
     }
     let mut _dummy_open_user_terminal = false;
+    let mut _dummy_memory_panel_open = false;
     // 先允许处理斜杠命令（包含 /settings /quit 等）。
     if handle_command(HandleCommandArgs {
         core,
@@ -4976,14 +5123,17 @@ fn handle_send_text(
         chat_target,
         dog_state,
         main_state,
+        memory_state,
         mind_ctx_idx_main,
         mind_ctx_idx_dog,
+        mind_ctx_idx_memory,
         screen,
         help_ui,
         should_exit,
         sse_enabled,
         enter_cmd_shell: pending_cmd_shell,
         open_user_terminal: &mut _dummy_open_user_terminal,
+        memory_panel_open: &mut _dummy_memory_panel_open,
         exit_code,
         sys_cfg,
         sys_cfg_path,
@@ -5003,7 +5153,6 @@ fn handle_send_text(
             collapsed_tool_idxs: &mut collapsed_tool_idxs,
             expanded_user_idxs: &mut expanded_user_idxs,
             collapsed_user_idxs: &mut collapsed_user_idxs,
-            ctx_compact_notice_idx: &mut None,
             expanded_thinking_idxs,
             collapsed_thinking_idxs: &mut collapsed_thinking_idxs,
             selected_msg_idx: &mut None,
@@ -5038,25 +5187,18 @@ fn handle_send_text(
     }
 
     let send_text = send.clone();
-    if let Some(pending) = pending_mind_half.take() {
-        let item = format!(
-            "{MIND_CTX_GUARD}\n协同记录（未完成一轮）：{}",
-            format_mind_half_line(pending.from, pending.to, &pending.brief, &pending.content)
-        );
-        main_state.push_ctx_pool_item(sys_cfg, &item);
-        dog_state.push_ctx_pool_item(sys_cfg, &item);
-    }
+    let _ = pending_mind_half.take();
     core.push_user(send);
     thinking_text.clear();
     thinking_full_text.clear();
     *thinking_started_at = None;
     *thinking_pending_idle = false;
-    if *sse_enabled {
-        *thinking_in_progress = true;
-        let stub = build_thinking_tool_message_stub(target, "running", "Thinking");
-        core.push_tool(stub);
-        *thinking_idx = Some(core.history.len().saturating_sub(1));
-    } else {
+	    if *sse_enabled {
+	        *thinking_in_progress = true;
+	        let stub = build_thinking_tool_message_stub(target, "running", "Thinking");
+	        core.push_tool_mind(stub, Some(target));
+	        *thinking_idx = Some(core.history.len().saturating_sub(1));
+	    } else {
         *thinking_in_progress = false;
         *thinking_idx = None;
     }
@@ -5069,42 +5211,28 @@ fn handle_send_text(
     if matches!(target, MindKind::Main) {
         log_contextmemo(&config.contextmemo_path, context_usage, "user", &send_text);
     }
+    let mind = match target {
+        MindKind::Main => "main",
+        MindKind::Sub => "dog",
+        MindKind::Memory => "memory",
+    };
+    let p = context_path_for_mind(config, mind);
+    log_dyncontext(p, mind, "user", &send_text, None, None);
     defer_heartbeat(next_heartbeat_at, now);
     // 保留用户展开状态：发送新消息不应强制把 Tab/Shift+Tab 的展开形态重置。
     *scroll = u16::MAX;
     *follow_bottom = true;
 
     *active_kind = target;
-    let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
     if sys_cfg.fastmemo_inject_enabled {
         let fastmemo = read_fastmemo_for_context();
         match target {
             MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
             MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
+            MindKind::Memory => memory_state.refresh_fastmemo_system(&fastmemo),
         }
     }
-    match target {
-        MindKind::Main => {
-            let _ = main_state.push_user(&send_text, ctx_limit);
-        }
-        MindKind::Sub => {
-            let _ = dog_state.push_user(&send_text, ctx_limit);
-        }
-    }
-    let extra_system = if match target {
-        MindKind::Main => main_state.begin_context_compact(),
-        MindKind::Sub => dog_state.begin_context_compact(),
-    } {
-        push_sys_log(sys_log, config.sys_log_limit, "↻ Context Summary 压缩中");
-        Some(render_context_compact_prompt(
-            context_compact_prompt_text,
-            target,
-            sys_cfg,
-            &send_text,
-        ))
-    } else {
-        None
-    };
+    let extra_system = None;
     let started = if matches!(target, MindKind::Main) {
         try_start_main_generation(TryStartMainGenerationArgs {
             main_client,
@@ -5827,6 +5955,7 @@ fn build_thinking_summary(kind: MindKind, secs: u64) -> String {
     match kind {
         MindKind::Main => String::new(),
         MindKind::Sub => pick_thinking_word_dog(secs),
+        MindKind::Memory => String::new(),
     }
 }
 
@@ -6059,6 +6188,7 @@ fn build_switch_prompt(target: MindKind) -> String {
     match target {
         MindKind::Main => "··· Switch to 萤·主意识".to_string(),
         MindKind::Sub => "··· Switch to 萤·潜意识".to_string(),
+        MindKind::Memory => "··· Switch to 萤·记忆".to_string(),
     }
 }
 
@@ -6094,7 +6224,7 @@ fn build_main_diary_prompt(
     let default_prompt = "系统：context 已满，需要进行上下文压缩。\
 请你根据当前记忆生成日记，并直接调用 memory_add 写入 datememo。\
 系统会附带上一条日记用于对比，请避免重复。仅输出工具 JSON，不要附加说明。\
-格式：<tool>{\"tool\":\"memory_add\",\"path\":\"datememo\",\"content\":\"YYYY-MM-DD HH:MM:SS | main | 关键词: ... | 日记: ...\",\"brief\":\"我来更新日记。\"}</tool>";
+格式：<tool>{\"tool\":\"memory_add\",\"path\":\"datememo\",\"content\":\"YYYY-MM-DD HH:MM:SS | memory | 关键词: ... | 日记: ...\",\"brief\":\"我来更新日记。\"}</tool>";
     let mut out = if prompt_override.trim().is_empty() {
         default_prompt.to_string()
     } else {
@@ -6119,6 +6249,28 @@ fn build_main_diary_prompt(
         out.push('\n');
     }
     out
+}
+
+fn fill_contextmemo_to_kb_limit_for_test(
+    path: &str,
+    usage: &mut ContextUsage,
+    kb_limit: usize,
+) {
+    if kb_limit == 0 {
+        return;
+    }
+    // 开放但有上限：只用于测试把 Date 计数打满，不要把上下文写爆到不可控。
+    // 每次写入约 8KB 的 filler（包含明确标记，便于日记提示词忽略）。
+    const CHUNK_BYTES: usize = 8 * 1024;
+    const MAX_WRITES: usize = 64;
+    let mut writes = 0usize;
+    while contextmemo_size_kb(path) < kb_limit && writes < MAX_WRITES {
+        let mut filler = String::new();
+        filler.push_str("[TEST-FILL] ");
+        filler.push_str("x".repeat(CHUNK_BYTES.saturating_sub(12)).as_str());
+        log_contextmemo(path, usage, "user", &filler);
+        writes = writes.saturating_add(1);
+    }
 }
 
 fn extract_thinking_tags(text: &str) -> (String, String) {
@@ -6381,7 +6533,6 @@ struct ResetAfterCommandArgs<'a> {
     collapsed_tool_idxs: &'a mut BTreeSet<usize>,
     expanded_user_idxs: &'a mut BTreeSet<usize>,
     collapsed_user_idxs: &'a mut BTreeSet<usize>,
-    ctx_compact_notice_idx: &'a mut Option<usize>,
     expanded_thinking_idxs: &'a mut BTreeSet<usize>,
     collapsed_thinking_idxs: &'a mut BTreeSet<usize>,
     selected_msg_idx: &'a mut Option<usize>,
@@ -6419,7 +6570,6 @@ fn reset_after_command(args: ResetAfterCommandArgs<'_>) {
         collapsed_tool_idxs,
         expanded_user_idxs,
         collapsed_user_idxs,
-        ctx_compact_notice_idx,
         expanded_thinking_idxs,
         collapsed_thinking_idxs,
         selected_msg_idx,
@@ -6488,7 +6638,6 @@ fn reset_after_command(args: ResetAfterCommandArgs<'_>) {
         collapsed_thinking_idxs,
         selected_msg_idx,
         tool_preview_chat_idx,
-        ctx_compact_notice_idx,
         streaming_state,
         active_tool_stream,
     });
@@ -6643,8 +6792,12 @@ fn write_termux_cmd_banner() {
     for line in art {
         let _ = writeln!(out, "{}{}", " ".repeat(left_pad), line);
     }
-    let tip = "tips：输入 /AI 回到主面板";
-    let _ = writeln!(out, "\n{}{}", " ".repeat(left_pad), tip);
+    let tip1 = "提示：这是用户手动打开的终端窗口";
+    let tip2 = "该窗口由用户自己执行命令与退出，非 AI 自动化任务";
+    let tip3 = "tips：输入 /AI 回到主面板";
+    let _ = writeln!(out, "\n{}{}", " ".repeat(left_pad), tip1);
+    let _ = writeln!(out, "{}{}", " ".repeat(left_pad), tip2);
+    let _ = writeln!(out, "{}{}", " ".repeat(left_pad), tip3);
     let _ = writeln!(out);
     let _ = out.flush();
 }
@@ -6903,18 +7056,18 @@ fn handle_model_stream_start(args: ModelStreamStartArgs<'_>) {
     let codex_mode = expect_brief;
     if !is_heartbeat && thinking_idx.is_none() && !codex_mode {
         let stub = build_thinking_tool_message_stub(kind, "running", "Thinking");
-        core.push_tool(stub);
+        core.push_tool_mind(stub, Some(kind));
         *thinking_idx = Some(core.history.len().saturating_sub(1));
     }
     if !is_heartbeat && codex_mode {
         // Codex：把 brief/think 作为“可选元数据”放在正文前，但默认不显示占位。
         // UI 会忽略 provider:codex 且内容为空的 stub，直到收到真实 brief/reasoning。
         if brief_idx.is_none() {
-            core.push_tool(build_codex_brief_tool_message_stub(kind));
+            core.push_tool_mind(build_codex_brief_tool_message_stub(kind), Some(kind));
             *brief_idx = Some(core.history.len().saturating_sub(1));
         }
         if thinking_idx.is_none() {
-            core.push_tool(build_codex_thinking_tool_message_stub(kind));
+            core.push_tool_mind(build_codex_thinking_tool_message_stub(kind), Some(kind));
             *thinking_idx = Some(core.history.len().saturating_sub(1));
         }
     }
@@ -7015,22 +7168,23 @@ fn handle_tool_stream_start(args: ToolStreamStartArgs<'_>) {
         meta: vec![],
         placeholder: true,
     };
-    let tool_text = build_tool_stream_message(&state);
-    if let Some(stub_idx) = tool_preview_chat_idx.take()
-        && core
-            .history
-            .get(stub_idx)
-            .is_some_and(|m| m.role == Role::Tool)
-    {
-        if let Some(entry) = core.history.get_mut(stub_idx) {
-            entry.text.clone_from(&tool_text);
-            render_cache.invalidate(stub_idx);
-        }
-        state.idx = stub_idx;
-    } else {
-        core.push_tool(tool_text.clone());
-        state.idx = core.history.len().saturating_sub(1);
-    }
+	    let tool_text = build_tool_stream_message(&state);
+	    if let Some(stub_idx) = tool_preview_chat_idx.take()
+	        && core
+	            .history
+	            .get(stub_idx)
+	            .is_some_and(|m| m.role == Role::Tool)
+	    {
+	        if let Some(entry) = core.history.get_mut(stub_idx) {
+	            entry.text.clone_from(&tool_text);
+	            entry.mind = Some(owner);
+	            render_cache.invalidate(stub_idx);
+	        }
+	        state.idx = stub_idx;
+	    } else {
+	        core.push_tool_mind(tool_text.clone(), Some(owner));
+	        state.idx = core.history.len().saturating_sub(1);
+	    }
     // 默认只展示 brief：工具详情由用户手动展开（→）。
     expanded_tool_idxs.remove(&state.idx);
     *active_tool_stream = Some(state);
@@ -7040,119 +7194,7 @@ fn handle_tool_stream_start(args: ToolStreamStartArgs<'_>) {
     jump_to_bottom(scroll, follow_bottom);
 }
 
-struct ContextCompactToolArgs<'a> {
-    state: &'a ToolStreamState,
-    outcome: &'a mut ToolOutcome,
-    main_state: &'a mut DogState,
-    dog_state: &'a mut DogState,
-    sys_cfg: &'a mut SystemConfig,
-    sys_log: &'a mut VecDeque<String>,
-    sys_log_limit: usize,
-    core: &'a mut Core,
-    render_cache: &'a mut ui::ChatRenderCache,
-    ctx_compact_notice_idx: &'a mut Option<usize>,
-}
-
-fn handle_context_compact_tool(args: ContextCompactToolArgs<'_>) {
-    let ContextCompactToolArgs {
-        state,
-        outcome,
-        main_state,
-        dog_state,
-        sys_cfg,
-        sys_log,
-        sys_log_limit,
-        core,
-        render_cache,
-        ctx_compact_notice_idx,
-    } = args;
-
-    if !sys_cfg.context_compact_enabled {
-        outcome.user_message = "context_compact 已停用（开发期聚焦 MCP）".to_string();
-        outcome
-            .log_lines
-            .push("状态:skipped | reason:context_compact_disabled".to_string());
-        update_ctx_compact_notice(
-            core,
-            render_cache,
-            ctx_compact_notice_idx,
-            "↻ CONTEXT SUMMARY（已停用）",
-        );
-        match state.owner {
-            MindKind::Main => main_state.abort_context_compact(),
-            MindKind::Sub => dog_state.abort_context_compact(),
-        }
-        return;
-    }
-
-    let target = state
-        .call
-        .target
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| {
-            if matches!(state.owner, MindKind::Main) {
-                "main".to_string()
-            } else {
-                "dog".to_string()
-            }
-        });
-    let kind = if target == "main" {
-        MindKind::Main
-    } else {
-        MindKind::Sub
-    };
-    let summary = state
-        .call
-        .content
-        .as_deref()
-        .unwrap_or(state.call.input.trim())
-        .trim()
-        .to_string();
-    if summary.is_empty() {
-        match kind {
-            MindKind::Main => main_state.abort_context_compact(),
-            MindKind::Sub => dog_state.abort_context_compact(),
-        }
-        outcome.user_message = "context_compact 失败：缺少 content".to_string();
-        outcome
-            .log_lines
-            .push("状态:fail | reason:missing_content".to_string());
-        update_ctx_compact_notice(
-            core,
-            render_cache,
-            ctx_compact_notice_idx,
-            "↻ CONTEXT SUMMARY 执行已中断",
-        );
-        return;
-    }
-
-    let (cleared_chat_tokens, pool_len) = match kind {
-        MindKind::Main => main_state.apply_context_compact(sys_cfg, &summary),
-        MindKind::Sub => dog_state.apply_context_compact(sys_cfg, &summary),
-    };
-    outcome.user_message = format!(
-        "↻ context summary 已写入（池 {pool_len} 条），已清空 {cleared_chat_tokens} 聊天tokens"
-    );
-    outcome.log_lines.push(format!(
-        "状态:0 | target:{} | pool:{} | cleared_chat_tokens:{}",
-        if matches!(kind, MindKind::Main) {
-            "main"
-        } else {
-            "dog"
-        },
-        pool_len,
-        cleared_chat_tokens
-    ));
-    push_sys_log(sys_log, sys_log_limit, "↻ Context Summary 已更新");
-    update_ctx_compact_notice(
-        core,
-        render_cache,
-        ctx_compact_notice_idx,
-        "↻ CONTEXT SUMMARY 已更新",
-    );
-}
-
+#[allow(dead_code)]
 struct MindMsgToolArgs<'a> {
     state: &'a ToolStreamState,
     pending_mind_half: &'a mut Option<PendingMindHalf>,
@@ -7167,11 +7209,11 @@ fn handle_mind_msg_tool(args: MindMsgToolArgs<'_>) -> Option<(MindKind, MindKind
     let MindMsgToolArgs {
         state,
         pending_mind_half,
-        main_state,
-        dog_state,
-        sys_cfg,
-        config,
-        context_usage,
+        main_state: _,
+        dog_state: _,
+        sys_cfg: _,
+        config: _config,
+        context_usage: _context_usage,
     } = args;
     let target = resolve_mind_target_kind(&state.call)?;
     let content = resolve_mind_message_text(&state.call);
@@ -7194,51 +7236,28 @@ fn handle_mind_msg_tool(args: MindMsgToolArgs<'_>) -> Option<(MindKind, MindKind
     let content_clean = content.trim().to_string();
     let brief_clean = brief.trim().to_string();
 
-    if let Some(prev) = pending_mind_half.take() {
-        let paired = prev.from == target && prev.to == owner;
-        if paired {
-            let item = format!(
-                "{MIND_CTX_GUARD}\n协同记录（1轮）：\n- {}\n- {}\n",
-                format_mind_half_line(prev.from, prev.to, &prev.brief, &prev.content),
-                format_mind_half_line(owner, target, &brief_clean, &content_clean)
-            );
-            main_state.push_ctx_pool_item(sys_cfg, &item);
-            dog_state.push_ctx_pool_item(sys_cfg, &item);
-        } else {
-            let item = format!(
-                "{MIND_CTX_GUARD}\n协同记录（未完成一轮）：{}",
-                format_mind_half_line(prev.from, prev.to, &prev.brief, &prev.content)
-            );
-            main_state.push_ctx_pool_item(sys_cfg, &item);
-            dog_state.push_ctx_pool_item(sys_cfg, &item);
-            *pending_mind_half = Some(PendingMindHalf {
-                from: owner,
-                to: target,
-                brief: brief_clean.clone(),
-                content: content_clean.clone(),
-            });
-        }
-    } else {
-        *pending_mind_half = Some(PendingMindHalf {
-            from: owner,
-            to: target,
-            brief: brief_clean.clone(),
-            content: content_clean.clone(),
-        });
-    }
-
-    log_contextmemo(
-        &config.contextmemo_path,
-        context_usage,
-        mind_context_speaker(owner, target),
-        &content_clean,
-    );
+    *pending_mind_half = Some(PendingMindHalf {
+        from: owner,
+        to: target,
+        brief: brief_clean.clone(),
+        content: content_clean.clone(),
+    });
 
     Some((owner, target, brief_clean, content_clean))
 }
 
 fn handle_error_retry(retry_status: &mut Option<String>, attempt: usize, max: usize) {
     *retry_status = Some(format!("♡ 现在[萤]第{attempt}/{max}次重试中…"));
+}
+
+fn context_path_for_mind<'a>(config: &'a AppConfig, mind: &str) -> &'a str {
+    if mind.trim().eq_ignore_ascii_case("memory") {
+        config.memory_context_path.as_str()
+    } else if mind.trim().eq_ignore_ascii_case("dog") {
+        config.dog_context_path.as_str()
+    } else {
+        config.dyncontext_path.as_str()
+    }
 }
 
 fn run_loop(
@@ -7255,7 +7274,7 @@ fn run_loop(
     trace_startup("run_loop: dog_cfg ok");
     let (mut main_cfg, main_cfg_err, main_cfg_path) = load_main_api_config();
     trace_startup("run_loop: main_cfg ok");
-    let (mut memory_cfg, memory_cfg_err, memory_cfg_path) = load_memory_api_config();
+    let (mut memory_cfg, memory_cfg_err, memory_cfg_path) = load_memory_api_config(&main_cfg);
     trace_startup("run_loop: memory_cfg ok");
     let (mut sys_cfg, sys_cfg_err, sys_cfg_path) = load_system_config();
     trace_startup("run_loop: sys_cfg ok");
@@ -7265,11 +7284,19 @@ fn run_loop(
         config.metamemo_path = resolve_relative_path(&config.metamemo_path, &root);
         config.datememo_path = resolve_relative_path(&config.datememo_path, &root);
         config.contextmemo_path = resolve_relative_path(&config.contextmemo_path, &root);
+        config.dyncontext_path = resolve_relative_path(&config.dyncontext_path, &root);
+        config.dog_context_path = resolve_relative_path(&config.dog_context_path, &root);
+        config.memory_context_path = resolve_relative_path(&config.memory_context_path, &root);
         config.run_log_path = resolve_relative_path(&config.run_log_path, &root);
         config.memo_db_path = resolve_relative_path(&config.memo_db_path, &root);
         let _ = std::env::set_current_dir(&root);
     }
     trace_startup("run_loop: root resolved");
+    // 会话上下文外置：每次启动清空 context JSONL（MAIN/DOG 与 MEMORY 分离）。
+    // 暂不做阈值/截断；文件增长仅影响本次会话。
+    clear_dyncontext_file(&config.dyncontext_path);
+    clear_dyncontext_file(&config.dog_context_path);
+    clear_dyncontext_file(&config.memory_context_path);
     trace_startup("run_loop: init_run_logger");
     init_run_logger(&config.run_log_path);
     trace_startup("run_loop: init_run_logger ok");
@@ -7283,6 +7310,9 @@ fn run_loop(
             "metamemo_path": config.metamemo_path,
             "datememo_path": config.datememo_path,
             "contextmemo_path": config.contextmemo_path,
+            "dyncontext_path": config.dyncontext_path,
+            "dog_context_path": config.dog_context_path,
+            "memory_context_path": config.memory_context_path,
             "memo_db_path": config.memo_db_path,
             "version": env!("CARGO_PKG_VERSION"),
             "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
@@ -7336,8 +7366,14 @@ fn run_loop(
             String::new()
         }
     };
-    let (mut context_compact_prompt_text, context_compact_prompt_err, context_compact_prompt_path) =
-        load_context_compact_prompt(&sys_cfg);
+    let mut _memory_prompt_err: Option<String> = None;
+    let memory_prompt = match load_prompt(Path::new(&memory_cfg.prompt_path)) {
+        Ok(text) => text,
+        Err(e) => {
+            _memory_prompt_err = Some(format!("{e:#}"));
+            String::new()
+        }
+    };
     let (pty_audit_prompt_text, pty_audit_prompt_err, pty_audit_prompt_path) =
         load_pty_audit_prompt(&sys_cfg);
     let (pty_help_prompt_text, pty_help_prompt_err, pty_help_prompt_path) =
@@ -7366,13 +7402,22 @@ fn run_loop(
         80,
         mcp_messages.tool_result_assistant.clone(),
     );
+    let memory_state = DogState::new(
+        memory_prompt.clone(),
+        80,
+        mcp_messages.tool_result_assistant.clone(),
+    );
+    let mut memory_state = memory_state;
+    memory_state.set_include_tool_context(true);
     // MAIN 也可能发起工具调用（记忆/系统配置等）。若不回注工具结果，模型会反复重试同一工具。
     main_state.set_include_tool_context(true);
     dog_state.reset_context();
     main_state.reset_context();
+    memory_state.reset_context();
     let mut mind_context = MindContextPool::new(MIND_CTX_MAX_ROUNDS, MIND_CTX_MAX_TOKENS);
     let mut mind_ctx_idx_main: Option<usize> = None;
     let mut mind_ctx_idx_dog: Option<usize> = None;
+    let mut mind_ctx_idx_memory: Option<usize> = None;
     let mut mind_rate_window: VecDeque<Instant> = VecDeque::new();
     let mut active_request_is_mind: bool = false;
     let mut active_request_is_fastmemo_compact: bool = false;
@@ -7404,6 +7449,9 @@ fn run_loop(
     let main_client_result = build_main_client(&main_cfg);
     let mut main_client = main_client_result.as_ref().ok().cloned();
     let main_client_err = main_client_result.err().map(|e| e.to_string());
+    let memory_client_result = build_main_client(&memory_cfg);
+    let mut memory_client = memory_client_result.as_ref().ok().cloned();
+    let _memory_client_err = memory_client_result.err().map(|e| e.to_string());
     let theme = ui::Theme::from_env();
     let mut render_cache = ui::ChatRenderCache::new();
     // 欢迎语：折叠 system info（简约态只显示一行，详情态在工具详情展开）。
@@ -7565,31 +7613,6 @@ fn run_loop(
             &mut sys_log,
             config.sys_log_limit,
             format!("CONTEXT: {err}"),
-        );
-    }
-    if let Some(err) = context_compact_prompt_err {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            format!(
-                "CONTEXT-COMPACT: {err} ({})",
-                context_compact_prompt_path.display()
-            ),
-        );
-    } else if context_compact_prompt_text.trim().is_empty() {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            "CONTEXT-COMPACT: 提示词为空",
-        );
-    } else {
-        push_sys_log(
-            &mut sys_log,
-            config.sys_log_limit,
-            format!(
-                "CONTEXT-COMPACT: 配置 {}",
-                context_compact_prompt_path.display()
-            ),
         );
     }
     if let Some(err) = pty_audit_prompt_err {
@@ -7778,7 +7801,6 @@ fn run_loop(
     let mut tool_preview_active = false;
     let mut tool_preview_pending_idle = false;
     let mut tool_preview_chat_idx: Option<usize> = None;
-    let mut ctx_compact_notice_idx: Option<usize> = None;
     let mut reveal_idx: Option<usize> = None;
     let mut reveal_len: usize = 0;
     let mut last_reveal_at = Instant::now();
@@ -7809,6 +7831,15 @@ fn run_loop(
     let mut input_rect_cache: Option<ratatui::layout::Rect> = None;
     let mut pty_rect_cache: Option<ratatui::layout::Rect> = None;
     let mut settings_rect_cache: Option<ratatui::layout::Rect> = None;
+    let mut memory_rect_cache: Option<ratatui::layout::Rect> = None;
+    let mut memory_focus = false;
+    let mut memory_scroll: u16 = u16::MAX; // u16::MAX 表示“跟随底部”
+    let mut memory_max_scroll_cache: u16 = 0;
+    let mut memory_panel_open: bool = false;
+    // Memory 面板高度缓存：键盘弹出/收回会触发窗口高度变化。
+    // 需求：Memory 属于“顶栏逻辑”，不随键盘折叠；只让聊天区域变小。
+    // 因此用缓存保持“期望高度”，仅在屏幕过小到无法容纳时才临时压缩（不回写缓存，便于恢复）。
+    let mut memory_panel_h_cache: Option<u16> = None;
 
     let mut settings_fields_scroll_cache: usize = 0;
     let mut chat_height_cache: usize = 0;
@@ -7869,6 +7900,12 @@ fn run_loop(
     // 避免 Termux 高频 Drag 事件导致滚动累计过快（跑得比手势快）。
     let mut touch_drag_anchor_row: Option<u16> = None;
     let mut touch_drag_anchor_scroll: Option<u16> = None;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TouchDragTarget {
+        Chat,
+        Memory,
+    }
+    let mut touch_drag_target: Option<TouchDragTarget> = None;
 
     macro_rules! drain_events {
         () => {
@@ -7898,6 +7935,8 @@ fn run_loop(
                 dog_client: &dog_client,
                 main_state: &mut main_state,
                 main_client: &main_client,
+                memory_state: &mut memory_state,
+                memory_client: &memory_client,
                 mind_context: &mut mind_context,
                 _mind_ctx_idx_main: &mut mind_ctx_idx_main,
                 _mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
@@ -7907,7 +7946,6 @@ fn run_loop(
                 meta: &mut metamemo,
                 context_usage: &mut context_usage,
                 diary_state: &mut diary_state,
-                ctx_compact_notice_idx: &mut ctx_compact_notice_idx,
                 mind_rate_window: &mut mind_rate_window,
                 pending_mind_half: &mut pending_mind_half,
                 brief_text: &mut brief_text,
@@ -7941,7 +7979,6 @@ fn run_loop(
                 sys_log: &mut sys_log,
                 sys_log_limit: config.sys_log_limit,
                 config: &config,
-                context_compact_prompt_text: &context_compact_prompt_text,
                 fastmemo_compact_prompt_text: &fastmemo_compact_prompt_text,
                 pty_help_prompt_text: &pty_help_prompt_text,
                 pty_started_notice_prompt_text: &pty_started_notice_prompt_text,
@@ -8017,17 +8054,28 @@ fn run_loop(
                 &pending_tool_confirm,
                 &active_tool_stream,
             )
-        {
-            let front = &mut pty_done_followups[0];
-            if !front.pushed {
-                core.push_tool(front.tool_text.clone());
-                match front.owner {
-                    MindKind::Sub => dog_state.push_mcp_tool_result("pty", &front.tool_text, &[]),
-                    _ => main_state.push_mcp_tool_result("pty", &front.tool_text, &[]),
-                }
-                render_cache.invalidate(core.history.len().saturating_sub(1));
-                front.pushed = true;
-                push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: batch ready");
+	        {
+	            let front = &mut pty_done_followups[0];
+	            if !front.pushed {
+	                core.push_tool_mind(front.tool_text.clone(), Some(front.owner));
+                    let mind = match front.owner {
+                        MindKind::Sub => "dog",
+                        MindKind::Main => "main",
+                        MindKind::Memory => "memory",
+                    };
+                    let p = context_path_for_mind(&config, mind);
+                    // 会话上下文外置：把 PTY 批量完成回执写入 context.jsonl，供后续请求回放到模型上下文。
+                    log_dyncontext(
+                        p,
+                        mind,
+                        "tool",
+                        &front.tool_text,
+                        Some("pty"),
+                        None,
+                    );
+	                render_cache.invalidate(core.history.len().saturating_sub(1));
+	                front.pushed = true;
+	                push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: batch ready");
                 let mut auto_reply = false;
                 let tpl = pty_messages.pty_done_auto_report_prompt.trim();
                 if !tpl.is_empty() {
@@ -8070,7 +8118,6 @@ fn run_loop(
             && !send_queue_dequeue_cooldown_until.is_some_and(|t| now < t)
             && matches!(send_queue_ui, SendQueueUiState::Closed)
             && !diary_state.active()
-            && !(main_state.ctx_compact_inflight || dog_state.ctx_compact_inflight)
             && can_inject_heartbeat(
                 mode,
                 &active_request_id,
@@ -8100,6 +8147,7 @@ fn run_loop(
                     pending_mind_half: &mut pending_mind_half,
                     dog_state: &mut dog_state,
                     main_state: &mut main_state,
+                    memory_state: &mut memory_state,
                     sys_cfg: &sys_cfg,
                     config: &config,
                     tx: &tx,
@@ -8125,12 +8173,12 @@ fn run_loop(
                     expanded_thinking_idxs: &mut expanded_thinking_idxs,
                     scroll: &mut scroll,
                     follow_bottom: &mut follow_bottom,
-                    context_compact_prompt_text: &context_compact_prompt_text,
                     token_totals: &mut token_totals,
                     token_total_path: &token_total_path,
                     active_request_in_tokens: &mut active_request_in_tokens,
                     dog_client: &dog_client,
                     main_client: &main_client,
+                    memory_client: &memory_client,
                 })?;
                 needs_redraw = true;
                 continue;
@@ -8143,7 +8191,6 @@ fn run_loop(
             && !send_queue_dequeue_cooldown_until.is_some_and(|t| now < t)
             && matches!(send_queue_ui, SendQueueUiState::Closed)
             && !diary_state.active()
-            && !(main_state.ctx_compact_inflight || dog_state.ctx_compact_inflight)
             && can_inject_heartbeat(
                 mode,
                 &active_request_id,
@@ -8173,14 +8220,17 @@ fn run_loop(
                     chat_target: &mut chat_target,
                     dog_state: &mut dog_state,
                     main_state: &mut main_state,
+                    memory_state: &mut memory_state,
                     mind_ctx_idx_main: &mut mind_ctx_idx_main,
                     mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                    mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                     screen: &mut screen,
                     help_ui: &mut help_ui,
                     should_exit: &mut should_exit,
                     sse_enabled: &mut sse_enabled,
                     enter_cmd_shell: &mut pending_cmd_shell,
                     open_user_terminal: &mut pending_user_terminal,
+                    memory_panel_open: &mut memory_panel_open,
                     exit_code: &mut exit_code,
                     sys_cfg: &mut sys_cfg,
                     sys_cfg_path: &sys_cfg_path,
@@ -8196,7 +8246,6 @@ fn run_loop(
                         collapsed_tool_idxs: &mut collapsed_tool_idxs,
                         expanded_user_idxs: &mut expanded_user_idxs,
                         collapsed_user_idxs: &mut collapsed_user_idxs,
-                        ctx_compact_notice_idx: &mut ctx_compact_notice_idx,
                         expanded_thinking_idxs: &mut expanded_thinking_idxs,
                         collapsed_thinking_idxs: &mut collapsed_thinking_idxs,
                         selected_msg_idx: &mut selected_msg_idx,
@@ -8241,6 +8290,8 @@ fn run_loop(
                             &mut input_chars,
                             &mut last_input_at,
                         );
+                        core.push_system("··· Terminal 已打开（用户手动）\n- 该窗口中的命令由用户自己执行\n- 退出/关闭请在 Terminal 内自行完成\n- 这不是 AI 启动的自动化任务");
+                        push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: user session");
                         let call = ToolCall {
                             tool: "bash".to_string(),
                             input: "exec bash -li".to_string(),
@@ -8278,6 +8329,7 @@ fn run_loop(
                     pending_mind_half: &mut pending_mind_half,
                     dog_state: &mut dog_state,
                     main_state: &mut main_state,
+                    memory_state: &mut memory_state,
                     sys_cfg: &sys_cfg,
                     config: &config,
                     tx: &tx,
@@ -8303,12 +8355,12 @@ fn run_loop(
                     expanded_thinking_idxs: &mut expanded_thinking_idxs,
                     scroll: &mut scroll,
                     follow_bottom: &mut follow_bottom,
-                    context_compact_prompt_text: &context_compact_prompt_text,
                     token_totals: &mut token_totals,
                     token_total_path: &token_total_path,
                     active_request_in_tokens: &mut active_request_in_tokens,
                     dog_client: &dog_client,
                     main_client: &main_client,
+                    memory_client: &memory_client,
                 })?;
                 needs_redraw = true;
                 continue;
@@ -8336,9 +8388,16 @@ fn run_loop(
             );
             // DeepSeek 对 system 消息位置/排序比较敏感（容易触发 400: Invalid consecutive assistant message）。
             // 心跳作为一次“用户事件”，用 user 消息注入到对话上下文：assistant -> user(heartbeat) -> assistant(reply)。
-            let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
             let hb_user = crate::messages::render_heartbeat_user(&mcp_messages, &stamp);
-            let _ = main_state.push_user(&hb_user, ctx_limit);
+            let p = context_path_for_mind(&config, "main");
+            log_dyncontext(
+                p,
+                "main",
+                "user",
+                &hb_user,
+                None,
+                None,
+            );
             if let Some(in_tokens) = try_start_main_heartbeat(TryStartMainHeartbeatArgs {
                 main_client: &main_client,
                 main_state: &main_state,
@@ -8575,6 +8634,9 @@ fn run_loop(
                             main_client.as_ref().is_some_and(|c| c.is_codex_provider())
                         }
                         MindKind::Sub => dog_client.as_ref().is_some_and(|c| c.is_codex_provider()),
+                        MindKind::Memory => {
+                            memory_client.as_ref().is_some_and(|c| c.is_codex_provider())
+                        }
                     },
                 mode,
                 reveal_idx,
@@ -8586,8 +8648,6 @@ fn run_loop(
                 tool_preview: tool_preview.as_str(),
                 pending_tool_confirm: pending_tool_confirm.as_ref().map(|(call, _, _)| call),
                 active_tool_stream: active_tool_stream.as_ref(),
-                ctx_compact_main: main_state.ctx_compact_inflight,
-                ctx_compact_dog: dog_state.ctx_compact_inflight,
                 mind_pulse: mind_pulse_dir,
                 input_active,
                 diary_active: diary_state.active(),
@@ -8617,7 +8677,6 @@ fn run_loop(
             dog_prompt_text: &dog_state.prompt,
             main_prompt_text: &main_prompt_text,
             context_prompts: &context_prompts,
-            context_compact_prompt_text: &context_compact_prompt_text,
         });
         if !settings_fields.is_empty() && settings.field_index >= settings_fields.len() {
             settings.field_index = settings_fields.len().saturating_sub(1);
@@ -8647,8 +8706,7 @@ fn run_loop(
                             }
                             SettingsFieldKind::DogPrompt
                             | SettingsFieldKind::MainPrompt
-                            | SettingsFieldKind::ContextMainPrompt
-                            | SettingsFieldKind::ContextCompactPrompt => {
+                            | SettingsFieldKind::ContextMainPrompt => {
                                 "Open prompt editor (Enter)".to_string()
                             }
                             _ => format!(
@@ -8678,8 +8736,6 @@ fn run_loop(
             // 压缩/写日记期间：输入框状态栏强制占用并屏蔽其它提示（toast/菜单/输入等），直到流程结束再解除。
             let locked = if diary_state.active() {
                 Some("Updating diary".to_string())
-            } else if main_state.ctx_compact_inflight || dog_state.ctx_compact_inflight {
-                Some("Compacting context".to_string())
             } else {
                 None
             };
@@ -8923,6 +8979,7 @@ fn run_loop(
             let pulse_dir = mind_pulse.as_ref().map(|p| p.dir);
             // 已移除弹窗/窗口栈：思考/工具/正文都在聊天流内以“动态层”呈现。
             let mut settings_draw = ui::SettingsDrawResult::default();
+            let mut memory_draw = ui::MemoryPanelDrawResult { max_scroll: 0 };
             terminal.draw(|f| {
                 let size = f.area();
                 ui::fill_background(f, &theme, size);
@@ -8935,21 +8992,45 @@ fn run_loop(
                 } else {
                     (input.as_str(), cursor)
                 };
+                let pty_panel_active = is_pty_panel_active(screen, pty_view, pty_tabs.as_slice());
                 let input_inner_w = size.width.saturating_sub(2).max(1) as usize;
                 let input_lines = ui::wrapped_line_count(input_inner_w, input_text);
-                let input_lines = input_lines.clamp(4, 10) as u16;
-                let desired_input_h = input_lines;
-                let fixed = 1 + 1 + 1 + 1 + 1 + 1; // header + header-sep + spacer + status + sep + ctx
+                // PTY 展开时仍显示输入框：输入框固定较小高度，避免把终端窗口挤没。
+                let desired_input_h = if pty_panel_active { 2 } else { input_lines.clamp(4, 10) as u16 };
+                // Memory 面板高度：测试期在 /TestMemory 时常开（与 chat_target 解耦）。
+                // 该面板从顶部横杠下拉，占用“header-sep”区域的额外高度，避免干扰聊天滚动。
+                let memory_panel_active = matches!(screen, Screen::Chat) && memory_panel_open;
+                let memory_h: u16 = if memory_panel_active {
+                    let total_h = size.height.max(1) as usize;
+                    // 默认约 1/3 屏，高度比之前减少 3 行。
+                    let mut mh = (total_h / 3).saturating_sub(3);
+                    // 至少留出：状态栏 + 上横杠 + 内容1行 + 下横杠
+                    if mh > 0 && mh < 4 {
+                        mh = 4;
+                    }
+                    // 留足空间给聊天+底栏，避免挤爆布局。
+                    let fixed0 = 1usize + 1 + 1 + 1 + 1 + 1; // 原固定区
+                    let max_mh = total_h.saturating_sub(fixed0).saturating_sub(2);
+                    // 首次进入 Memory：记录期望高度；之后不随键盘弹出/收起波动。
+                    let desired = *memory_panel_h_cache.get_or_insert(mh.min(max_mh).min(u16::MAX as usize) as u16);
+                    // 仅当屏幕过小到无法容纳时临时压缩（不回写 cache，方便键盘收起后恢复）。
+                    let max_allow = max_mh.min(u16::MAX as usize) as u16;
+                    desired.min(max_allow)
+                } else {
+                    memory_panel_h_cache = None;
+                    0
+                };
+
+                let fixed = 1 + (1 + memory_h) + 1 + 1 + 1 + 1; // header + header-sep(+memory) + spacer + status + sep + ctx
                 let avail = size.height.saturating_sub(fixed).max(2); // 至少给 chat+bottom 留 2 行
                 let max_input_h = avail.saturating_sub(1); // 给 chat 至少 1 行
                 let input_h = desired_input_h.min(max_input_h.max(1));
-                let pty_panel_active = is_pty_panel_active(screen, pty_view, pty_tabs.as_slice());
                 let bottom_h = pty_bottom_height(avail, input_h, pty_panel_active);
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(1),
-                        Constraint::Length(1),
+                        Constraint::Length(1 + memory_h),
                         Constraint::Min(1),
                         Constraint::Length(1),
                         Constraint::Length(1),
@@ -8959,16 +9040,19 @@ fn run_loop(
                     ])
                     .split(size);
 
-                ui::draw_header(
-                    f,
-                    ui::DrawHeaderArgs {
-                        theme: &theme,
-                        area: chunks[0],
-                        main_mode: {
-                            match mode {
-                                Mode::Generating => match active_kind {
-                                    MindKind::Main => mode,
+	                ui::draw_header(
+	                    f,
+	                    ui::DrawHeaderArgs {
+	                        theme: &theme,
+	                        area: chunks[0],
+	                        // 记忆面板的标题/状态不放在 Powered by 的中间提示里（避免抢占顶栏注意力）。
+	                        center: "",
+	                        main_mode: {
+	                            match mode {
+	                                Mode::Generating => match active_kind {
+	                                    MindKind::Main => mode,
                                     MindKind::Sub => Mode::Idle,
+                                    MindKind::Memory => Mode::Idle,
                                 },
                                 Mode::ExecutingTool | Mode::ApprovingTool => {
                                     if active_tool_stream
@@ -8988,6 +9072,7 @@ fn run_loop(
                                 Mode::Generating => match active_kind {
                                     MindKind::Sub => mode,
                                     MindKind::Main => Mode::Idle,
+                                    MindKind::Memory => Mode::Idle,
                                 },
                                 Mode::ExecutingTool | Mode::ApprovingTool => {
                                     if active_tool_stream
@@ -9008,12 +9093,20 @@ fn run_loop(
                         run_secs,
                     },
                 );
-                // 顶部横杠：用于把“标题栏”和主体隔离开。
-                ui::draw_separator(
-                    f,
-                    ui::DrawSeparatorArgs {
-                        theme: &theme,
-                        area: chunks[1],
+	                // 顶部横杠：用于把“标题栏”和主体隔离开。
+	                // Memory 面板展开时：横杠保持固定（不下移），面板从横杠下方开始展开。
+	                let header_sep_y = chunks[1].y;
+	                let header_sep_area = ratatui::layout::Rect {
+	                    x: chunks[1].x,
+	                    y: header_sep_y,
+	                    width: chunks[1].width,
+	                    height: 1,
+	                };
+	                ui::draw_separator(
+	                    f,
+	                    ui::DrawSeparatorArgs {
+	                        theme: &theme,
+                        area: header_sep_area,
                         mode,
                         active_kind,
                         // 顶栏横杠：只在 API 活跃时动画（避免“输入中也在动”造成噪声）。
@@ -9026,22 +9119,485 @@ fn run_loop(
                         tick: spinner_tick,
                         hint: "",
                     },
-                );
+	                );
+                memory_rect_cache = None;
+                if matches!(screen, Screen::Chat) && memory_panel_open && chunks[1].height > 1
+                {
+                    let memory_area = ratatui::layout::Rect {
+                        x: chunks[1].x,
+                        // chunks[1] 顶部一行是“顶栏横杠”；Memory 面板从下一行开始。
+                        y: chunks[1].y.saturating_add(1),
+                        width: chunks[1].width,
+                        height: chunks[1].height.saturating_sub(1),
+                    };
+                    memory_rect_cache = Some(memory_area);
 
-                if screen == Screen::Chat {
-                    // Chat 始终可见：PTY 仅占用底部面板（半屏），不再“整块替换聊天区”。
-                    chat_rect_cache = Some(chunks[2]);
-                    input_rect_cache = if !pty_panel_active {
-                        Some(chunks[6])
-                    } else {
-                        None
+                    // Memory 面板结构：
+                    // 1 状态栏
+                    // 2 横杠
+                    // 3 内容（可滚动）
+                    // 4 横杠
+                    let status_h: u16 = 1;
+                    let sep_h: u16 = 1;
+                    let content_h = memory_area
+                        .height
+                        .saturating_sub(status_h)
+                        .saturating_sub(sep_h)
+                        .saturating_sub(sep_h)
+                        .max(1);
+                    let status_area = ratatui::layout::Rect {
+                        x: memory_area.x,
+                        y: memory_area.y,
+                        width: memory_area.width,
+                        height: status_h,
                     };
-                    pty_rect_cache = if pty_panel_active {
-                        Some(chunks[6])
-                    } else {
-                        None
+                    let mem_top_sep_area = ratatui::layout::Rect {
+                        x: memory_area.x,
+                        y: memory_area.y.saturating_add(status_h),
+                        width: memory_area.width,
+                        height: sep_h,
                     };
-                    settings_rect_cache = None;
+                    let mem_content_area = ratatui::layout::Rect {
+                        x: memory_area.x,
+                        y: memory_area.y.saturating_add(status_h).saturating_add(sep_h),
+                        width: memory_area.width,
+                        height: content_h,
+                    };
+                    let mem_bottom_sep_area = ratatui::layout::Rect {
+                        x: memory_area.x,
+                        y: mem_content_area.y.saturating_add(mem_content_area.height),
+                        width: memory_area.width,
+                        height: sep_h,
+                    };
+
+                    // 记忆状态栏文案：左侧固定 label；中间只显示状态（Thinking/Typing/MemoryAdd/.../Ready）。
+                    let (mem_status, mem_busy) = {
+                        let mut busy = false;
+                        let mut status = "Ready".to_string();
+                        if matches!(mode, Mode::Generating) && matches!(active_kind, MindKind::Memory) {
+                            busy = true;
+                            if matches!(diary_state.stage, DiaryStage::WaitingMain) {
+                                status = "MemoryAdd".to_string();
+                            } else {
+                                status = "Thinking".to_string();
+                            }
+                        } else if matches!(mode, Mode::ExecutingTool | Mode::ApprovingTool)
+                            && active_tool_stream
+                                .as_ref()
+                                .is_some_and(|s| matches!(s.owner, MindKind::Memory))
+                        {
+                            busy = true;
+                            let tool = active_tool_stream
+                                .as_ref()
+                                .map(|s| s.call.tool.trim().to_ascii_lowercase())
+                                .unwrap_or_default();
+                            if tool == "memory_read" {
+                                status = "MemoryRead".to_string();
+                            } else if tool == "memory_check" {
+                                status = "MemoryCheck".to_string();
+                            } else if tool == "memory_add" {
+                                status = "MemoryAdd".to_string();
+                            } else {
+                                status = "Tool".to_string();
+                            }
+                        } else if memory_focus && input_active {
+                            busy = true;
+                            status = "Typing".to_string();
+                        }
+                        (status, busy)
+                    };
+                    ui::draw_memory_status_line(
+                        f,
+                        &theme,
+                        status_area,
+                        mem_status.as_str(),
+                        mem_busy,
+                        spinner_tick,
+                    );
+                    ui::draw_separator(
+                        f,
+                        ui::DrawSeparatorArgs {
+                            theme: &theme,
+                            area: mem_top_sep_area,
+                            mode,
+                            active_kind,
+                            user_active: false,
+                            highlight: memory_focus,
+                            // Memory 区域横杠不做动画（仅顶栏横杠有动画）。
+                            tick: 0,
+                            hint: "",
+                        },
+                    );
+                    ui::draw_separator(
+                        f,
+                        ui::DrawSeparatorArgs {
+                            theme: &theme,
+                            area: mem_bottom_sep_area,
+                            mode,
+                            active_kind,
+                            user_active: false,
+                            highlight: memory_focus,
+                            tick: 0,
+                            hint: "",
+                        },
+                    );
+
+                    fn sanitize_memory_text(s: &str) -> String {
+                        // Memory 面板只展示“工具名+brief”，这里做最小去噪，避免 brief 里夹着 markdown 符号。
+                        let mut out = s.replace("```", "");
+                        out = out.replace("**", "");
+                        out = out.replace('`', "");
+                        out.trim().to_string()
+                    }
+                    fn pretty_memory_tool_label(raw: &str) -> String {
+                        // 统一成紧凑标签：仅用于 Memory 面板显示。
+                        // 说明：工具回执里 TOOL: 往往是 display label（例如 "Memory Read"），不是底层工具 key。
+                        let t = raw.trim();
+                        if t.eq_ignore_ascii_case("MemoryCheck")
+                            || t.eq_ignore_ascii_case("Memory Check")
+                            || t.eq_ignore_ascii_case("MFIND")
+                        {
+                            return "MemoryCheck".to_string();
+                        }
+                        if t.eq_ignore_ascii_case("MemoryRead")
+                            || t.eq_ignore_ascii_case("Memory Read")
+                            || t.eq_ignore_ascii_case("MREAD")
+                        {
+                            return "MemoryRead".to_string();
+                        }
+                        if t.eq_ignore_ascii_case("MemoryAdd")
+                            || t.eq_ignore_ascii_case("Memory Add")
+                            || t.eq_ignore_ascii_case("MADD")
+                        {
+                            return "MemoryAdd".to_string();
+                        }
+                        if t.eq_ignore_ascii_case("BASH") || t.eq_ignore_ascii_case("Bash") {
+                            return "Bash".to_string();
+                        }
+                        if t.eq_ignore_ascii_case("ADB") || t.eq_ignore_ascii_case("ADB Shell") {
+                            return "Adb".to_string();
+                        }
+                        if t.eq_ignore_ascii_case("TERMUX") || t.eq_ignore_ascii_case("TERMUX API") {
+                            return "TermuxApi".to_string();
+                        }
+                        // fallback：去掉空格，尽量紧凑
+                        t.split_whitespace().collect::<String>()
+                    }
+                    fn extract_memory_tool_brief_one_line(tool_text: &str) -> Option<String> {
+                        // 只解析工具名与 brief；不展示 input/output/meta/status（避免刷屏）。
+                        let mut tool = None::<String>;
+                        let mut explain = None::<String>;
+                        for line in tool_text.lines().take(40) {
+                            let t = line.trim_end();
+                            if tool.is_none() {
+                                if let Some(rest) = t.strip_prefix("TOOL:") {
+                                    let v = rest.trim();
+                                    if !v.is_empty() {
+                                        tool = Some(v.to_string());
+                                    }
+                                }
+                            }
+                            if explain.is_none() {
+                                if let Some(rest) = t.strip_prefix("EXPLAIN:") {
+                                    let v = rest.trim();
+                                    if !v.is_empty() {
+                                        explain = Some(v.to_string());
+                                    }
+                                }
+                            }
+                            if tool.is_some() && explain.is_some() {
+                                break;
+                            }
+                        }
+                        let tool = tool?;
+                        let label = pretty_memory_tool_label(tool.as_str());
+                        let brief = sanitize_memory_text(explain.unwrap_or_default().as_str());
+                        if brief.is_empty() {
+                            Some(label)
+                        } else {
+                            Some(format!("{label} · {brief}"))
+                        }
+                    }
+                    fn compact_tool_call_json_for_ui(call: &ToolCall) -> String {
+                        // 仅用于 UI 临时展示：尽量短、单行、可读。
+                        // 注意：不要把 output/meta 等回执信息塞进来。
+                        let mut m = serde_json::Map::new();
+                        let tool = call.tool.trim();
+                        if !tool.is_empty() {
+                            m.insert("tool".to_string(), serde_json::Value::String(tool.to_string()));
+                        }
+                        if let Some(b) = call.brief.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("brief".to_string(), serde_json::Value::String(b.to_string()));
+                        }
+                        // 常用字段：只在非空时写入。
+                        if let Some(p) = call.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("path".to_string(), serde_json::Value::String(p.to_string()));
+                        }
+                        if let Some(p) = call.pattern.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("pattern".to_string(), serde_json::Value::String(p.to_string()));
+                        }
+                        if let Some(r) = call.root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("root".to_string(), serde_json::Value::String(r.to_string()));
+                        }
+                        if let Some(r) = call.region.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("region".to_string(), serde_json::Value::String(r.to_string()));
+                        }
+                        if let Some(d) = call.date_start.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("date_start".to_string(), serde_json::Value::String(d.to_string()));
+                        }
+                        if let Some(d) = call.date_end.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("date_end".to_string(), serde_json::Value::String(d.to_string()));
+                        }
+                        if let Some(dates) = call.dates.as_ref().filter(|v| !v.is_empty()) {
+                            let arr = dates
+                                .iter()
+                                .map(|s| serde_json::Value::String(s.trim().to_string()))
+                                .collect::<Vec<_>>();
+                            m.insert("dates".to_string(), serde_json::Value::Array(arr));
+                        }
+                        if let Some(s) = call.section.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("section".to_string(), serde_json::Value::String(s.to_string()));
+                        }
+                        if let Some(c) = call.category.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            m.insert("category".to_string(), serde_json::Value::String(c.to_string()));
+                        }
+                        if let Some(c) = call.content.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            // content 可能很长：这里只留短预览。
+                            let mut s = c.to_string();
+                            // 这里按 bytes 截断即可（UI 预览用），避免引入额外的“按字符截断”函数依赖。
+                            truncate_to_max_bytes(&mut s, 600);
+                            m.insert("content".to_string(), serde_json::Value::String(s));
+                        }
+                        serde_json::to_string(&serde_json::Value::Object(m)).unwrap_or_else(|_| "{}".to_string())
+                    }
+
+                    let mut mem_lines: Vec<String> = Vec::new();
+                    const MEMORY_PANEL_ENTRY_MAX_CHARS: usize = 800;
+                    let active_tool_idx = active_tool_stream
+                        .as_ref()
+                        .filter(|s| matches!(s.owner, MindKind::Memory))
+                        .map(|s| s.idx);
+                    for (idx, m) in core.history.iter().enumerate() {
+                        if m.mind != Some(MindKind::Memory) {
+                            continue;
+                        }
+                        let text = m.text.trim_end_matches('\r').trim_end();
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        match m.role {
+                            Role::User => {
+                                // Memory 面板：用户消息用 `▷` 前缀。避免 markdown/代码块符号刷屏，做轻量去噪。
+                                let mut t = sanitize_memory_text(text);
+                                t = compact_ws_inline(&t);
+                                t = truncate_with_ellipsis(&t, MEMORY_PANEL_ENTRY_MAX_CHARS);
+                                if !t.is_empty() {
+                                    mem_lines.push(format!("▷ · {t}"));
+                                }
+                            }
+                            Role::Assistant => {
+                                // Memory 面板：assistant 正文用 `▶` 前缀。
+                                // 若输出包含工具调用块，则仅显示“工具名+brief”，不回显 JSON（避免噪音）。
+                                // 说明：工具 JSON 会在聊天区被拆成独立 Tool 消息（并且本面板会显示工具摘要），
+                                // 因此这里仅展示“去除 tool 块后的正文”，避免重复/刷屏。
+                                let (_calls, cleaned) = crate::mcp::extract_tool_calls(text)
+                                    .unwrap_or_else(|_| (vec![], text.to_string()));
+                                let cleaned = cleaned.trim();
+                                if cleaned.is_empty() {
+                                    continue;
+                                }
+                                let mut t = sanitize_memory_text(cleaned);
+                                t = t.trim().to_string();
+                                t = truncate_with_ellipsis(&t, MEMORY_PANEL_ENTRY_MAX_CHARS);
+                                if !t.is_empty() {
+                                    mem_lines.push(format!("▶ · {t}"));
+                                }
+                            }
+                            Role::Tool => {
+                                // Memory 面板：工具回执只展示“工具名+brief”；思考用单行跑马灯展示。
+                                if text.starts_with(THINK_TOOL_MARKER) {
+	                                    fn extract_thinking_output_inline(tool_text: &str) -> String {
+                                        // 解析 THINK 工具回执的 output ```text ... ```，压成单行（用于跑马灯）。
+                                        let mut out = String::new();
+                                        let mut in_block = false;
+                                        for line in tool_text.lines() {
+                                            let t = line.trim_end();
+                                            if !in_block {
+                                                if t == "output:" {
+                                                    continue;
+                                                }
+                                                if t == "```text" {
+                                                    in_block = true;
+                                                }
+                                                continue;
+                                            }
+                                            if t == "```" {
+                                                break;
+                                            }
+                                            if !out.is_empty() {
+                                                out.push(' ');
+                                            }
+                                            out.push_str(t.trim());
+                                        }
+                                        compact_ws_inline(out.as_str())
+                                    }
+	                                    fn extract_thinking_secs(tool_text: &str) -> Option<u64> {
+                                        // 优先从 meta 的 `耗时:{secs}s` 提取；其次从 input 行里的 `... {secs}s.` 猜测。
+                                        for line in tool_text.lines().take(60) {
+                                            let t = line.trim();
+                                            if let Some(pos) = t.find("耗时:") {
+                                                let rest = &t[pos + "耗时:".len()..];
+                                                let digits: String = rest
+                                                    .chars()
+                                                    .take_while(|ch| ch.is_ascii_digit())
+                                                    .collect();
+                                                if let Ok(v) = digits.parse::<u64>() {
+                                                    return Some(v);
+                                                }
+                                            }
+                                        }
+                                        for line in tool_text.lines().take(40) {
+                                            let t = line.trim();
+                                            if let Some(rest) = t.strip_prefix("input:") {
+                                                let r = rest.trim();
+                                                if let Some(pos) = r.rfind(' ') {
+                                                    let tail = r[pos..].trim();
+                                                    let digits: String = tail
+                                                        .chars()
+                                                        .filter(|ch| ch.is_ascii_digit())
+                                                        .collect();
+                                                    if let Ok(v) = digits.parse::<u64>() {
+                                                        if v > 0 {
+                                                            return Some(v);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+	                                        None
+	                                    }
+	                                    fn extract_last_status(tool_text: &str) -> Option<String> {
+	                                        // 工具输出可能是“累积文本”：既包含旧的 `状态:running`，又包含最终 `状态:0`。
+	                                        // 这里取最后一次出现的状态值，避免 `contains("状态:running")` 误判导致跑马灯永远不结束。
+	                                        let mut last: Option<String> = None;
+	                                        for line in tool_text.lines() {
+	                                            let t = line.trim();
+	                                            // 常见格式：
+	                                            // - "状态:running"
+	                                            // - "状态:0 | 耗时:3s | chars:123"
+	                                            // - "... | 状态:running | ..."
+	                                            // 统一扫一遍该行内所有片段。
+	                                            for part in t.split('|') {
+	                                                let p = part.trim();
+	                                                let v = if let Some(rest) = p.strip_prefix("状态:") {
+	                                                    rest.trim()
+	                                                } else if let Some(rest) = p.strip_prefix("status:") {
+	                                                    rest.trim()
+	                                                } else {
+	                                                    continue;
+	                                                };
+	                                                if v.is_empty() {
+	                                                    continue;
+	                                                }
+	                                                let token = v
+	                                                    .split_whitespace()
+	                                                    .next()
+	                                                    .unwrap_or("")
+	                                                    .trim()
+	                                                    .to_ascii_lowercase();
+	                                                if !token.is_empty() {
+	                                                    last = Some(token);
+	                                                }
+	                                            }
+	                                        }
+	                                        last
+	                                    }
+		                                    // 多次 THINK 回执会在同一轮里反复出现：这里保持“只显示最后一条思考状态”，避免占多行刷屏。
+		                                    if mem_lines
+		                                        .last()
+		                                        .is_some_and(|s| s.starts_with("▶ · Thinking · ") || s.starts_with("▶ · Thought"))
+		                                    {
+		                                        mem_lines.pop();
+		                                    }
+		                                    // “是否仍在流式/执行中”以 UI 当前状态为准：流式一结束就应立即停止跑马灯。
+		                                    // 避免工具输出里残留旧的 running 文本导致“思考行”挂住。
+		                                    let last_status = extract_last_status(text);
+		                                    let running = mem_busy
+		                                        && last_status
+		                                            .as_deref()
+		                                            .is_some_and(|s| s.eq_ignore_ascii_case("running"));
+		                                    if running {
+		                                        let mut body = extract_thinking_output_inline(text);
+		                                        if body.is_empty() {
+		                                            // stub（无 output）：给一个最小占位，避免显示空前缀。
+	                                            body = "…".to_string();
+	                                        }
+	                                        // UI 侧会对该行做跑马灯横向滚动。
+	                                        mem_lines.push(format!("▶ · Thinking · {body}"));
+	                                    } else if let Some(secs) = extract_thinking_secs(text) {
+	                                        mem_lines.push(format!("▶ · Thought for {secs}s"));
+	                                    } else {
+	                                        mem_lines.push("▶ · Thought".to_string());
+	                                    }
+                                    continue;
+                                }
+                                if let Some(summary) = extract_memory_tool_brief_one_line(text) {
+                                    // 运行中的工具：额外展示“原 tool call（单行）”用于观察；执行完自动隐藏。
+                                    if mem_busy && active_tool_idx == Some(idx) {
+                                        mem_lines.push(format!("▶ · {summary}"));
+                                        if let Some(state) = active_tool_stream.as_ref() {
+                                            let json1 = compact_tool_call_json_for_ui(&state.call);
+                                            mem_lines.push(format!("// <tool>{json1}</tool>"));
+                                        }
+                                    } else {
+                                        mem_lines.push(format!("▶ · {summary}"));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let max_lines = (mem_content_area.height.max(1) as usize).saturating_mul(80);
+                    if mem_lines.len() > max_lines {
+                        mem_lines = mem_lines[mem_lines.len() - max_lines..].to_vec();
+                    }
+                    let mem_text = mem_lines.join("\n");
+                    memory_draw = ui::draw_memory_panel(
+                        f,
+                        &theme,
+                        mem_content_area,
+	                        mem_text.as_str(),
+	                        if memory_focus { memory_scroll } else { u16::MAX },
+	                        if mem_busy { spinner_tick } else { 0 },
+	                        memory_focus,
+	                    );
+	                }
+
+	                if screen == Screen::Chat {
+	                    // Chat 始终可见：PTY 仅占用底部面板（半屏），不再“整块替换聊天区”。
+	                    chat_rect_cache = Some(chunks[2]);
+	                    if pty_panel_active {
+	                        // 底部区域：上方终端 + 下方输入框
+	                        let ih = input_h.min(chunks[6].height.saturating_sub(3).max(1));
+	                        let input_area = ratatui::layout::Rect {
+	                            x: chunks[6].x,
+	                            y: chunks[6].y.saturating_add(chunks[6].height.saturating_sub(ih)),
+	                            width: chunks[6].width,
+	                            height: ih,
+	                        };
+	                        let pty_area = ratatui::layout::Rect {
+	                            x: chunks[6].x,
+	                            y: chunks[6].y,
+	                            width: chunks[6].width,
+	                            height: chunks[6].height.saturating_sub(ih),
+	                        };
+	                        input_rect_cache = Some(input_area);
+	                        pty_rect_cache = Some(pty_area);
+	                    } else {
+	                        input_rect_cache = Some(chunks[6]);
+	                        pty_rect_cache = None;
+	                    }
+	                    settings_rect_cache = None;
                     let chat_width = chunks[2].width.max(1) as usize;
                     if chat_anim_fast_forward {
                         render_cache.prepare(chat_width, core.history.len());
@@ -9059,21 +9615,21 @@ fn run_loop(
                         tick: spinner_tick,
                         selected_msg_idx,
                         tool_global_expanded: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client) {
+                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
                                 codex_tool_global_expanded
                             } else {
                                 tool_global_expanded
                             }
                         },
                         expanded_tool_idxs: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client) {
+                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
                                 &codex_expanded_tool_idxs
                             } else {
                                 &expanded_tool_idxs
                             }
                         },
                         collapsed_tool_idxs: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client) {
+                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
                                 &codex_collapsed_tool_idxs
                             } else {
                                 &collapsed_tool_idxs
@@ -9084,21 +9640,21 @@ fn run_loop(
                         collapsed_user_idxs: &collapsed_user_idxs,
                         thinking_idx,
                         thinking_global_expanded: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client) {
+                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
                                 codex_thinking_global_expanded
                             } else {
                                 thinking_global_expanded
                             }
                         },
                         expanded_thinking_idxs: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client) {
+                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
                                 &codex_expanded_thinking_idxs
                             } else {
                                 &expanded_thinking_idxs
                             }
                         },
                         collapsed_thinking_idxs: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client) {
+                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
                                 &codex_collapsed_thinking_idxs
                             } else {
                                 &collapsed_thinking_idxs
@@ -9108,7 +9664,7 @@ fn run_loop(
                         // Codex：虽然 transport 仍用 SSE（responses 要求 stream=true），但很多中转商是“伪流式”。
                         // UI 侧禁用流式动效，避免出现乱码/逐行刷屏的错觉与状态错乱。
                         streaming_enabled: sse_enabled
-                            && !chat_target_is_codex(chat_target, &dog_client, &main_client),
+                            && !chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client),
                         pulse_idx,
                         pulse_style,
                     });
@@ -9238,14 +9794,38 @@ fn run_loop(
                     },
                 );
                 if matches!(screen, Screen::Chat) && pty_panel_active {
+                    let ih = input_h.min(chunks[6].height.saturating_sub(3).max(1));
+                    let input_area = ratatui::layout::Rect {
+                        x: chunks[6].x,
+                        y: chunks[6].y.saturating_add(chunks[6].height.saturating_sub(ih)),
+                        width: chunks[6].width,
+                        height: ih,
+                    };
+                    let pty_area = ratatui::layout::Rect {
+                        x: chunks[6].x,
+                        y: chunks[6].y,
+                        width: chunks[6].width,
+                        height: chunks[6].height.saturating_sub(ih),
+                    };
                     draw_pty_panel(
                         f,
                         DrawPtyPanelArgs {
                             theme: &theme,
-                            area: chunks[6],
+                            area: pty_area,
                             pty_tabs: &mut pty_tabs,
                             pty_active_idx,
                             pty_focus,
+                        },
+                    );
+                    ui::draw_input(
+                        f,
+                        ui::DrawInputArgs {
+                            theme: &theme,
+                            area: input_area,
+                            input: input_text,
+                            cursor: input_cursor,
+                            // PTY 展开时：输入框仅在“聊天焦点”下可编辑（点击输入框会切到 PtyFocus::Chat）。
+                            focused: matches!(screen, Screen::Chat) && matches!(pty_focus, PtyFocus::Chat),
                         },
                     );
                 } else {
@@ -9335,17 +9915,25 @@ fn run_loop(
                         ui::draw_owned_menu(f, &theme, menu_area, &items, sel);
                     }
                 }
-                let context_used = context_usage.tokens();
-                let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
-                let sc_used = match chat_target {
-                    MindKind::Main => main_state.estimate_chat_tokens(),
-                    MindKind::Sub => dog_state.estimate_chat_tokens(),
+                let date_kb = contextmemo_size_kb(&config.contextmemo_path);
+                let date_kb_limit = sys_cfg.date_kb_limit;
+                let (fastmemo_label, fastmemo_n) = {
+                    let raw = std::fs::read_to_string(FASTMEMO_PATH).unwrap_or_default();
+                    match fastmemo_max_section_usage(&raw) {
+                        Some((label, n)) => (Some(label), n),
+                        None => (None, 0),
+                    }
                 };
-                let sc_limit = sys_cfg.ctx_recent_max_tokens.max(1);
                 let context_line = ContextLine {
-                    sc_tokens: sc_used,
-                    sc_pct: calc_pct(sc_used, sc_limit),
-                    ctx_pct: calc_pct(context_used, ctx_limit),
+                    fastmemo_label,
+                    fastmemo_n,
+                    date_kb,
+                    date_kb_limit,
+                    date_pct: if date_kb_limit == 0 {
+                        0
+                    } else {
+                        calc_pct(date_kb, date_kb_limit.max(1))
+                    },
                     run_in_tokens: core.run_in_token_total(),
                     run_out_tokens: core.run_out_token_total(),
                     total_in_tokens: token_totals.total_in_tokens,
@@ -9362,6 +9950,7 @@ fn run_loop(
                 .map(|r| r.width.max(1) as usize)
                 .unwrap_or(0);
             settings_editor_rect_cache = settings_draw.editor_rect;
+            memory_max_scroll_cache = memory_draw.max_scroll;
             needs_redraw = false;
             last_draw_at = now;
         }
@@ -9405,8 +9994,32 @@ fn run_loop(
                         let up = matches!(me.kind, MouseEventKind::ScrollUp);
                         // Termux 触控滚动会高频触发 ScrollUp/Down；步长过大会显得“跑得比手势快”。
                         let delta: u16 = 2;
+                        let col = me.column;
+                        let row = me.row;
+                        let contains = |r: ratatui::layout::Rect| {
+                            col >= r.x
+                                && col < r.x.saturating_add(r.width)
+                                && row >= r.y
+                                && row < r.y.saturating_add(r.height)
+                        };
                         // 已移除弹窗/窗口栈：鼠标滚轮只滚动聊天区；交互 PTY 视图下则滚动 PTY 回看。
                         if matches!(screen, Screen::Chat)
+                            && memory_rect_cache.is_some_and(|r| contains(r))
+                        {
+                            // Memory 面板滚动（独立于主聊天滚动）。
+                            memory_focus = true;
+                            let max = memory_max_scroll_cache;
+                            let cur = if memory_scroll == u16::MAX {
+                                max
+                            } else {
+                                memory_scroll.min(max)
+                            };
+                            if up {
+                                memory_scroll = cur.saturating_sub(delta);
+                            } else {
+                                memory_scroll = (cur + delta).min(max);
+                            }
+                        } else if matches!(screen, Screen::Chat)
                             && apply_mouse_wheel_to_pty_view(
                                 pty_view && matches!(pty_focus, PtyFocus::Terminal),
                                 pty_tabs.as_mut_slice(),
@@ -9453,6 +10066,7 @@ fn run_loop(
                         touch_drag_last_col = Some(me.column);
                         touch_drag_anchor_row = Some(me.row);
                         touch_drag_anchor_scroll = Some(scroll);
+                        touch_drag_target = None;
                         if matches!(screen, Screen::Settings) {
                             let col = me.column;
                             let row = me.row;
@@ -9517,6 +10131,24 @@ fn run_loop(
                                     && row >= r.y
                                     && row < r.y.saturating_add(r.height)
                             };
+                            let prev_mem_focus = memory_focus;
+                            // Memory 面板：点击后聚焦，支持滚动查看（不影响主聊天）。
+                            if memory_rect_cache.is_some_and(|r| contains(r)) {
+                                memory_focus = true;
+                                selected_msg_idx = None;
+                                action_hint = Some((now, "焦点: 记忆".to_string()));
+                                let base = if memory_scroll == u16::MAX {
+                                    memory_max_scroll_cache
+                                } else {
+                                    memory_scroll.min(memory_max_scroll_cache)
+                                };
+                                touch_drag_anchor_scroll = Some(base);
+                                touch_drag_target = Some(TouchDragTarget::Memory);
+                                changed = true;
+                            } else {
+                                memory_focus = false;
+                                touch_drag_target = Some(TouchDragTarget::Chat);
+                            }
                             // PTY 面板：单击切换焦点到终端（用于终端滚动/交互）。
                             if pty_view
                                 && !pty_tabs.is_empty()
@@ -9532,6 +10164,9 @@ fn run_loop(
                                 let prev_selected = selected_msg_idx;
                                 let prev_cursor = cursor;
                                 chat_focus = ChatFocus::Input;
+                                if pty_view && !pty_tabs.is_empty() {
+                                    pty_focus = PtyFocus::Chat;
+                                }
                                 selected_msg_idx = None;
                                 action_hint = Some((now, "焦点: 输入".to_string()));
 
@@ -9569,6 +10204,9 @@ fn run_loop(
                                         && !pty_tabs.is_empty()
                                         && !matches!(prev_pty_focus, PtyFocus::Chat))
                                 {
+                                    action_hint = Some((now, "焦点: 聊天".to_string()));
+                                } else if prev_mem_focus {
+                                    // 从 Memory 焦点切回聊天：给一个明确提示，避免“看起来没切换成功”。
                                     action_hint = Some((now, "焦点: 聊天".to_string()));
                                 }
 
@@ -9668,8 +10306,14 @@ fn run_loop(
                             // 用温和的步长映射让滚动更跟手：约 2 行手势移动 -> 1 行内容滚动。
                             let abs = dy_total.unsigned_abs().min(128) as u16;
                             let delta = ((abs + 1) / 2).max(1);
-                            // 手势方向：手指上滑(dy>0) => 聊天向下翻；手指下滑(dy<0) => 聊天向上翻。
-                            if matches!(screen, Screen::Chat)
+                            if matches!(touch_drag_target, Some(TouchDragTarget::Memory)) {
+                                let max = memory_max_scroll_cache;
+                                if dy_total > 0 {
+                                    memory_scroll = (base_scroll + delta).min(max);
+                                } else {
+                                    memory_scroll = base_scroll.saturating_sub(delta);
+                                }
+                            } else if matches!(screen, Screen::Chat)
                                 && apply_touch_drag_to_pty_view(
                                     pty_view && matches!(pty_focus, PtyFocus::Terminal),
                                     pty_tabs.as_mut_slice(),
@@ -9694,6 +10338,7 @@ fn run_loop(
                         touch_drag_last_col = None;
                         touch_drag_anchor_row = None;
                         touch_drag_anchor_scroll = None;
+                        touch_drag_target = None;
                     }
                     _ => {}
                 }
@@ -9787,19 +10432,18 @@ fn run_loop(
                                             sys_cfg_path: &sys_cfg_path,
                                             dog_state: &mut dog_state,
                                             main_state: &mut main_state,
+                                            memory_state: &mut memory_state,
                                             mind_ctx_idx_main: &mut mind_ctx_idx_main,
                                             mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                            mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                                             main_prompt_text: &mut main_prompt_text,
-                                            context_compact_prompt_text:
-                                                &mut context_compact_prompt_text,
                                             dog_client: &mut dog_client,
                                             main_client: &mut main_client,
+                                            memory_client: &mut memory_client,
                                             sys_log: &mut sys_log,
                                             sys_log_limit: config.sys_log_limit,
                                             context_prompts: &mut context_prompts,
                                             context_prompt_path: &context_prompt_path,
-                                            context_compact_prompt_path:
-                                                &context_compact_prompt_path,
                                         });
                                         continue;
                                     }
@@ -9824,19 +10468,18 @@ fn run_loop(
                                             sys_cfg_path: &sys_cfg_path,
                                             dog_state: &mut dog_state,
                                             main_state: &mut main_state,
+                                            memory_state: &mut memory_state,
                                             mind_ctx_idx_main: &mut mind_ctx_idx_main,
                                             mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                            mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                                             main_prompt_text: &mut main_prompt_text,
-                                            context_compact_prompt_text:
-                                                &mut context_compact_prompt_text,
                                             dog_client: &mut dog_client,
                                             main_client: &mut main_client,
+                                            memory_client: &mut memory_client,
                                             sys_log: &mut sys_log,
                                             sys_log_limit: config.sys_log_limit,
                                             context_prompts: &mut context_prompts,
                                             context_prompt_path: &context_prompt_path,
-                                            context_compact_prompt_path:
-                                                &context_compact_prompt_path,
                                         });
                                         continue;
                                     }
@@ -9870,19 +10513,18 @@ fn run_loop(
                                             sys_cfg_path: &sys_cfg_path,
                                             dog_state: &mut dog_state,
                                             main_state: &mut main_state,
+                                            memory_state: &mut memory_state,
                                             mind_ctx_idx_main: &mut mind_ctx_idx_main,
                                             mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                            mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                                             main_prompt_text: &mut main_prompt_text,
-                                            context_compact_prompt_text:
-                                                &mut context_compact_prompt_text,
                                             dog_client: &mut dog_client,
                                             main_client: &mut main_client,
+                                            memory_client: &mut memory_client,
                                             sys_log: &mut sys_log,
                                             sys_log_limit: config.sys_log_limit,
                                             context_prompts: &mut context_prompts,
                                             context_prompt_path: &context_prompt_path,
-                                            context_compact_prompt_path:
-                                                &context_compact_prompt_path,
                                         });
                                         continue;
                                     }
@@ -9930,19 +10572,18 @@ fn run_loop(
                                             sys_cfg_path: &sys_cfg_path,
                                             dog_state: &mut dog_state,
                                             main_state: &mut main_state,
+                                            memory_state: &mut memory_state,
                                             mind_ctx_idx_main: &mut mind_ctx_idx_main,
                                             mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                            mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                                             main_prompt_text: &mut main_prompt_text,
-                                            context_compact_prompt_text:
-                                                &mut context_compact_prompt_text,
                                             dog_client: &mut dog_client,
                                             main_client: &mut main_client,
+                                            memory_client: &mut memory_client,
                                             sys_log: &mut sys_log,
                                             sys_log_limit: config.sys_log_limit,
                                             context_prompts: &mut context_prompts,
                                             context_prompt_path: &context_prompt_path,
-                                            context_compact_prompt_path:
-                                                &context_compact_prompt_path,
                                         });
                                         sync_system_toggles(
                                             &sys_cfg,
@@ -9968,7 +10609,6 @@ fn run_loop(
                                         dog_prompt_text: &dog_state.prompt,
                                         main_prompt_text: &main_prompt_text,
                                         context_prompts: &context_prompts,
-                                        context_compact_prompt_text: &context_compact_prompt_text,
                                     });
                                     settings.edit_cursor = settings.edit_buffer.len();
                                     if is_prompt_kind(spec.kind) {
@@ -10018,18 +10658,18 @@ fn run_loop(
                                         sys_cfg_path: &sys_cfg_path,
                                         dog_state: &mut dog_state,
                                         main_state: &mut main_state,
+                                        memory_state: &mut memory_state,
                                         mind_ctx_idx_main: &mut mind_ctx_idx_main,
                                         mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                        mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                                         main_prompt_text: &mut main_prompt_text,
-                                        context_compact_prompt_text:
-                                            &mut context_compact_prompt_text,
                                         dog_client: &mut dog_client,
                                         main_client: &mut main_client,
+                                        memory_client: &mut memory_client,
                                         sys_log: &mut sys_log,
                                         sys_log_limit: config.sys_log_limit,
                                         context_prompts: &mut context_prompts,
                                         context_prompt_path: &context_prompt_path,
-                                        context_compact_prompt_path: &context_compact_prompt_path,
                                         sse_enabled: &mut sse_enabled,
                                         chat_target: &mut chat_target,
                                     });
@@ -10052,18 +10692,18 @@ fn run_loop(
                                         sys_cfg_path: &sys_cfg_path,
                                         dog_state: &mut dog_state,
                                         main_state: &mut main_state,
+                                        memory_state: &mut memory_state,
                                         mind_ctx_idx_main: &mut mind_ctx_idx_main,
                                         mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                        mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                                         main_prompt_text: &mut main_prompt_text,
-                                        context_compact_prompt_text:
-                                            &mut context_compact_prompt_text,
                                         dog_client: &mut dog_client,
                                         main_client: &mut main_client,
+                                        memory_client: &mut memory_client,
                                         sys_log: &mut sys_log,
                                         sys_log_limit: config.sys_log_limit,
                                         context_prompts: &mut context_prompts,
                                         context_prompt_path: &context_prompt_path,
-                                        context_compact_prompt_path: &context_compact_prompt_path,
                                         sse_enabled: &mut sse_enabled,
                                         chat_target: &mut chat_target,
                                     });
@@ -10148,18 +10788,18 @@ fn run_loop(
                                         sys_cfg_path: &sys_cfg_path,
                                         dog_state: &mut dog_state,
                                         main_state: &mut main_state,
+                                        memory_state: &mut memory_state,
                                         mind_ctx_idx_main: &mut mind_ctx_idx_main,
                                         mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                        mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                                         main_prompt_text: &mut main_prompt_text,
-                                        context_compact_prompt_text:
-                                            &mut context_compact_prompt_text,
                                         dog_client: &mut dog_client,
                                         main_client: &mut main_client,
+                                        memory_client: &mut memory_client,
                                         sys_log: &mut sys_log,
                                         sys_log_limit: config.sys_log_limit,
                                         context_prompts: &mut context_prompts,
                                         context_prompt_path: &context_prompt_path,
-                                        context_compact_prompt_path: &context_compact_prompt_path,
                                     });
                                 }
                                 KeyCode::Enter => {
@@ -10543,7 +11183,7 @@ fn run_loop(
                     && !ctrl
                     && !(matches!(screen, Screen::Chat) && pty_view)
                 {
-                    let codex_mode = chat_target_is_codex(chat_target, &dog_client, &main_client);
+                    let codex_mode = chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
                     let (thinking_global, expanded_thinking_ref, collapsed_thinking_ref) =
                         if codex_mode {
                             (
@@ -10795,6 +11435,7 @@ fn run_loop(
                                     || cmd.eq_ignore_ascii_case("/cmd")
                                     || cmd.eq_ignore_ascii_case("/settings")
                                     || cmd.eq_ignore_ascii_case("/help")
+                                    || cmd.eq_ignore_ascii_case("/testmemory")
                                     || cmd.eq_ignore_ascii_case("/sse")
                                     || cmd.eq_ignore_ascii_case("/switch to")
                                 {
@@ -10805,30 +11446,33 @@ fn run_loop(
                                         &mut last_input_at,
                                     );
                                     command_menu_suppress = true;
-                                    if handle_command(HandleCommandArgs {
-                                        core: &mut core,
-                                        raw: &raw,
-                                        meta: &mut metamemo,
-                                        context_usage: &mut context_usage,
-                                        mode: &mut mode,
-                                        active_kind: &mut active_kind,
-                                        chat_target: &mut chat_target,
-                                        dog_state: &mut dog_state,
-                                        main_state: &mut main_state,
-                                        mind_ctx_idx_main: &mut mind_ctx_idx_main,
-                                        mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
-                                        screen: &mut screen,
-                                        help_ui: &mut help_ui,
-                                        should_exit: &mut should_exit,
-                                        sse_enabled: &mut sse_enabled,
-                                        enter_cmd_shell: &mut pending_cmd_shell,
-                                        open_user_terminal: &mut pending_user_terminal,
-                                        exit_code: &mut exit_code,
-                                        sys_cfg: &mut sys_cfg,
-                                        sys_cfg_path: &sys_cfg_path,
-                                        sys_log: &mut sys_log,
-                                        sys_log_limit: config.sys_log_limit,
-                                    })? {
+	                                    if handle_command(HandleCommandArgs {
+	                                        core: &mut core,
+	                                        raw: &raw,
+	                                        meta: &mut metamemo,
+	                                        context_usage: &mut context_usage,
+	                                        mode: &mut mode,
+	                                        active_kind: &mut active_kind,
+	                                        chat_target: &mut chat_target,
+	                                        dog_state: &mut dog_state,
+	                                        main_state: &mut main_state,
+	                                        memory_state: &mut memory_state,
+	                                        mind_ctx_idx_main: &mut mind_ctx_idx_main,
+	                                        mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+	                                        mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
+	                                        screen: &mut screen,
+	                                        help_ui: &mut help_ui,
+	                                        should_exit: &mut should_exit,
+	                                        sse_enabled: &mut sse_enabled,
+	                                        enter_cmd_shell: &mut pending_cmd_shell,
+	                                        open_user_terminal: &mut pending_user_terminal,
+	                                        memory_panel_open: &mut memory_panel_open,
+	                                        exit_code: &mut exit_code,
+	                                        sys_cfg: &mut sys_cfg,
+	                                        sys_cfg_path: &sys_cfg_path,
+	                                        sys_log: &mut sys_log,
+	                                        sys_log_limit: config.sys_log_limit,
+	                                    })? {
                                         reset_after_command(ResetAfterCommandArgs {
                                             core: &mut core,
                                             render_cache: &mut render_cache,
@@ -10838,7 +11482,6 @@ fn run_loop(
                                             collapsed_tool_idxs: &mut collapsed_tool_idxs,
                                             expanded_user_idxs: &mut expanded_user_idxs,
                                             collapsed_user_idxs: &mut collapsed_user_idxs,
-                                            ctx_compact_notice_idx: &mut ctx_compact_notice_idx,
                                             expanded_thinking_idxs: &mut expanded_thinking_idxs,
                                             collapsed_thinking_idxs: &mut collapsed_thinking_idxs,
                                             selected_msg_idx: &mut selected_msg_idx,
@@ -10885,6 +11528,8 @@ fn run_loop(
                                                 &mut input_chars,
                                                 &mut last_input_at,
                                             );
+                                            core.push_system("··· Terminal 已打开（用户手动）\n- 该窗口中的命令由用户自己执行\n- 退出/关闭请在 Terminal 内自行完成\n- 这不是 AI 启动的自动化任务");
+                                            push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: user session");
                                             let call = ToolCall {
                                                 tool: "bash".to_string(),
                                                 input: "exec bash -li".to_string(),
@@ -11075,7 +11720,7 @@ fn run_loop(
                             );
                         }
                         let codex_mode =
-                            chat_target_is_codex(chat_target, &dog_client, &main_client);
+                            chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
 
                         // cycle helper: compact -> tool -> thinking -> compact (both=true treated as tool-only)
                         let next_cycle = |tool: bool, thinking: bool| -> (bool, bool) {
@@ -11262,7 +11907,7 @@ fn run_loop(
                             follow_bottom = false;
                             if let Some(msg) = core.history.get(sel) {
                                 let codex_mode =
-                                    chat_target_is_codex(chat_target, &dog_client, &main_client);
+                                    chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
                                 let mut handled = false;
                                 match msg.role {
                                     Role::User => {
@@ -11477,7 +12122,7 @@ fn run_loop(
                         }
 
                         let codex_mode =
-                            chat_target_is_codex(chat_target, &dog_client, &main_client);
+                            chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
                         if codex_mode {
                             // Codex：Tab 切换“工具详情 + 思维链”全局展开/全局折叠（折叠态仅显示 brief）。
                             let next =
@@ -11543,7 +12188,7 @@ fn run_loop(
                             );
                         }
                         let codex_mode =
-                            chat_target_is_codex(chat_target, &dog_client, &main_client);
+                            chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
 
                         let double_home = last_home_at.is_some_and(|t| {
                             now.saturating_duration_since(t) <= Duration::from_millis(350)
@@ -11714,7 +12359,7 @@ fn run_loop(
                         let sel = selected_msg_idx.unwrap_or(0);
                         if let Some(ti) = find_think_message_for_selection(&core, sel) {
                             let codex_mode =
-                                chat_target_is_codex(chat_target, &dog_client, &main_client);
+                                chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
                             let at_bottom = (scroll as usize) >= max_scroll_cache.saturating_sub(1);
                             if !at_bottom {
                                 pending_scroll_anchor = capture_scroll_anchor(
@@ -11796,7 +12441,7 @@ fn run_loop(
                             ));
                         } else {
                             let codex_mode =
-                                chat_target_is_codex(chat_target, &dog_client, &main_client);
+                                chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
                             // system 折叠条目（如欢迎语/PTY已启动）：走“工具详情”折叠路线。
                             if core.history.get(sel).is_some_and(|m| {
                                 m.role == Role::System
@@ -12116,10 +12761,10 @@ fn run_loop(
                             }
                             continue;
                         }
-                        if force_newline {
-                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-                                force: true,
-                                now,
+	                        if force_newline {
+	                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+	                                force: true,
+	                                now,
                                 config: &config,
                                 paste_capture: &mut paste_capture,
                                 input: &mut input,
@@ -12147,14 +12792,67 @@ fn run_loop(
                                 command_menu_suppress: Some(&mut command_menu_suppress),
                             }) {
                                 continue;
-                            }
-                            continue;
-                        }
+	                            }
+	                            continue;
+	                        }
 
-                        if force_enqueue
-                            && (is_idle_like(mode)
-                                || matches!(mode, Mode::Generating | Mode::ExecutingTool))
-                        {
+	                        // PTY 展开且焦点在聊天输入框：Enter 作为“发送到终端”（用于测试/快速执行）。
+	                        // - Shift+Enter 仍然强制换行（上面已处理）
+	                        // - Ctrl+Enter 仍然走“入队发送给 AI”的语义（下面会处理）
+	                        if !force_enqueue
+	                            && matches!(screen, Screen::Chat)
+	                            && is_pty_panel_active(screen, pty_view, pty_tabs.as_slice())
+	                            && matches!(pty_focus, PtyFocus::Chat)
+	                        {
+	                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+	                                force: true,
+	                                now,
+	                                config: &config,
+	                                paste_capture: &mut paste_capture,
+	                                input: &mut input,
+	                                cursor: &mut cursor,
+	                                input_chars: &mut input_chars,
+	                                pending_pastes: &mut pending_pastes,
+	                                toast: &mut toast,
+	                                max_input_chars,
+	                                burst_count: &mut burst_count,
+	                                burst_last_at: &mut burst_last_at,
+	                                burst_started_at: &mut burst_started_at,
+	                                burst_start_cursor: &mut burst_start_cursor,
+	                                paste_drop_until: &mut paste_drop_until,
+	                                paste_guard_until: &mut paste_guard_until,
+	                            });
+	                            let send = drain_input_for_send(
+	                                &mut input,
+	                                &mut cursor,
+	                                &mut input_chars,
+	                                &mut last_input_at,
+	                                &mut pending_pastes,
+	                                &mut paste_capture,
+	                                &mut command_menu_suppress,
+	                                &mut pending_pty_snapshot,
+	                            );
+	                            let text = send.model_text;
+	                            if text.trim().is_empty() {
+	                                continue;
+	                            }
+	                            let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
+	                            if let Some(state) = pty_tabs.get_mut(active) {
+	                                let mut bytes = text.into_bytes();
+	                                bytes.push(b'\r');
+	                                state.record_input_bytes(&bytes);
+	                                if let Some(tx_in) = pty_handles.get(&state.job_id) {
+	                                    let _ = tx_in.send(PtyControl::Input(bytes));
+	                                }
+	                                action_hint = Some((now, "已发送到终端".to_string()));
+	                            }
+	                            continue;
+	                        }
+
+	                        if force_enqueue
+	                            && (is_idle_like(mode)
+	                                || matches!(mode, Mode::Generating | Mode::ExecutingTool))
+	                        {
                             finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
                                 force: true,
                                 now,
@@ -12186,28 +12884,92 @@ fn run_loop(
                             if send.model_text.trim().is_empty() {
                                 continue;
                             }
+                            let effective_target = if memory_panel_open && memory_focus {
+                                MindKind::Memory
+                            } else {
+                                chat_target
+                            };
                             let id = next_send_queue_id();
                             send_queue_low.push_back(QueuedUserMessage {
                                 id,
-                                target: chat_target,
+                                target: effective_target,
                                 ui_text: send.ui_text,
                                 model_text: send.model_text,
                             });
                             push_sys_log(
                                 &mut sys_log,
                                 config.sys_log_limit,
-                                format!("已入队（最低优先级）：#{id} → {:?}", chat_target),
+                                format!("已入队（最低优先级）：#{id} → {:?}", effective_target),
                             );
                             action_hint = Some((now, "已入队".to_string()));
                             continue;
                         }
 
-                        if matches!(mode, Mode::Generating | Mode::ExecutingTool) {
-                            // API 活跃：Enter 仅换行；Alt+Enter 强发送（入队，最低优先级）。
-                            if alt && !ctrl {
-                                finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-                                    force: true,
-                                    now,
+	                        if matches!(mode, Mode::Generating | Mode::ExecutingTool) {
+	                            // API 活跃：
+	                            // - 默认 Enter 仅换行（避免打断当前请求）
+	                            // - 但在 Memory 面板内，更符合预期的是“Enter 直接入队等待发送”，用于不打断主流程的独立测试。
+	                            // - Shift+Enter 强制换行（上面已处理）
+	                            // - Alt+Enter 仍保留为兼容的“强制入队”
+	                            if !alt
+	                                && !ctrl
+	                                && !shift
+	                                && memory_panel_open
+	                                && memory_focus
+	                                && matches!(screen, Screen::Chat)
+	                            {
+	                                finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+	                                    force: true,
+	                                    now,
+	                                    config: &config,
+	                                    paste_capture: &mut paste_capture,
+	                                    input: &mut input,
+	                                    cursor: &mut cursor,
+	                                    input_chars: &mut input_chars,
+	                                    pending_pastes: &mut pending_pastes,
+	                                    toast: &mut toast,
+	                                    max_input_chars,
+	                                    burst_count: &mut burst_count,
+	                                    burst_last_at: &mut burst_last_at,
+	                                    burst_started_at: &mut burst_started_at,
+	                                    burst_start_cursor: &mut burst_start_cursor,
+	                                    paste_drop_until: &mut paste_drop_until,
+	                                    paste_guard_until: &mut paste_guard_until,
+	                                });
+	                                let send = drain_input_for_send(
+	                                    &mut input,
+	                                    &mut cursor,
+	                                    &mut input_chars,
+	                                    &mut last_input_at,
+	                                    &mut pending_pastes,
+	                                    &mut paste_capture,
+	                                    &mut command_menu_suppress,
+	                                    &mut pending_pty_snapshot,
+	                                );
+	                                if send.model_text.trim().is_empty() {
+	                                    continue;
+	                                }
+	                                let id = next_send_queue_id();
+	                                send_queue_low.push_back(QueuedUserMessage {
+	                                    id,
+	                                    target: MindKind::Memory,
+	                                    ui_text: send.ui_text,
+	                                    model_text: send.model_text,
+	                                });
+	                                push_sys_log(
+	                                    &mut sys_log,
+	                                    config.sys_log_limit,
+	                                    format!("已入队：#{id} → Memory"),
+	                                );
+	                                action_hint = Some((now, "已入队".to_string()));
+	                                continue;
+	                            }
+
+	                            // 其它情况：Enter 换行；Alt+Enter 入队。
+	                            if alt && !ctrl {
+	                                finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+	                                    force: true,
+	                                    now,
                                     config: &config,
                                     paste_capture: &mut paste_capture,
                                     input: &mut input,
@@ -12236,17 +12998,22 @@ fn run_loop(
                                 if send.model_text.trim().is_empty() {
                                     continue;
                                 }
+                                let effective_target = if memory_panel_open && memory_focus {
+                                    MindKind::Memory
+                                } else {
+                                    chat_target
+                                };
                                 let id = next_send_queue_id();
                                 send_queue_low.push_back(QueuedUserMessage {
                                     id,
-                                    target: chat_target,
+                                    target: effective_target,
                                     ui_text: send.ui_text,
                                     model_text: send.model_text,
                                 });
                                 push_sys_log(
                                     &mut sys_log,
                                     config.sys_log_limit,
-                                    format!("已入队（最低优先级）：#{id} → {:?}", chat_target),
+                                    format!("已入队（最低优先级）：#{id} → {:?}", effective_target),
                                 );
                                 continue;
                             }
@@ -12307,14 +13074,20 @@ fn run_loop(
                                             config.sys_log_limit,
                                             mcp_messages.tool_confirm_user_allowed.clone(),
                                         );
-                                        match active_kind {
-                                            MindKind::Sub => dog_state.push_system(
-                                                mcp_messages.tool_confirm_user_allowed.as_str(),
-                                            ),
-                                            MindKind::Main => main_state.push_system(
-                                                mcp_messages.tool_confirm_user_allowed.as_str(),
-                                            ),
-                                        }
+                                        let mind = match active_kind {
+                                            MindKind::Sub => "dog",
+                                            MindKind::Main => "main",
+                                            MindKind::Memory => "memory",
+                                        };
+                                        let p = context_path_for_mind(&config, mind);
+                                        log_dyncontext(
+                                            p,
+                                            mind,
+                                            "system",
+                                            mcp_messages.tool_confirm_user_allowed.as_str(),
+                                            None,
+                                            None,
+                                        );
                                         spawn_tool_execution(
                                             call,
                                             active_kind,
@@ -12335,28 +13108,26 @@ fn run_loop(
                                             config.sys_log_limit,
                                             mcp_messages.tool_confirm_user_denied.clone(),
                                         );
-                                        match active_kind {
-                                            // 模型侧：明确“用户拒绝执行”（不是工具失败/超时），用于自愈交互：
-                                            // - 先向用户说明你正准备做什么
-                                            // - 询问用户担忧/限制点
-                                            // - 给出更安全的替代方案（只读/更短命令/先解释后执行等）
-                                            MindKind::Sub => dog_state.push_mcp_tool_result(
-                                                call.tool.as_str(),
-                                                "用户拒绝执行该工具调用，本轮未执行。\n请立即向用户说明：你正准备做什么/为什么需要这一步；并询问用户是否有担忧（安全/隐私/副作用/资源占用）。\n然后给出替代方案（更安全的只读命令、或先解释再请求确认）。",
-                                                &vec![
-                                                    "ok:false | result:confirmation_denied | exit:0 | elapsed_ms:0 | 状态:fail"
-                                                        .to_string(),
-                                                ],
-                                            ),
-                                            MindKind::Main => main_state.push_mcp_tool_result(
-                                                call.tool.as_str(),
-                                                "用户拒绝执行该工具调用，本轮未执行。\n请立即向用户说明：你正准备做什么/为什么需要这一步；并询问用户是否有担忧（安全/隐私/副作用/资源占用）。\n然后给出替代方案（更安全的只读命令、或先解释再请求确认）。",
-                                                &vec![
-                                                    "ok:false | result:confirmation_denied | exit:0 | elapsed_ms:0 | 状态:fail"
-                                                        .to_string(),
-                                                ],
-                                            ),
-                                        }
+                                        // 会话上下文外置：将“用户拒绝执行”作为 tool 回执写入 context.jsonl，供模型下轮自愈。
+                                        let denied_note = "用户拒绝执行该工具调用，本轮未执行。\n请立即向用户说明：你正准备做什么/为什么需要这一步；并询问用户是否有担忧（安全/隐私/副作用/资源占用）。\n然后给出替代方案（更安全的只读命令、或先解释再请求确认）。";
+                                        let denied_meta = vec![
+                                            "ok:false | result:confirmation_denied | exit:0 | elapsed_ms:0 | 状态:fail"
+                                                .to_string(),
+                                        ];
+                                        let mind = match active_kind {
+                                            MindKind::Sub => "dog",
+                                            MindKind::Main => "main",
+                                            MindKind::Memory => "memory",
+                                        };
+                                        let p = context_path_for_mind(&config, mind);
+                                        log_dyncontext(
+                                            p,
+                                            mind,
+                                            "tool",
+                                            denied_note,
+                                            Some(call.tool.as_str()),
+                                            Some(denied_meta.as_slice()),
+                                        );
                                         // 用户拒绝工具执行：停止后续工具链，交由模型在后续对话中解释并礼貌询问原因。
                                         pending_tools.clear();
                                         mode = Mode::Idle;
@@ -12379,10 +13150,12 @@ fn run_loop(
                                 );
                             }
                         } else if is_idle_like(mode) {
-                            let context_used = context_usage.tokens();
-                            let ctx_limit = sys_cfg.context_k.saturating_mul(1000).max(1);
-                            let ctx_pct = calc_pct(context_used, ctx_limit);
-                            if matches!(diary_state.stage, DiaryStage::Idle) && ctx_pct >= 100 {
+                            let kb_limit = sys_cfg.date_kb_limit;
+                            let kb_used = contextmemo_size_kb(&config.contextmemo_path);
+                            if kb_limit > 0
+                                && matches!(diary_state.stage, DiaryStage::Idle)
+                                && kb_used >= kb_limit
+                            {
                                 finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
                                     force: true,
                                     now,
@@ -12403,10 +13176,10 @@ fn run_loop(
                                 });
                                 let last_diary = read_last_datememo_entry(&memo_db);
                                 let context_text = read_contextmemo_text(&config.contextmemo_path);
-                                if try_start_main_diary(TryStartMainDiaryArgs {
-                                    main_client: &main_client,
+                                if try_start_memory_diary(TryStartMemoryDiaryArgs {
+                                    memory_client: &memory_client,
                                     main_prompt: &context_prompts.main_prompt,
-                                    system_prompt: &main_state.prompt,
+                                    system_prompt: &memory_state.prompt,
                                     last_diary: &last_diary,
                                     context_text: &context_text,
                                     tx: &tx,
@@ -12429,8 +13202,8 @@ fn run_loop(
                                         &mut core,
                                         &mut metamemo,
                                         &mut context_usage,
-                                        Some("main"),
-                                        "MAIN 未配置 API Key，无法写日记。",
+                                        Some("memory"),
+                                        "MEMORY 未配置 API Key，无法写日记。",
                                     );
                                     continue;
                                 }
@@ -12560,30 +13333,33 @@ fn run_loop(
                                 continue;
                             }
                             // 已移除弹窗/窗口栈：不需要“清屏关闭弹窗”的额外处理。
-                            if handle_command(HandleCommandArgs {
-                                core: &mut core,
-                                raw: send.model_text.trim_end(),
-                                meta: &mut metamemo,
-                                context_usage: &mut context_usage,
-                                mode: &mut mode,
-                                active_kind: &mut active_kind,
-                                chat_target: &mut chat_target,
-                                dog_state: &mut dog_state,
-                                main_state: &mut main_state,
-                                mind_ctx_idx_main: &mut mind_ctx_idx_main,
-                                mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
-                                screen: &mut screen,
-                                help_ui: &mut help_ui,
-                                should_exit: &mut should_exit,
-                                sse_enabled: &mut sse_enabled,
-                                enter_cmd_shell: &mut pending_cmd_shell,
-                                open_user_terminal: &mut pending_user_terminal,
-                                exit_code: &mut exit_code,
-                                sys_cfg: &mut sys_cfg,
-                                sys_cfg_path: &sys_cfg_path,
-                                sys_log: &mut sys_log,
-                                sys_log_limit: config.sys_log_limit,
-                            })? {
+                                    if handle_command(HandleCommandArgs {
+                                        core: &mut core,
+                                        raw: send.model_text.trim_end(),
+                                        meta: &mut metamemo,
+                                        context_usage: &mut context_usage,
+                                        mode: &mut mode,
+                                        active_kind: &mut active_kind,
+                                        chat_target: &mut chat_target,
+                                        dog_state: &mut dog_state,
+                                        main_state: &mut main_state,
+                                        memory_state: &mut memory_state,
+                                        mind_ctx_idx_main: &mut mind_ctx_idx_main,
+                                        mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                        mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
+                                        screen: &mut screen,
+                                        help_ui: &mut help_ui,
+                                        should_exit: &mut should_exit,
+                                        sse_enabled: &mut sse_enabled,
+                                        enter_cmd_shell: &mut pending_cmd_shell,
+                                        open_user_terminal: &mut pending_user_terminal,
+                                        memory_panel_open: &mut memory_panel_open,
+                                        exit_code: &mut exit_code,
+                                        sys_cfg: &mut sys_cfg,
+                                        sys_cfg_path: &sys_cfg_path,
+                                        sys_log: &mut sys_log,
+                                        sys_log_limit: config.sys_log_limit,
+                                    })? {
                                 reset_after_command(ResetAfterCommandArgs {
                                     core: &mut core,
                                     render_cache: &mut render_cache,
@@ -12593,7 +13369,6 @@ fn run_loop(
                                     collapsed_tool_idxs: &mut collapsed_tool_idxs,
                                     expanded_user_idxs: &mut expanded_user_idxs,
                                     collapsed_user_idxs: &mut collapsed_user_idxs,
-                                    ctx_compact_notice_idx: &mut ctx_compact_notice_idx,
                                     expanded_thinking_idxs: &mut expanded_thinking_idxs,
                                     collapsed_thinking_idxs: &mut collapsed_thinking_idxs,
                                     selected_msg_idx: &mut selected_msg_idx,
@@ -12639,6 +13414,8 @@ fn run_loop(
                                         &mut input_chars,
                                         &mut last_input_at,
                                     );
+                                    core.push_system("··· Terminal 已打开（用户手动）\n- 该窗口中的命令由用户自己执行\n- 退出/关闭请在 Terminal 内自行完成\n- 这不是 AI 启动的自动化任务");
+                                    push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: user session");
                                     let call = ToolCall {
                                         tool: "bash".to_string(),
                                         input: "exec bash -li".to_string(),
@@ -12664,7 +13441,12 @@ fn run_loop(
                                 continue;
                             }
 
-                            let target = chat_target;
+                            // 发送目标：默认按 chat_target（Main/Dog），但若 Memory 面板聚焦，则发送给 Memory。
+                            let target = if memory_panel_open && memory_focus {
+                                MindKind::Memory
+                            } else {
+                                chat_target
+                            };
                             clear_brief_state(ClearBriefStateArgs {
                                 brief_text: &mut brief_text,
                                 brief_idx: &mut brief_idx,
@@ -12683,6 +13465,7 @@ fn run_loop(
                                 pending_mind_half: &mut pending_mind_half,
                                 dog_state: &mut dog_state,
                                 main_state: &mut main_state,
+                                memory_state: &mut memory_state,
                                 sys_cfg: &sys_cfg,
                                 config: &config,
                                 tx: &tx,
@@ -12708,17 +13491,39 @@ fn run_loop(
                                 expanded_thinking_idxs: &mut expanded_thinking_idxs,
                                 scroll: &mut scroll,
                                 follow_bottom: &mut follow_bottom,
-                                context_compact_prompt_text: &context_compact_prompt_text,
                                 token_totals: &mut token_totals,
                                 token_total_path: &token_total_path,
                                 active_request_in_tokens: &mut active_request_in_tokens,
                                 dog_client: &dog_client,
                                 main_client: &main_client,
+                                memory_client: &memory_client,
                             })?;
                         }
                     }
                     KeyCode::Char(ch) => {
                         last_input_at = Some(now);
+                        // 体验优化：用户输入 `/` 期望立即弹出命令菜单。
+                        // 若当前处于 paste_capture（粘贴捕获）阶段，直接 force flush，避免 `/` 被吞在 capture 缓冲里导致“要点一下屏幕才出现菜单”。
+                        if ch == '/' && input.is_empty() && paste_capture.is_some() {
+                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+                                force: true,
+                                now,
+                                config: &config,
+                                paste_capture: &mut paste_capture,
+                                input: &mut input,
+                                cursor: &mut cursor,
+                                input_chars: &mut input_chars,
+                                pending_pastes: &mut pending_pastes,
+                                toast: &mut toast,
+                                max_input_chars,
+                                burst_count: &mut burst_count,
+                                burst_last_at: &mut burst_last_at,
+                                burst_started_at: &mut burst_started_at,
+                                burst_start_cursor: &mut burst_start_cursor,
+                                paste_drop_until: &mut paste_drop_until,
+                                paste_guard_until: &mut paste_guard_until,
+                            });
+                        }
                         if let Some(c) = paste_capture.as_mut() {
                             cursor =
                                 snap_cursor_out_of_placeholder(&input, &pending_pastes, cursor);
@@ -12908,9 +13713,12 @@ struct DrainAsyncEventsArgs<'a> {
     collapsed_user_idxs: &'a mut BTreeSet<usize>,
     active_tool_stream: &'a mut Option<ToolStreamState>,
     dog_state: &'a mut DogState,
+    #[allow(dead_code)]
     dog_client: &'a Option<DogClient>,
     main_state: &'a mut DogState,
     main_client: &'a Option<DogClient>,
+    memory_state: &'a mut DogState,
+    memory_client: &'a Option<DogClient>,
     mind_context: &'a mut MindContextPool,
     _mind_ctx_idx_main: &'a mut Option<usize>,
     _mind_ctx_idx_dog: &'a mut Option<usize>,
@@ -12920,7 +13728,6 @@ struct DrainAsyncEventsArgs<'a> {
     meta: &'a mut Option<MetaMemo>,
     context_usage: &'a mut ContextUsage,
     diary_state: &'a mut DiaryState,
-    ctx_compact_notice_idx: &'a mut Option<usize>,
     mind_rate_window: &'a mut VecDeque<Instant>,
     pending_mind_half: &'a mut Option<PendingMindHalf>,
     brief_text: &'a mut String,
@@ -12954,7 +13761,6 @@ struct DrainAsyncEventsArgs<'a> {
     sys_log: &'a mut VecDeque<String>,
     sys_log_limit: usize,
     config: &'a AppConfig,
-    context_compact_prompt_text: &'a str,
     fastmemo_compact_prompt_text: &'a str,
     pty_help_prompt_text: &'a str,
     pty_started_notice_prompt_text: &'a str,
@@ -13065,7 +13871,7 @@ fn handle_model_stream_chunk(
         } else {
             if brief_idx.is_none() {
                 let stub = build_brief_tool_message_stub(owner, "running");
-                core.push_tool(stub);
+                core.push_tool_mind(stub, Some(owner));
                 *brief_idx = Some(core.history.len().saturating_sub(1));
             }
             brief_text.push_str(brief);
@@ -13177,7 +13983,7 @@ fn handle_model_stream_chunk(
                             let stub = format!(
                                 "操作: {label}\nexplain: 解析工具调用\ninput: ...\noutput:\n```text\n...\n```\nmeta:\n```text\n状态:parsing\n```\n"
                             );
-                            core.push_tool(stub);
+                            core.push_tool_mind(stub, Some(owner));
                             let tool_idx = core.history.len().saturating_sub(1);
                             render_cache.invalidate(tool_idx);
                             streaming_state.idx = Some(tool_idx);
@@ -13234,14 +14040,12 @@ fn handle_model_stream_chunk(
                             let tool_name = extract_tool_name_hint(&streaming_state.text[start..])
                                 .unwrap_or_else(|| "tool".to_string());
                             let label = crate::mcp::tool_display_label(tool_name.trim());
-                            let stub = format!(
-                                "操作: {label}\nexplain: 解析工具调用\ninput: ...\noutput:\n```text\n...\n```\nmeta:\n```text\n状态:parsing\n```\n"
-                            );
-                            core.push_tool(stub);
-                            let tool_idx = core.history.len().saturating_sub(1);
-                            render_cache.invalidate(tool_idx);
-                            streaming_state.idx = Some(tool_idx);
-                            *tool_preview_chat_idx = Some(tool_idx);
+	                            let stub = build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
+	                            core.push_tool_mind(stub, Some(owner));
+	                            let tool_idx = core.history.len().saturating_sub(1);
+	                            render_cache.invalidate(tool_idx);
+	                            streaming_state.idx = Some(tool_idx);
+	                            *tool_preview_chat_idx = Some(tool_idx);
                         } else {
                             if let Some(entry) = core.history.get_mut(idx) {
                                 entry.role = Role::Tool;
@@ -13249,9 +14053,8 @@ fn handle_model_stream_chunk(
                                     extract_tool_name_hint(&streaming_state.text[start..])
                                         .unwrap_or_else(|| "tool".to_string());
                                 let label = crate::mcp::tool_display_label(tool_name.trim());
-                                entry.text = format!(
-                                    "操作: {label}\nexplain: 解析工具调用\ninput: ...\noutput:\n```text\n...\n```\nmeta:\n```text\n状态:parsing\n```\n"
-                                );
+                                entry.text =
+                                    build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
                                 render_cache.invalidate(idx);
                             }
                             *tool_preview_chat_idx = Some(idx);
@@ -13262,7 +14065,16 @@ fn handle_model_stream_chunk(
         }
 
         // 一旦进入 tool stub 阶段，就不再把 raw tool JSON 刷进聊天区（仅在 stream_end 时解析+执行）。
-        if streaming_state.tool_start.is_some() {
+        if let Some(start) = streaming_state.tool_start {
+            if let Some(idx) = streaming_state.idx {
+                if let Some(entry) = core.history.get_mut(idx) {
+                    let tool_name = extract_tool_name_hint(&streaming_state.text[start..])
+                        .unwrap_or_else(|| "tool".to_string());
+                    let label = crate::mcp::tool_display_label(tool_name.trim());
+                    entry.text = build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
+                    render_cache.invalidate(idx);
+                }
+            }
             return;
         }
 
@@ -13365,16 +14177,20 @@ struct ModelStreamEndArgs<'a> {
     collapsed_user_idxs: &'a mut BTreeSet<usize>,
     active_tool_stream: &'a mut Option<ToolStreamState>,
     dog_state: &'a mut DogState,
+    #[allow(dead_code)]
     dog_client: &'a Option<DogClient>,
     main_state: &'a mut DogState,
+    #[allow(dead_code)]
     main_client: &'a Option<DogClient>,
+    memory_state: &'a mut DogState,
+    #[allow(dead_code)]
+    memory_client: &'a Option<DogClient>,
     sending_until: &'a mut Option<Instant>,
     token_totals: &'a mut TokenTotals,
     token_total_path: &'a Path,
     meta: &'a mut Option<MetaMemo>,
     context_usage: &'a mut ContextUsage,
     diary_state: &'a mut DiaryState,
-    ctx_compact_notice_idx: &'a mut Option<usize>,
     brief_text: &'a mut String,
     brief_idx: &'a mut Option<usize>,
     brief_in_progress: &'a mut bool,
@@ -13401,7 +14217,6 @@ struct ModelStreamEndArgs<'a> {
     sys_log: &'a mut VecDeque<String>,
     sys_log_limit: usize,
     config: &'a AppConfig,
-    context_compact_prompt_text: &'a str,
     fastmemo_compact_prompt_text: &'a str,
     pty_started_notice_prompt_text: &'a str,
     mcp_messages: &'a McpMessages,
@@ -13445,16 +14260,17 @@ fn handle_model_stream_end(
         collapsed_user_idxs,
         active_tool_stream,
         dog_state,
-        dog_client,
+        dog_client: _,
         main_state,
-        main_client,
+        main_client: _,
+        memory_state,
+        memory_client,
         sending_until,
         token_totals,
         token_total_path,
         meta,
         context_usage,
         diary_state,
-        ctx_compact_notice_idx,
         brief_text,
         brief_idx,
         brief_in_progress,
@@ -13481,7 +14297,6 @@ fn handle_model_stream_end(
         sys_log,
         sys_log_limit,
         config,
-        context_compact_prompt_text,
         fastmemo_compact_prompt_text,
         pty_started_notice_prompt_text,
         mcp_messages,
@@ -13504,7 +14319,6 @@ fn handle_model_stream_end(
         run_log_path,
     } = args;
 
-    let mut auto_context_compact: Option<MindKind> = None;
     let is_heartbeat = heartbeat_request_id
         .as_ref()
         .is_some_and(|v| *v == request_id);
@@ -13547,12 +14361,6 @@ fn handle_model_stream_end(
 
         *active_request_is_mind = false;
         *active_request_is_fastmemo_compact = false;
-        update_ctx_compact_notice_if_system(
-            core,
-            render_cache,
-            ctx_compact_notice_idx,
-            "↻ CONTEXT SUMMARY 执行已中断",
-        );
         let mut remove_idxs: Vec<usize> = Vec::new();
         if let Some(idx) = *thinking_idx {
             remove_idxs.push(idx);
@@ -13641,10 +14449,6 @@ fn handle_model_stream_end(
             sys_log_limit,
             format!("[{}] 系统错误：{user_err}", mind_label(kind)),
         );
-        match kind {
-            MindKind::Sub => dog_state.abort_context_compact(),
-            MindKind::Main => main_state.abort_context_compact(),
-        }
         if diary_state.active() {
             diary_state.stage = DiaryStage::Idle;
         }
@@ -13703,14 +14507,20 @@ fn handle_model_stream_end(
                     .to_string();
                 let meta_lines =
                     vec!["ok:false | result:format_error | exit:0 | elapsed_ms:0".to_string()];
-                match kind {
-                    MindKind::Sub => {
-                        dog_state.push_mcp_tool_result("tool", &model_note, &meta_lines)
-                    }
-                    MindKind::Main => {
-                        main_state.push_mcp_tool_result("tool", &model_note, &meta_lines)
-                    }
-                }
+                let mind = match kind {
+                    MindKind::Sub => "dog",
+                    MindKind::Main => "main",
+                    MindKind::Memory => "memory",
+                };
+                let p = context_path_for_mind(config, mind);
+                log_dyncontext(
+                    p,
+                    mind,
+                    "tool",
+                    &model_note,
+                    Some("tool"),
+                    Some(meta_lines.as_slice()),
+                );
                 push_system_and_log(
                     core,
                     meta,
@@ -13747,10 +14557,20 @@ fn handle_model_stream_end(
             );
             let meta_lines =
                 vec!["ok:false | result:too_many_tools | exit:0 | elapsed_ms:0".to_string()];
-            match kind {
-                MindKind::Sub => dog_state.push_mcp_tool_result("tool", &model_note, &meta_lines),
-                MindKind::Main => main_state.push_mcp_tool_result("tool", &model_note, &meta_lines),
-            }
+            let mind = match kind {
+                MindKind::Sub => "dog",
+                MindKind::Main => "main",
+                MindKind::Memory => "memory",
+            };
+            let p = context_path_for_mind(config, mind);
+            log_dyncontext(
+                p,
+                mind,
+                "tool",
+                &model_note,
+                Some("tool"),
+                Some(meta_lines.as_slice()),
+            );
 
             extracted.clear();
             extracted_from_assistant = false;
@@ -13837,14 +14657,10 @@ fn handle_model_stream_end(
             extracted.retain(|c| c.tool == "mind_msg");
         }
         if *active_request_is_fastmemo_compact {
-            extracted.retain(|c| c.tool == "memory_read" || c.tool == "memory_edit");
+            extracted.retain(|c| c.tool == "memory_read");
         }
         if matches!(diary_state.stage, DiaryStage::WaitingMain) {
-            if *active_request_is_mind {
-                extracted.retain(|c| c.tool == "datememo_add");
-            } else {
-                extracted.retain(|c| c.tool == "context_compact");
-            }
+            extracted.retain(is_datememo_add);
         }
             // 工具调用：按解析顺序依次执行（受每轮最多 3 个工具调用上限约束）。
         if malformed_tool_call
@@ -13905,6 +14721,7 @@ fn handle_model_stream_end(
             match kind {
                 MindKind::Sub => dog_state.set_last_usage_total(out_tokens),
                 MindKind::Main => main_state.set_last_usage_total(out_tokens),
+                MindKind::Memory => memory_state.set_last_usage_total(out_tokens),
             }
             token_totals.total_out_tokens =
                 token_totals.total_out_tokens.saturating_add(out_tokens);
@@ -13919,16 +14736,30 @@ fn handle_model_stream_end(
             && !*active_request_is_mind
             && !*active_request_is_fastmemo_compact
         {
-            match kind {
-                MindKind::Sub => dog_state.push_assistant(&assistant_text),
-                MindKind::Main => main_state.push_assistant(&assistant_text),
-            }
-            let agent = if matches!(kind, MindKind::Sub) {
-                Some("dog")
-            } else {
-                Some("main")
+            let agent = match kind {
+                MindKind::Sub => Some("dog"),
+                MindKind::Main => Some("main"),
+                MindKind::Memory => Some("memory"),
             };
             log_memos(meta, context_usage, "assistant", agent, &assistant_text);
+            let mind = match kind {
+                MindKind::Sub => "dog",
+                MindKind::Main => "main",
+                MindKind::Memory => "memory",
+            };
+            // 会话上下文外置：若本轮包含工具调用，外置 context 会在下方按“前置正文 + tool原文 + 后置正文”
+            // 拆分写入；这里避免重复落盘（否则会把前/后正文写两遍）。
+            if extracted.is_empty() {
+                let p = context_path_for_mind(config, mind);
+                log_dyncontext(
+                    p,
+                    mind,
+                    "assistant",
+                    &assistant_text,
+                    None,
+                    None,
+                );
+            }
             if matches!(kind, MindKind::Main) && !is_pass_message(&assistant_text) {
                 log_contextmemo(
                     &config.contextmemo_path,
@@ -13943,17 +14774,7 @@ fn handle_model_stream_end(
                 sys_log_limit,
                 format!("现在[萤]{}响应完成", mind_label(kind)),
             );
-            let armed = match kind {
-                MindKind::Sub => dog_state.arm_context_compact_if_needed(sys_cfg),
-                MindKind::Main => main_state.arm_context_compact_if_needed(sys_cfg),
-            };
-            if armed {
-                // mind 协同不触发 context_compact，避免频繁压缩影响协同链路成本/节奏。
-                if !*active_request_is_mind {
-                    auto_context_compact = Some(kind);
-                    push_sys_log(sys_log, sys_log_limit, "↻ Context Summary 自动压缩准备中");
-                }
-            }
+            // 动态上下文压缩链路已移除：这里只做常规落盘/统计即可。
         } else if extracted.is_empty() && !*active_request_is_mind && !is_heartbeat {
             append_run_log(
                 run_log_path,
@@ -13962,7 +14783,7 @@ fn handle_model_stream_end(
             );
         }
         *active_request_is_mind = false;
-        if !extracted.is_empty() {
+	        if !extracted.is_empty() {
             // SSE tool stub 模式下，模型可能输出：
             // - 前置正文 + <tool>... + 后置正文
             // 我们希望 UI 能稳定呈现：
@@ -13972,55 +14793,73 @@ fn handle_model_stream_end(
             //
             // 之前的逻辑会把“清理后的全文（去掉 tool blocks）”覆盖到前置正文，导致前/后正文混成一条。
             // 这里改为：尽量保留前置正文不动，把“剩余正文”作为一条新的 assistant 消息追加到 tool stub 之后。
-            let cleaned_ui_text = assistant_text.trim().to_string();
-            let mut suffix_to_push: Option<String> = None;
-            if let Some(ai) = streaming_state.assistant_idx_before_tool.take() {
-                if let Some(entry) = core.history.get_mut(ai) {
-                    entry.role = Role::Assistant;
-                    entry.mind = Some(kind);
-                    let prefix = entry.text.trim().to_string();
-                    if !prefix.is_empty()
-                        && !cleaned_ui_text.is_empty()
-                        && cleaned_ui_text.starts_with(&prefix)
-                    {
-                        // suffix = cleaned - prefix
-                        let rest = cleaned_ui_text[prefix.len()..].trim().to_string();
-                        entry.text = prefix;
-                        if !rest.is_empty() {
-                            suffix_to_push = Some(rest);
-                        }
-                    } else if !cleaned_ui_text.is_empty() {
-                        // Fallback：无法可靠切分时，至少保证“清理后的正文”可见。
-                        entry.text.clone_from(&cleaned_ui_text);
-                    }
-                    render_cache.invalidate(ai);
-                }
-            } else if tool_preview_chat_idx.is_some() && !cleaned_ui_text.is_empty() {
-                // tool stub 里没有前置正文（回复直接从 <tool> 开始），但可能存在后置正文（例如 </tool> 后还有解释）。
-                // 追加一条 assistant，避免“后置正文消失”。
-                suffix_to_push = Some(cleaned_ui_text);
-            }
-            if let Some(t) = suffix_to_push
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                core.history.push(Message {
-                    role: Role::Assistant,
-                    text: t.to_string(),
-                    mind: Some(kind),
-                });
-                render_cache.invalidate(core.history.len().saturating_sub(1));
-            }
-            // 关键：把“工具调用原文（<tool>...</tool>）”按原样写入上下文，避免任何摘要/前端格式污染。
-            // 否则模型下一轮只能看到工具回执，会误判为外部执行，或误学到错误的工具调用格式。
-            let tool_calls_raw = extract_tool_blocks_verbatim(&raw_assistant);
-            if !tool_calls_raw.trim().is_empty() {
-                match kind {
-                    MindKind::Sub => dog_state.push_assistant(&tool_calls_raw),
-                    MindKind::Main => main_state.push_assistant(&tool_calls_raw),
-                }
-            }
+	            let cleaned_ui_text = assistant_text.trim().to_string();
+	            let mut prefix_for_ctx: Option<String> = None;
+	            let mut suffix_for_ctx: Option<String> = None;
+	            let mut suffix_to_push: Option<String> = None;
+	            if let Some(ai) = streaming_state.assistant_idx_before_tool.take() {
+	                if let Some(entry) = core.history.get_mut(ai) {
+	                    entry.role = Role::Assistant;
+	                    entry.mind = Some(kind);
+	                    let prefix = entry.text.trim().to_string();
+	                    if !prefix.is_empty()
+	                        && !cleaned_ui_text.is_empty()
+	                        && cleaned_ui_text.starts_with(&prefix)
+	                    {
+	                        // suffix = cleaned - prefix
+	                        let rest = cleaned_ui_text[prefix.len()..].trim().to_string();
+	                        entry.text = prefix;
+	                        if !entry.text.trim().is_empty() {
+	                            prefix_for_ctx = Some(entry.text.trim().to_string());
+	                        }
+	                        if !rest.is_empty() {
+	                            suffix_to_push = Some(rest);
+	                            suffix_for_ctx = suffix_to_push.clone();
+	                        }
+	                    } else if !cleaned_ui_text.is_empty() {
+	                        // Fallback：无法可靠切分时，至少保证“清理后的正文”可见。
+	                        entry.text.clone_from(&cleaned_ui_text);
+	                        prefix_for_ctx = Some(cleaned_ui_text.clone());
+	                    }
+	                    render_cache.invalidate(ai);
+	                }
+	            } else if tool_preview_chat_idx.is_some() && !cleaned_ui_text.is_empty() {
+	                // tool stub 里没有前置正文（回复直接从 <tool> 开始），但可能存在后置正文（例如 </tool> 后还有解释）。
+	                // 追加一条 assistant，避免“后置正文消失”。
+	                suffix_to_push = Some(cleaned_ui_text);
+	                suffix_for_ctx = suffix_to_push.clone();
+	            }
+	            if let Some(t) = suffix_to_push
+	                .as_deref()
+	                .map(str::trim)
+	                .filter(|s| !s.is_empty())
+	            {
+	                core.history.push(Message {
+	                    role: Role::Assistant,
+	                    text: t.to_string(),
+	                    mind: Some(kind),
+	                });
+	                render_cache.invalidate(core.history.len().saturating_sub(1));
+	            }
+	            // 外置上下文：当回复中存在“工具调用块”时，也要把前/后正文写入 context（否则下一轮会丢失）。
+	            let mind = match kind {
+	                MindKind::Sub => "dog",
+	                MindKind::Main => "main",
+	                MindKind::Memory => "memory",
+	            };
+	            let p = context_path_for_mind(config, mind);
+	            if let Some(prefix) = prefix_for_ctx.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+	                log_dyncontext(p, mind, "assistant", prefix, None, None);
+	            }
+	            // 关键：把“工具调用原文（<tool>...</tool>）”按原样写入上下文，避免任何摘要/前端格式污染。
+	            // 否则模型下一轮只能看到工具回执，会误判为外部执行，或误学到错误的工具调用格式。
+	            let tool_calls_raw = extract_tool_blocks_verbatim(&raw_assistant);
+	            if !tool_calls_raw.trim().is_empty() {
+	                log_dyncontext(p, mind, "assistant", &tool_calls_raw, None, None);
+	            }
+	            if let Some(suffix) = suffix_for_ctx.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+	                log_dyncontext(p, mind, "assistant", suffix, None, None);
+	            }
             if let Some(idx) = streaming_state.idx {
                 let is_tool_stub = tool_preview_chat_idx.is_some_and(|v| v == idx)
                     && core.history.get(idx).is_some_and(|m| m.role == Role::Tool);
@@ -14030,22 +14869,24 @@ fn handle_model_stream_end(
                 }
             }
             pending_tools.extend(extracted);
-            let _ = try_start_next_tool(TryStartNextToolArgs {
-                pending_tools,
-                pending_tool_confirm,
-                tx: tx.clone(),
-                core,
-                meta,
-                context_usage,
-                mode,
-                sys_log,
-                sys_log_limit,
-                sys_cfg,
-                owner: *active_kind,
-                mcp_messages,
-                pty_messages,
-                pty_started_notice_prompt_text,
-            });
+	            // 工具执行 owner 必须以“该次回复的 mind(kind)”为准：
+	            // 否则用户切焦点/切目标时，Memory 的工具会被当成 Main 执行，导致 Memory 面板看起来“没轮询/没执行”。
+	            let _ = try_start_next_tool(TryStartNextToolArgs {
+	                pending_tools,
+	                pending_tool_confirm,
+	                tx: tx.clone(),
+	                core,
+	                meta,
+	                context_usage,
+	                mode,
+	                sys_log,
+	                sys_log_limit,
+	                sys_cfg,
+	                owner: kind,
+	                mcp_messages,
+	                pty_messages,
+	                pty_started_notice_prompt_text,
+	            });
         }
         if matches!(kind, MindKind::Main)
             && matches!(diary_state.stage, DiaryStage::WaitingMain)
@@ -14133,13 +14974,21 @@ fn handle_model_stream_end(
         }
 
         if !assistant_text.trim().is_empty() {
-            main_state.push_assistant(&assistant_text);
             log_memos(
                 meta,
                 context_usage,
                 "assistant",
                 Some("main"),
                 &assistant_text,
+            );
+            let p = context_path_for_mind(&config, "main");
+            log_dyncontext(
+                p,
+                "main",
+                "assistant",
+                &assistant_text,
+                None,
+                None,
             );
             if !is_pass_message(&assistant_text) {
                 log_contextmemo(
@@ -14200,7 +15049,7 @@ fn handle_model_stream_end(
                     render_cache.invalidate(idx);
                 }
             } else {
-                core.push_tool(msg.trim_end().to_string());
+                core.push_tool_mind(msg.trim_end().to_string(), Some(kind));
             }
             log_memos(meta, context_usage, "tool", None, msg.trim());
         } else if let Some(idx) = *thinking_idx {
@@ -14265,87 +15114,6 @@ fn handle_model_stream_end(
     if !keep_busy && !matches!(*mode, Mode::ApprovingTool | Mode::ExecutingTool) {
         *mode = Mode::Idle;
     }
-    if sys_cfg.context_compact_enabled
-        && let Some(target) = auto_context_compact
-        && !is_heartbeat
-        && pending_tools.is_empty()
-        && pending_tool_confirm.is_none()
-        && active_tool_stream.is_none()
-        && matches!(*mode, Mode::Idle)
-    {
-        let begin_ok = match target {
-            MindKind::Main => main_state.begin_context_compact(),
-            MindKind::Sub => dog_state.begin_context_compact(),
-        };
-        if begin_ok {
-            // 刷新 fastmemo（尽量保证压缩请求包含最新摘要）。
-            if sys_cfg.fastmemo_inject_enabled {
-                let fastmemo = read_fastmemo_for_context();
-                match target {
-                    MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
-                    MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
-                }
-            }
-            push_sys_log(sys_log, sys_log_limit, "↻ Context Summary 压缩中");
-            let extra_system = Some(render_context_compact_prompt(
-                context_compact_prompt_text,
-                target,
-                sys_cfg,
-                "(自动压缩，无新用户消息)",
-            ));
-            let in_tokens = if matches!(target, MindKind::Main) {
-                try_start_main_generation(TryStartMainGenerationArgs {
-                    main_client,
-                    main_state,
-                    extra_system,
-                    tx,
-                    config,
-                    mode,
-                    active_kind,
-                    sending_until,
-                    sys_log,
-                    sys_log_limit,
-                    streaming_state,
-                    request_seq,
-                    active_request_id,
-                    active_cancel,
-                    sse_enabled,
-                })
-            } else {
-                try_start_dog_generation(TryStartDogGenerationArgs {
-                    kind: MindKind::Sub,
-                    dog_client,
-                    dog_state,
-                    extra_system,
-                    tx,
-                    config,
-                    mode,
-                    active_kind,
-                    sending_until,
-                    sys_log,
-                    sys_log_limit,
-                    streaming_state,
-                    request_seq,
-                    active_request_id,
-                    active_cancel,
-                    sse_enabled,
-                })
-            };
-            if let Some(in_tokens) = in_tokens {
-                *active_request_in_tokens = Some(in_tokens);
-                // 聊天区：显示 CONTEXT SUMMARY 系统提示（直到压缩完成再更新为“已更新”）。
-                let note = "↻ CONTEXT SUMMARY";
-                push_system_and_log(core, meta, context_usage, None, note);
-                *ctx_compact_notice_idx = Some(core.history.len().saturating_sub(1));
-            } else {
-                // API 未就绪时不要卡在 inflight，回退为 pending，等待后续再压缩。
-                match target {
-                    MindKind::Main => main_state.abort_context_compact(),
-                    MindKind::Sub => dog_state.abort_context_compact(),
-                }
-            }
-        }
-    }
     let fastmemo_retry_ready = fastmemo_compact_retry_at
         .as_ref()
         .map(|t| Instant::now() >= *t)
@@ -14360,20 +15128,20 @@ fn handle_model_stream_end(
         && active_tool_stream.is_none()
         && matches!(*mode, Mode::Idle)
     {
-        if dog_client.is_some() {
-            // 刷新 fastmemo（尽量保证 DOG 在压缩前看到最新内容）。
+        if memory_client.is_some() {
+            // 刷新 fastmemo（尽量保证 Memory 在压缩前看到最新内容）。
             if sys_cfg.fastmemo_inject_enabled {
                 let fastmemo = read_fastmemo_for_context();
                 main_state.refresh_fastmemo_system(&fastmemo);
                 dog_state.refresh_fastmemo_system(&fastmemo);
+                memory_state.refresh_fastmemo_system(&fastmemo);
             }
-            push_sys_log(sys_log, sys_log_limit, "fastmemo 自动压缩中");
+            push_sys_log(sys_log, sys_log_limit, "fastmemo 自动压缩中（MEM）");
             *active_request_is_fastmemo_compact = true;
             let extra_system = Some(fastmemo_compact_prompt_text.to_string());
-            if let Some(in_tokens) = try_start_dog_generation(TryStartDogGenerationArgs {
-                kind: MindKind::Sub,
-                dog_client,
-                dog_state,
+            if let Some(in_tokens) = try_start_memory_generation(TryStartMemoryGenerationArgs {
+                memory_client,
+                memory_state,
                 extra_system,
                 tx,
                 config,
@@ -14401,7 +15169,7 @@ fn handle_model_stream_end(
                 *fastmemo_compact_retry_at = None;
             }
         } else {
-            push_sys_log(sys_log, sys_log_limit, "DOG: API 未就绪，fastmemo 压缩暂停");
+            push_sys_log(sys_log, sys_log_limit, "MEMORY: API 未就绪，fastmemo 压缩暂停");
         }
     }
     jump_to_bottom(scroll, follow_bottom);
@@ -14434,6 +15202,8 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         dog_client,
         main_state,
         main_client,
+        memory_state,
+        memory_client,
         mind_context,
         _mind_ctx_idx_main,
         _mind_ctx_idx_dog,
@@ -14443,7 +15213,6 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         meta,
         context_usage,
         diary_state,
-        ctx_compact_notice_idx,
         mind_rate_window,
         pending_mind_half,
         brief_text,
@@ -14477,7 +15246,6 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         sys_log,
         sys_log_limit,
         config,
-        context_compact_prompt_text,
         fastmemo_compact_prompt_text,
         pty_help_prompt_text,
         pty_started_notice_prompt_text,
@@ -14602,13 +15370,14 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         dog_client,
                         main_state,
                         main_client,
+                        memory_state,
+                        memory_client,
                         sending_until,
                         token_totals,
                         token_total_path,
                         meta,
                         context_usage,
                         diary_state,
-                        ctx_compact_notice_idx,
                         brief_text,
                         brief_idx,
                         brief_in_progress,
@@ -14635,7 +15404,6 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         sys_log,
                         sys_log_limit,
                         config,
-                        context_compact_prompt_text,
                         fastmemo_compact_prompt_text,
                         pty_started_notice_prompt_text,
                         mcp_messages,
@@ -14883,36 +15651,22 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         skip_tool_context = true;
                         skip_owner_resume = true;
                     }
-                    // pty.run 现在会延迟回传“启动快照”（带 log_tail/status/log_path），用于继续任务或提示用户观察。
-                    if matches!(diary_state.stage, DiaryStage::WaitingMain)
+                    // 写日记收尾：只要“日记流程处于 active”且本轮由 Memory 成功执行了 datememo 写入，就认为日记已落盘，
+                    // 后续应清空 fastcontext，准备新一轮记录。
+                    //
+                    // 这里不再绑定某个具体 stage 名称（例如 WaitingMain），避免未来 stage 调整导致漏清空。
+                    if diary_state.active()
+                        && matches!(state.owner, MindKind::Memory)
                         && is_datememo_add(&state.call)
+                        && outcome
+                            .log_lines
+                            .iter()
+                            .any(|l| l.trim_start().starts_with("状态:0"))
                     {
                         saw_diary_add = true;
                     }
                     if state.call.tool == "system_config" {
                         reload_sys_cfg = true;
-                    }
-                    if state.call.tool == "context_compact" {
-                        skip_tool_context = true;
-                        handle_context_compact_tool(ContextCompactToolArgs {
-                            state,
-                            outcome: &mut outcome,
-                            main_state,
-                            dog_state,
-                            sys_cfg,
-                            sys_log,
-                            sys_log_limit,
-                            core,
-                            render_cache,
-                            ctx_compact_notice_idx,
-                        });
-                        if sys_cfg.fastmemo_compact_enabled
-                            && (main_state.fastmemo_compact_pending
-                                || dog_state.fastmemo_compact_pending)
-                        {
-                            *auto_fastmemo_compact = true;
-                            push_sys_log(sys_log, sys_log_limit, "fastmemo: 已达阈值，待压缩");
-                        }
                     }
                     if state.call.tool == "mind_msg" {
                         skip_owner_resume = true;
@@ -14932,14 +15686,13 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             mind_pulse_dir = Some(pulse_dir(from, target));
                         }
                         if sys_cfg.fastmemo_compact_enabled
-                            && (main_state.fastmemo_compact_pending
-                                || dog_state.fastmemo_compact_pending)
+                            && memory_state.fastmemo_compact_pending
                         {
                             *auto_fastmemo_compact = true;
                             push_sys_log(sys_log, sys_log_limit, "fastmemo: 已达阈值，待压缩");
                         }
                     }
-                    if state.call.tool == "memory_add" && matches!(state.owner, MindKind::Main) {
+                    if state.call.tool == "memory_add" {
                         let raw = state
                             .call
                             .path
@@ -14953,12 +15706,12 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             .any(|l| l.trim() == "fastmemo_compact_pending:1");
                         if sys_cfg.fastmemo_compact_enabled && is_fastmemo && pending {
                             *auto_fastmemo_compact = true;
-                            main_state.fastmemo_compact_pending = true;
+                            memory_state.fastmemo_compact_pending = true;
                             push_sys_log(sys_log, sys_log_limit, "fastmemo: 已达阈值，待压缩");
                         }
                     }
-                    // fastmemo 是固定注入的上下文块：任意写入/压缩后应立即重载，避免后续请求仍拿旧内容。
-                    if matches!(state.call.tool.as_str(), "memory_add" | "memory_edit") {
+                    // fastmemo 是固定注入的上下文块：任意写入后应立即重载，避免后续请求仍拿旧内容。
+                    if matches!(state.call.tool.as_str(), "memory_add") {
                         let raw = state
                             .call
                             .path
@@ -14970,36 +15723,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                                 let fastmemo = read_fastmemo_for_context();
                                 main_state.refresh_fastmemo_system(&fastmemo);
                                 dog_state.refresh_fastmemo_system(&fastmemo);
-                            }
-                        }
-                    }
-                    if state.call.tool == "memory_edit"
-                        && matches!(state.owner, MindKind::Sub)
-                        && *fastmemo_compact_inflight
-                    {
-                        let raw = state
-                            .call
-                            .path
-                            .as_deref()
-                            .unwrap_or(state.call.input.trim())
-                            .to_ascii_lowercase();
-                        if raw.contains("fastmemo") {
-                            if let Some(mut sec) = state.call.section.as_deref().map(str::trim) {
-                                if sec.starts_with('[') && sec.contains(']') {
-                                    if let Some(end) = sec.find(']') {
-                                        sec = &sec[1..end];
-                                    }
-                                }
-                                let bit = match sec {
-                                    "自我感知" => Some(1u8 << 0),
-                                    "用户感知" => Some(1u8 << 1),
-                                    "环境感知" => Some(1u8 << 2),
-                                    "事件感知" => Some(1u8 << 3),
-                                    _ => None,
-                                };
-                                if let Some(b) = bit {
-                                    *fastmemo_compact_edit_mask |= b;
-                                }
+                                memory_state.refresh_fastmemo_system(&fastmemo);
                             }
                         }
                     }
@@ -15084,26 +15808,28 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     *mode = Mode::Idle;
                 }
                 jump_to_bottom(scroll, follow_bottom);
-                if saw_diary_add && matches!(diary_state.stage, DiaryStage::WaitingMain) {
+                if saw_diary_add {
                     diary_state.stage = DiaryStage::Idle;
                     context_usage.reset();
                     clear_contextmemo(&config.contextmemo_path);
                     push_sys_log(sys_log, sys_log_limit, "日记压缩完成");
                 }
-                // 写回“模型上下文”的工具回执：只允许 model 侧协议格式，禁止回灌聊天区/渲染用的 tool_message。
+                // 会话上下文外置：工具回执写入 context.jsonl，供后续请求回放到模型上下文。
                 if !skip_tool_context && let Some(msg) = tool_message_model.as_ref() {
-                    match owner {
-                        MindKind::Sub => dog_state.push_mcp_tool_result(
-                            &tool_name_for_ctx,
-                            msg,
-                            outcome.log_lines.as_slice(),
-                        ),
-                        MindKind::Main => main_state.push_mcp_tool_result(
-                            &tool_name_for_ctx,
-                            msg,
-                            outcome.log_lines.as_slice(),
-                        ),
-                    }
+                    let mind = match owner {
+                        MindKind::Sub => "dog",
+                        MindKind::Main => "main",
+                        MindKind::Memory => "memory",
+                    };
+                    let p = context_path_for_mind(config, mind);
+                    log_dyncontext(
+                        p,
+                        mind,
+                        "tool",
+                        msg,
+                        Some(tool_name_for_ctx.as_str()),
+                        Some(outcome.log_lines.as_slice()),
+                    );
                 }
                 if reload_sys_cfg {
                     let (new_cfg, err, _) = load_system_config();
@@ -15132,91 +15858,76 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     mcp_messages,
                     pty_messages,
                 });
-                if !has_next && !skip_owner_resume && matches!(owner, MindKind::Sub) {
-                    // fastmemo 自动压缩：工具链结束后不再让 DOG 输出正文，保持“静默维护”。
-                    if *fastmemo_compact_inflight {
-                        let pending = std::fs::read_to_string(FASTMEMO_PATH)
-                            .ok()
-                            .map(|t| fastmemo_event_count_and_any_ge10(&t).1)
-                            .unwrap_or(false);
-                        if !pending {
-                            *fastmemo_compact_inflight = false;
-                            *fastmemo_compact_edit_mask = 0;
-                            *fastmemo_compact_retry_at = None;
-                            *auto_fastmemo_compact = false;
-                            *active_request_is_fastmemo_compact = false;
-                            main_state.fastmemo_compact_pending = false;
-                            dog_state.fastmemo_compact_pending = false;
-                            push_sys_log(sys_log, sys_log_limit, "fastmemo 自动压缩完成");
-                        } else {
-                            // 仍超阈值：认为本轮压缩未生效（或未覆盖全部需要压缩的区），稍后自动重试。
-                            *fastmemo_compact_inflight = false;
-                            *fastmemo_compact_edit_mask = 0;
-                            *active_request_is_fastmemo_compact = false;
-                            if sys_cfg.fastmemo_compact_enabled {
-                                *auto_fastmemo_compact = true;
-                                main_state.fastmemo_compact_pending = true;
-                                dog_state.fastmemo_compact_pending = true;
-                                *fastmemo_compact_retry_at =
-                                    Some(Instant::now() + Duration::from_secs(12));
-                                push_sys_log(sys_log, sys_log_limit, "fastmemo 仍超阈值：稍后重试");
-                            } else {
-                                *auto_fastmemo_compact = false;
-                                main_state.fastmemo_compact_pending = false;
-                                dog_state.fastmemo_compact_pending = false;
-                                *fastmemo_compact_retry_at = None;
-                                push_sys_log(
-                                    sys_log,
-                                    sys_log_limit,
-                                    "fastmemo 压缩已停用：跳过重试",
-                                );
-                            }
-                        }
+                // fastmemo 自动压缩完成判定（由 MEMORY 执行）：最后一个工具结束后检查 fastmemo 是否仍有任一分区 >=10。
+                // 仅依据 fastmemo 文件本身判断，避免依赖“是否回显 notice”导致漏判。
+                if !has_next && *fastmemo_compact_inflight {
+                    let pending = std::fs::read_to_string(FASTMEMO_PATH)
+                        .ok()
+                        .map(|t| fastmemo_event_count_and_any_ge10(&t).1)
+                        .unwrap_or(false);
+                    if !pending {
+                        *fastmemo_compact_inflight = false;
+                        *fastmemo_compact_edit_mask = 0;
+                        *fastmemo_compact_retry_at = None;
+                        *auto_fastmemo_compact = false;
+                        *active_request_is_fastmemo_compact = false;
+                        memory_state.fastmemo_compact_pending = false;
+                        push_sys_log(sys_log, sys_log_limit, "fastmemo 自动压缩完成");
                     } else {
-                        let extra_system = if *fastmemo_compact_inflight {
-                            *active_request_is_fastmemo_compact = true;
-                            Some(fastmemo_compact_prompt_text.to_string())
+                        // 仍超阈值：稍后自动重试（或下一轮继续压缩下一分区）。
+                        *fastmemo_compact_inflight = false;
+                        *fastmemo_compact_edit_mask = 0;
+                        *active_request_is_fastmemo_compact = false;
+                        if sys_cfg.fastmemo_compact_enabled {
+                            *auto_fastmemo_compact = true;
+                            memory_state.fastmemo_compact_pending = true;
+                            *fastmemo_compact_retry_at =
+                                Some(Instant::now() + Duration::from_secs(12));
+                            push_sys_log(sys_log, sys_log_limit, "fastmemo 仍超阈值：稍后重试");
                         } else {
-                            None
-                        };
-                        if let Some(in_tokens) =
-                            try_start_dog_generation(TryStartDogGenerationArgs {
-                                kind: MindKind::Sub,
-                                dog_client,
-                                dog_state,
-                                extra_system,
-                                tx,
-                                config,
-                                mode,
-                                active_kind,
-                                sending_until,
-                                sys_log,
-                                sys_log_limit,
-                                streaming_state,
-                                request_seq,
-                                active_request_id,
-                                active_cancel,
-                                sse_enabled,
-                            })
-                        {
-                            record_request_in_tokens(
-                                core,
-                                token_totals,
-                                token_total_path,
-                                context_usage,
-                                active_request_in_tokens,
-                                in_tokens,
-                            );
-                        } else {
-                            push_sys_log(sys_log, sys_log_limit, "DOG: API 未就绪，工具链暂停");
-                            push_system_and_log(
-                                core,
-                                meta,
-                                context_usage,
-                                Some("dog"),
-                                "DOG: API 未就绪，工具链暂停",
-                            );
+                            *auto_fastmemo_compact = false;
+                            memory_state.fastmemo_compact_pending = false;
+                            *fastmemo_compact_retry_at = None;
+                            push_sys_log(sys_log, sys_log_limit, "fastmemo 压缩已停用：跳过重试");
                         }
+                    }
+                }
+                if !has_next && !skip_owner_resume && matches!(owner, MindKind::Sub) {
+                    if let Some(in_tokens) = try_start_dog_generation(TryStartDogGenerationArgs {
+                        kind: MindKind::Sub,
+                        dog_client,
+                        dog_state,
+                        extra_system: None,
+                        tx,
+                        config,
+                        mode,
+                        active_kind,
+                        sending_until,
+                        sys_log,
+                        sys_log_limit,
+                        streaming_state,
+                        request_seq,
+                        active_request_id,
+                        active_cancel,
+                        sse_enabled,
+                    }) {
+                        record_request_in_tokens(
+                            core,
+                            token_totals,
+                            token_total_path,
+                            context_usage,
+                            active_request_in_tokens,
+                            in_tokens,
+                        );
+                    } else {
+                        push_sys_log(sys_log, sys_log_limit, "DOG: API 未就绪，工具链暂停");
+                        push_system_and_log(
+                            core,
+                            meta,
+                            context_usage,
+                            Some("dog"),
+                            "DOG: API 未就绪，工具链暂停",
+                        );
                     }
                 } else if !has_next
                     && !skip_owner_resume
@@ -15350,7 +16061,6 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         collapsed_thinking_idxs,
         selected_msg_idx,
         tool_preview_chat_idx,
-        ctx_compact_notice_idx,
         streaming_state,
         active_tool_stream,
     });
@@ -15395,7 +16105,6 @@ struct PruneHistoryArgs<'a> {
     collapsed_thinking_idxs: &'a mut BTreeSet<usize>,
     selected_msg_idx: &'a mut Option<usize>,
     tool_preview_chat_idx: &'a mut Option<usize>,
-    ctx_compact_notice_idx: &'a mut Option<usize>,
     streaming_state: &'a mut StreamingState,
     active_tool_stream: &'a mut Option<ToolStreamState>,
 }
@@ -15416,7 +16125,6 @@ fn prune_history_if_needed(args: PruneHistoryArgs<'_>) {
         collapsed_thinking_idxs,
         selected_msg_idx,
         tool_preview_chat_idx,
-        ctx_compact_notice_idx,
         streaming_state,
         active_tool_stream,
     } = args;
@@ -15436,7 +16144,6 @@ fn prune_history_if_needed(args: PruneHistoryArgs<'_>) {
     adjust_index_set(collapsed_thinking_idxs, removed);
     adjust_index(selected_msg_idx, removed);
     adjust_index(tool_preview_chat_idx, removed);
-    adjust_index(ctx_compact_notice_idx, removed);
     streaming_state.adjust_index(removed);
     if let Some(state) = active_tool_stream.as_mut() {
         if state.idx < removed {
@@ -15503,14 +16210,17 @@ struct HandleCommandArgs<'a> {
     chat_target: &'a mut MindKind,
     dog_state: &'a mut DogState,
     main_state: &'a mut DogState,
+    memory_state: &'a mut DogState,
     mind_ctx_idx_main: &'a mut Option<usize>,
     mind_ctx_idx_dog: &'a mut Option<usize>,
+    mind_ctx_idx_memory: &'a mut Option<usize>,
     screen: &'a mut Screen,
     help_ui: &'a mut HelpUiState,
     should_exit: &'a mut bool,
     sse_enabled: &'a mut bool,
     enter_cmd_shell: &'a mut bool,
     open_user_terminal: &'a mut bool,
+    memory_panel_open: &'a mut bool,
     exit_code: &'a mut i32,
     sys_cfg: &'a mut SystemConfig,
     sys_cfg_path: &'a Path,
@@ -15529,14 +16239,17 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
         chat_target,
         dog_state,
         main_state,
+        memory_state,
         mind_ctx_idx_main,
         mind_ctx_idx_dog,
+        mind_ctx_idx_memory,
         screen,
         help_ui,
         should_exit,
         sse_enabled,
         enter_cmd_shell,
         open_user_terminal,
+        memory_panel_open,
         exit_code,
         sys_cfg,
         sys_cfg_path,
@@ -15572,17 +16285,29 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
             *screen = Screen::Chat;
             *help_ui = HelpUiState::Selecting { selected: 0 };
         }
+        "/testmemory" => {
+            *screen = Screen::Chat;
+            // 仅打开/关闭 Memory 面板：不锁定 chat_target，不抢占主聊天。
+            *memory_panel_open = !*memory_panel_open;
+            let msg = if *memory_panel_open {
+                "··· Memory 面板已打开\n- 点击聊天区：发送给主聊天（Main/Dog）\n- 点击记忆面板：发送给记忆模型"
+            } else {
+                "··· Memory 面板已关闭"
+            };
+            push_system_and_log(core, meta, context_usage, None, msg);
+            push_sys_log(sys_log, sys_log_limit, msg);
+        }
         "/turn" | "/trun" | "/switch" => {
             let target = match arg.as_str() {
                 "main" => MindKind::Main,
-                "dog" | "memory" => MindKind::Sub,
+                "dog" => MindKind::Sub,
                 _ => {
                     push_system_and_log(
                         core,
                         meta,
                         context_usage,
                         None,
-                        "用法：/Switch Main 或 /Switch Memory",
+                        "用法：/Switch Main 或 /Switch Dog",
                     );
                     return Ok(true);
                 }
@@ -15598,8 +16323,10 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
                 target,
                 dog_state,
                 main_state,
+                memory_state,
                 mind_ctx_idx_main,
                 mind_ctx_idx_dog,
+                mind_ctx_idx_memory,
             );
             if is_idle_like(*mode) {
                 *active_kind = target;
@@ -15630,7 +16357,7 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
             }
         },
         _ => {
-            const UNKNOWN: &str = "未知命令：/Terminal /Cmd /Settings /Help /Switch Main /Switch Memory /SSE Open /SSE Close /Quit";
+            const UNKNOWN: &str = "未知命令：/Terminal /Cmd /Settings /Help /Switch Main /Switch Dog /TestMemory /SSE Open /SSE Close /Quit";
             push_system_and_log(core, meta, context_usage, None, UNKNOWN);
         }
     }
@@ -15665,21 +16392,8 @@ fn spawn_dog_request(
     });
 }
 
-fn begin_request(
-    request_seq: &mut u64,
-    active_request_id: &mut Option<u64>,
-    active_cancel: &mut Option<Arc<AtomicBool>>,
-) -> (u64, Arc<AtomicBool>) {
-    *request_seq = request_seq.saturating_add(1).max(1);
-    let request_id = *request_seq;
-    let cancel = Arc::new(AtomicBool::new(false));
-    *active_request_id = Some(request_id);
-    *active_cancel = Some(cancel.clone());
-    (request_id, cancel)
-}
-
-struct TryStartMainDiaryArgs<'a> {
-    main_client: &'a Option<DogClient>,
+struct TryStartMemoryDiaryArgs<'a> {
+    memory_client: &'a Option<DogClient>,
     main_prompt: &'a str,
     system_prompt: &'a str,
     last_diary: &'a str,
@@ -15698,9 +16412,9 @@ struct TryStartMainDiaryArgs<'a> {
     sse_enabled: bool,
 }
 
-fn try_start_main_diary(args: TryStartMainDiaryArgs<'_>) -> bool {
-    let TryStartMainDiaryArgs {
-        main_client,
+fn try_start_memory_diary(args: TryStartMemoryDiaryArgs<'_>) -> bool {
+    let TryStartMemoryDiaryArgs {
+        memory_client,
         main_prompt,
         system_prompt,
         last_diary,
@@ -15719,19 +16433,17 @@ fn try_start_main_diary(args: TryStartMainDiaryArgs<'_>) -> bool {
         sse_enabled,
     } = args;
 
-    let Some(client) = main_client.clone() else {
+    let Some(client) = memory_client.clone() else {
         return false;
     };
     *mode = Mode::Generating;
-    *active_kind = MindKind::Main;
-    let now = Instant::now();
-    // `Working...` 状态仅用于 Codex（用于伪流式“连接/工作中”的体感）。
-    // DeepSeek 走 `Thinking...` 即可，避免在关闭 SSE 时出现误导性的 `Working...`。
+    *active_kind = MindKind::Memory;
     *sending_until = None;
+    let now = Instant::now();
     if client.is_codex_provider() {
         *sending_until = Some(now + Duration::from_millis(config.send_status_ms));
     }
-    push_sys_log(sys_log, sys_log_limit, "萤现在在写日记");
+    push_sys_log(sys_log, sys_log_limit, "记忆模型正在写日记");
     streaming_state.reset();
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     let messages: Vec<ApiMessage> = vec![
@@ -15748,12 +16460,25 @@ fn try_start_main_diary(args: TryStartMainDiaryArgs<'_>) -> bool {
         client,
         messages,
         tx.clone(),
-        MindKind::Main,
+        MindKind::Memory,
         sse_enabled,
         request_id,
         cancel,
     );
     true
+}
+
+fn begin_request(
+    request_seq: &mut u64,
+    active_request_id: &mut Option<u64>,
+    active_cancel: &mut Option<Arc<AtomicBool>>,
+) -> (u64, Arc<AtomicBool>) {
+    *request_seq = request_seq.saturating_add(1).max(1);
+    let request_id = *request_seq;
+    let cancel = Arc::new(AtomicBool::new(false));
+    *active_request_id = Some(request_id);
+    *active_cancel = Some(cancel.clone());
+    (request_id, cancel)
 }
 
 struct TryStartMainGenerationArgs<'a> {
@@ -15803,7 +16528,12 @@ fn try_start_main_generation(args: TryStartMainGenerationArgs<'_>) -> Option<u64
     }
     push_sys_log(sys_log, sys_log_limit, "现在[萤]MAIN正在思考");
     streaming_state.reset();
-    let messages = main_state.message_snapshot(extra_system.as_deref());
+    let p = context_path_for_mind(config, "main");
+    let messages = main_state.message_snapshot_with_context_file(
+        extra_system.as_deref(),
+        p,
+        "main",
+    );
     let in_tokens = estimate_messages_in_tokens(&messages);
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     spawn_dog_request(
@@ -15811,6 +16541,74 @@ fn try_start_main_generation(args: TryStartMainGenerationArgs<'_>) -> Option<u64
         messages,
         tx.clone(),
         MindKind::Main,
+        sse_enabled,
+        request_id,
+        cancel,
+    );
+    Some(in_tokens)
+}
+
+
+struct TryStartMemoryGenerationArgs<'a> {
+    memory_client: &'a Option<DogClient>,
+    memory_state: &'a DogState,
+    extra_system: Option<String>,
+    tx: &'a mpsc::Sender<AsyncEvent>,
+    config: &'a AppConfig,
+    mode: &'a mut Mode,
+    active_kind: &'a mut MindKind,
+    sending_until: &'a mut Option<Instant>,
+    sys_log: &'a mut VecDeque<String>,
+    sys_log_limit: usize,
+    streaming_state: &'a mut StreamingState,
+    request_seq: &'a mut u64,
+    active_request_id: &'a mut Option<u64>,
+    active_cancel: &'a mut Option<Arc<AtomicBool>>,
+    sse_enabled: bool,
+}
+
+fn try_start_memory_generation(args: TryStartMemoryGenerationArgs<'_>) -> Option<u64> {
+    let TryStartMemoryGenerationArgs {
+        memory_client,
+        memory_state,
+        extra_system,
+        tx,
+        config,
+        mode,
+        active_kind,
+        sending_until,
+        sys_log,
+        sys_log_limit,
+        streaming_state,
+        request_seq,
+        active_request_id,
+        active_cancel,
+        sse_enabled,
+    } = args;
+
+    let client = memory_client.clone()?;
+    *mode = Mode::Generating;
+    *active_kind = MindKind::Memory;
+    let now = Instant::now();
+    *sending_until = None;
+    if client.is_codex_provider() {
+        *sending_until = Some(now + Duration::from_millis(config.send_status_ms));
+    }
+    push_sys_log(sys_log, sys_log_limit, "现在[萤]MEM正在思考");
+    streaming_state.reset();
+    let p = context_path_for_mind(config, "memory");
+    let messages = memory_state.message_snapshot_with_context_file(
+        extra_system.as_deref(),
+        p,
+        "memory",
+    );
+    let in_tokens = estimate_messages_in_tokens(&messages);
+    let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
+    spawn_dog_request(
+        client,
+        messages,
+        tx.clone(),
+        MindKind::Memory,
         sse_enabled,
         request_id,
         cancel,
@@ -15884,7 +16682,8 @@ fn try_start_mind_generation(args: TryStartMindGenerationArgs<'_>) -> Option<u64
             content: mind_user.to_string(),
         });
     }
-    let messages = normalize_messages_for_deepseek(&messages);
+	    // 这里不依赖具体 provider：仅做基础清洗（空消息过滤 + 连续 assistant 合并）。
+	    let messages = normalize_messages_for_model_context(&messages);
     let in_tokens = estimate_messages_in_tokens(&messages);
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     spawn_dog_request(
@@ -15946,7 +16745,8 @@ fn try_start_main_heartbeat(args: TryStartMainHeartbeatArgs<'_>) -> Option<u64> 
     }
     push_sys_log(sys_log, sys_log_limit, "心跳已发送");
     streaming_state.reset();
-    let messages = main_state.message_snapshot(None);
+    let p = context_path_for_mind(config, "main");
+    let messages = main_state.message_snapshot_with_context_file(None, p, "main");
     let in_tokens = estimate_messages_in_tokens(&messages);
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     *heartbeat_request_id = Some(request_id);
@@ -16016,7 +16816,13 @@ fn try_start_dog_generation(args: TryStartDogGenerationArgs<'_>) -> Option<u64> 
     };
     push_sys_log(sys_log, sys_log_limit, format!("现在[萤]{label}正在思考"));
     streaming_state.reset();
-    let messages = dog_state.message_snapshot(extra_system.as_deref());
+    let mind = if matches!(kind, MindKind::Sub) { "dog" } else { "main" };
+    let p = context_path_for_mind(config, mind);
+    let messages = dog_state.message_snapshot_with_context_file(
+        extra_system.as_deref(),
+        p,
+        mind,
+    );
     let in_tokens = estimate_messages_in_tokens(&messages);
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     spawn_dog_request(
@@ -16337,7 +17143,7 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-mod types {
+	mod types {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Mode {
         Idle,
@@ -16382,6 +17188,7 @@ mod types {
     pub enum MindKind {
         Main,
         Sub,
+        Memory,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16392,9 +17199,11 @@ mod types {
 
     #[derive(Debug, Clone, Copy)]
     pub struct ContextLine {
-        pub sc_tokens: usize,
-        pub sc_pct: u8,
-        pub ctx_pct: u8,
+        pub fastmemo_label: Option<&'static str>,
+        pub fastmemo_n: usize,
+        pub date_kb: usize,
+        pub date_kb_limit: usize,
+        pub date_pct: u8,
         pub run_in_tokens: u64,
         pub run_out_tokens: u64,
         pub total_in_tokens: u64,
@@ -16424,7 +17233,7 @@ mod types {
         }
     }
 
-    impl Core {
+	    impl Core {
         pub fn new() -> Self {
             Self {
                 history: Vec::new(),
@@ -16500,17 +17309,29 @@ mod types {
             });
         }
 
-        pub fn push_tool(&mut self, text: String) {
-            let clean = text.trim_end().to_string();
-            if clean.is_empty() {
-                return;
-            }
-            self.history.push(Message {
-                role: Role::Tool,
-                text: clean,
-                mind: None,
-            });
-        }
+	        pub fn push_tool(&mut self, text: String) {
+	            let clean = text.trim_end().to_string();
+	            if clean.is_empty() {
+	                return;
+	            }
+	            self.history.push(Message {
+	                role: Role::Tool,
+	                text: clean,
+	                mind: None,
+	            });
+	        }
+
+	        pub fn push_tool_mind(&mut self, text: String, mind: Option<MindKind>) {
+	            let clean = text.trim_end().to_string();
+	            if clean.is_empty() {
+	                return;
+	            }
+	            self.history.push(Message {
+	                role: Role::Tool,
+	                text: clean,
+	                mind,
+	            });
+	        }
 
         pub fn clear_chat(&mut self) {
             self.history.clear();
@@ -16563,11 +17384,11 @@ mod commands {
         !after.chars().any(|c| c.is_whitespace())
     }
 
-    pub fn filter_commands_for_input(
-        input: &str,
-        sse_enabled: bool,
-        chat_target: MindKind,
-    ) -> Vec<CommandSpec> {
+pub fn filter_commands_for_input(
+    input: &str,
+    sse_enabled: bool,
+    chat_target: MindKind,
+) -> Vec<CommandSpec> {
         if !should_show_command_menu(input) {
             return Vec::new();
         }
@@ -16591,7 +17412,7 @@ mod commands {
         let switch_target = if matches!(chat_target, MindKind::Main) {
             CommandSpec {
                 cmd: "/Switch to",
-                desc: "Memory",
+                desc: "Dog",
             }
         } else {
             CommandSpec {
@@ -16600,6 +17421,10 @@ mod commands {
             }
         };
         items.push(switch_target);
+        items.push(CommandSpec {
+            cmd: "/TestMemory",
+            desc: "Memory",
+        });
         if sse_enabled {
             items.push(CommandSpec {
                 cmd: "/SSE",
@@ -16655,6 +17480,9 @@ mod config {
         pub metamemo_path: String,
         pub datememo_path: String,
         pub contextmemo_path: String,
+        pub dyncontext_path: String,
+        pub dog_context_path: String,
+        pub memory_context_path: String,
         pub run_log_path: String,
         pub memo_db_path: String,
     }
@@ -16723,6 +17551,8 @@ mod config {
     #[serde(default)]
     pub struct SystemConfig {
         pub context_k: usize,
+        #[serde(default = "default_date_kb_limit")]
+        pub date_kb_limit: usize,
         pub heartbeat_minutes: usize,
         #[serde(default = "default_true")]
         pub sse_enabled: bool,
@@ -16732,17 +17562,8 @@ mod config {
         pub paste_cache_enabled: bool,
         #[serde(default)]
         pub fastmemo_inject_enabled: bool,
-        // 开发期：先聚焦 MCP 软件本身，暂时关闭自动压缩相关链路（可在配置中重新开启）。
-        #[serde(default)]
-        pub context_compact_enabled: bool,
         #[serde(default)]
         pub fastmemo_compact_enabled: bool,
-        #[serde(default = "default_ctx_recent_max_tokens")]
-        pub ctx_recent_max_tokens: usize,
-        #[serde(default = "default_ctx_pool_max_items")]
-        pub ctx_pool_max_items: usize,
-        #[serde(default = "default_context_compact_prompt_path")]
-        pub context_compact_prompt_path: String,
         #[serde(default = "default_pty_audit_prompt_path")]
         pub pty_audit_prompt_path: String,
         #[serde(default = "default_pty_help_prompt_path")]
@@ -16759,6 +17580,10 @@ mod config {
         true
     }
 
+    fn default_date_kb_limit() -> usize {
+        256
+    }
+
     fn default_reasoning_effort() -> Option<String> {
         Some("high".to_string())
     }
@@ -16769,18 +17594,6 @@ mod config {
 
     fn default_codex_base_url() -> String {
         "http://154.44.8.149:3500/openai".to_string()
-    }
-
-    fn default_ctx_recent_max_tokens() -> usize {
-        3000
-    }
-
-    fn default_ctx_pool_max_items() -> usize {
-        10
-    }
-
-    fn default_context_compact_prompt_path() -> String {
-        "prompt/contextsummary.txt".to_string()
     }
 
     fn default_pty_audit_prompt_path() -> String {
@@ -16855,6 +17668,18 @@ mod config {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "memory/fastcontext.jsonl".to_string()),
+                dyncontext_path: std::env::var("YING_DYNCONTEXT_PATH")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| crate::context::DYNCONTEXT_PATH_DEFAULT.to_string()),
+                dog_context_path: std::env::var("YING_DOG_CONTEXT_PATH")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "memory/context/dogcontext.jsonl".to_string()),
+                memory_context_path: std::env::var("YING_MEMORY_CONTEXT_PATH")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "memory/context/memorycontext.jsonl".to_string()),
                 run_log_path: std::env::var("YING_RUN_LOG_PATH")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
@@ -16952,7 +17777,7 @@ mod config {
                 main_prompt: "系统：context 已满，需要进行上下文压缩。\
 请你根据当前记忆生成日记，并直接调用 memory_add 写入 datememo。\
 系统会附带上一条日记用于对比，请避免重复。仅输出工具 JSON，不要附加说明。\
-格式：<tool>{\"tool\":\"memory_add\",\"path\":\"datememo\",\"content\":\"YYYY-MM-DD HH:MM:SS | main | 关键词: ... | 日记: ...\",\"brief\":\"我来更新日记。\"}</tool>"
+格式：<tool>{\"tool\":\"memory_add\",\"path\":\"datememo\",\"content\":\"YYYY-MM-DD HH:MM:SS | memory | 关键词: ... | 日记: ...\",\"brief\":\"我来更新日记。\"}</tool>"
                     .to_string(),
             }
         }
@@ -16962,16 +17787,13 @@ mod config {
         fn default() -> Self {
             Self {
                 context_k: 128,
+                date_kb_limit: 256,
                 heartbeat_minutes: 5,
                 sse_enabled: true,
                 tool_full_access: false,
                 paste_cache_enabled: false,
-                fastmemo_inject_enabled: false,
-                context_compact_enabled: false,
-                fastmemo_compact_enabled: false,
-                ctx_recent_max_tokens: default_ctx_recent_max_tokens(),
-                ctx_pool_max_items: default_ctx_pool_max_items(),
-                context_compact_prompt_path: default_context_compact_prompt_path(),
+                fastmemo_inject_enabled: true,
+                fastmemo_compact_enabled: true,
                 pty_audit_prompt_path: default_pty_audit_prompt_path(),
                 pty_help_prompt_path: default_pty_help_prompt_path(),
                 welcome_shortcuts_prompt_path: default_welcome_shortcuts_prompt_path(),

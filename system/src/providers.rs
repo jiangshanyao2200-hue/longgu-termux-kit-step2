@@ -15,7 +15,31 @@ use crate::MindKind;
 use crate::api::{normalize_provider, normalize_reasoning_effort};
 use crate::config::DogApiConfig;
 
-// 约束：单次模型响应不超过 7 分钟；否则流式会卡住 UI，非流式会长时间无响应。
+// ===== 注释链（供应商适配层：DeepSeek/Codex）=====
+//
+//（1）A 调用入口
+//（2）core.rs:start_user_chat_request
+//（3）-> DogClient::send_chat_stream（SSE）
+//（4）或 DogClient::send_chat（非 SSE）
+//
+//（1）B 发送前处理（协议一致性）
+//（2）normalize_provider /
+//（3）normalize_reasoning_effort（src/api.rs）
+//（4）normalize_messages_for_provider(provider, messages)
+//（5）（src/context.rs）
+//（6）DeepSeek：必要时补“最后一条 user 占位”（不落盘，仅 request time）
+//
+//（1）C 回包事件统一输出（UI/编排层只消费 AsyncEvent）
+//（2）AsyncEvent::ModelStreamStart
+//（3）AsyncEvent::ModelStreamChunk { content, reasoning, brief
+//（4）}
+//（5）AsyncEvent::ModelStreamEnd { usage, error }
+//
+//（1）D 超时与重试
+//（2）request_timeout_secs：给流式/非流式统一上限，避免 UI 卡死
+//（3）出错时发 AsyncEvent::ErrorRetry 给 core 做提示
+
+//（1）约束：单次模型响应不超过 7 分钟；否则流式会卡住 UI，非流式会长时间无响应。
 const MODEL_RESPONSE_TIMEOUT_CAP_SECS: u64 = 7 * 60;
 
 #[derive(Debug, Serialize)]
@@ -60,14 +84,10 @@ impl DogClient {
         Ok(Self { http, cfg })
     }
 
-    fn request_timeout_secs(&self, stream: bool) -> u64 {
+    fn request_timeout_secs(&self, _stream: bool) -> u64 {
         let cap = MODEL_RESPONSE_TIMEOUT_CAP_SECS;
         let base = self.cfg.timeout_secs.max(30).min(cap);
-        if stream {
-            base.max(120).min(cap)
-        } else {
-            base.max(120).min(cap)
-        }
+        base.max(120).min(cap)
     }
 
     fn post_deepseek(
@@ -169,19 +189,19 @@ impl DogClient {
 
         let stream_idle_timeout_secs = self.request_timeout_secs(true).saturating_add(10);
 
-        crate::test::contexttest_log_request_start(
-            kind,
+        crate::test::contexttest_log_request_start(crate::test::ContextTestRequestStartArgs {
+            mind: kind,
             request_id,
-            true,
-            &self.cfg.provider,
-            &self.cfg.base_url,
-            &self.cfg.model,
-            self.cfg.reasoning_effort.as_deref(),
-            None,
-            None,
-            stream_idle_timeout_secs,
-            &messages,
-        );
+            stream: true,
+            provider: &self.cfg.provider,
+            base_url: &self.cfg.base_url,
+            model: &self.cfg.model,
+            reasoning_effort: self.cfg.reasoning_effort.as_deref(),
+            temperature: None,
+            max_tokens: None,
+            timeout_secs: stream_idle_timeout_secs,
+            messages: &messages,
+        });
 
         let max_retries = 3usize;
         let mut retries_done = 0usize;
@@ -291,7 +311,7 @@ impl DogClient {
                     };
                     match value.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                         "response.reasoning_summary_part.added" => {
-                            // 某些实现会按 part 分段输出 summary；这里用分隔换行保持段落边界。
+                            //（1）某些实现会按 part 分段输出 summary；这里用分隔换行保持段落边界。
                             if brief_seen_any {
                                 brief_pending_sep = true;
                             }
@@ -318,8 +338,8 @@ impl DogClient {
                             if !content.is_empty() {
                                 text_seen_any = true;
                                 text_buf.push_str(&content);
-                                // Codex 有时会“真流式分段”，也有时会一次性吐大量 delta；
-                                // 这里做轻量 coalesce，既能早显示，也避免 UI/渲染被海量事件打爆。
+                                //（1）Codex 有时会“真流式分段”，也有时会一次性吐大量 delta；
+                                //（2）这里做轻量 coalesce，既能早显示，也避免 UI/渲染被海量事件打爆。
                                 let should_flush = text_buf.len() >= 1024
                                     || last_text_flush.elapsed() >= Duration::from_millis(120);
                                 if should_flush && !text_buf.is_empty() {
@@ -589,14 +609,15 @@ impl DogClient {
         request_id: u64,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
-        // 统一的协议层清洗：去空、合并连续 assistant（避免 DeepSeek 400，也让 Codex 请求更稳定）。
+        //（1）统一的协议层清洗：去空、合并连续 assistant（避免 DeepSeek 400，
+        //（2）也让 Codex 请求更稳定）。
         let mut messages =
             crate::context::normalize_messages_for_provider(&self.cfg.provider, &messages);
-        // DeepSeek（chat/completions）某些实现要求最后一条必须是 user。
-        // 工具回执使用 system（避免模型误判为“用户输入”），因此只要最后一条不是 user，
-        // 就补一个“零指令语义”的 user 占位，保证协议兼容。
+        //（1）DeepSeek（chat/completions）某些实现要求最后一条必须是 user。
+        //（2）工具回执使用 system（避免模型误判为“用户输入”），因此只要最后一条不是 user，
+        //（3）就补一个“零指令语义”的 user 占位，保证协议兼容。
         //
-        // 注意：消息内容可能包含历史遗留的时间戳/前缀，因此不要用 `starts_with(...)` 做语义判断。
+        //（1）注意：消息内容可能包含历史遗留的时间戳/前缀，因此不要用 `starts_with(...)` 做语义判断。
         if normalize_provider(&self.cfg.provider) == "deepseek"
             && !messages
                 .last()
@@ -668,19 +689,19 @@ impl DogClient {
             }),
             max_tokens: self.cfg.max_tokens,
         };
-        crate::test::contexttest_log_request_start(
-            kind,
+        crate::test::contexttest_log_request_start(crate::test::ContextTestRequestStartArgs {
+            mind: kind,
             request_id,
-            true,
-            &self.cfg.provider,
-            &self.cfg.base_url,
-            &self.cfg.model,
-            self.cfg.reasoning_effort.as_deref(),
-            self.cfg.temperature,
-            self.cfg.max_tokens,
-            stream_idle_timeout_secs,
-            &messages,
-        );
+            stream: true,
+            provider: &self.cfg.provider,
+            base_url: &self.cfg.base_url,
+            model: &self.cfg.model,
+            reasoning_effort: self.cfg.reasoning_effort.as_deref(),
+            temperature: self.cfg.temperature,
+            max_tokens: self.cfg.max_tokens,
+            timeout_secs: stream_idle_timeout_secs,
+            messages: &messages,
+        });
         let max_retries = 3usize;
         let mut retries_done = 0usize;
         let mut started = false;
@@ -894,12 +915,13 @@ impl DogClient {
         request_id: u64,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
-        // 统一的协议层清洗：去空、合并连续 assistant（避免 DeepSeek 400，也让 Codex 请求更稳定）。
+        //（1）统一的协议层清洗：去空、合并连续 assistant（避免 DeepSeek 400，
+        //（2）也让 Codex 请求更稳定）。
         let mut messages =
             crate::context::normalize_messages_for_provider(&self.cfg.provider, &messages);
-        // DeepSeek（chat/completions）某些实现要求最后一条必须是 user。
-        // 工具回执使用 system（避免模型误判为“用户输入”），因此只要最后一条不是 user，
-        // 就补一个“零指令语义”的 user 占位，保证协议兼容。
+        //（1）DeepSeek（chat/completions）某些实现要求最后一条必须是 user。
+        //（2）工具回执使用 system（避免模型误判为“用户输入”），因此只要最后一条不是 user，
+        //（3）就补一个“零指令语义”的 user 占位，保证协议兼容。
         if normalize_provider(&self.cfg.provider) == "deepseek"
             && !messages
                 .last()
@@ -957,7 +979,7 @@ impl DogClient {
             return Err(anyhow::anyhow!("API Key 为空"));
         }
         if self.is_codex_provider() {
-            // Codex responses 端点要求 stream=true；非流式模式回落到同一套流式处理。
+            //（1）Codex responses 端点要求 stream=true；非流式模式回落到同一套流式处理。
             return self.send_chat_stream(messages, tx, kind, request_id, cancel);
         }
         let req = DeepseekRequest {
@@ -968,19 +990,19 @@ impl DogClient {
             stream_options: None,
             max_tokens: self.cfg.max_tokens,
         };
-        crate::test::contexttest_log_request_start(
-            kind,
+        crate::test::contexttest_log_request_start(crate::test::ContextTestRequestStartArgs {
+            mind: kind,
             request_id,
-            false,
-            &self.cfg.provider,
-            &self.cfg.base_url,
-            &self.cfg.model,
-            self.cfg.reasoning_effort.as_deref(),
-            self.cfg.temperature,
-            self.cfg.max_tokens,
-            self.request_timeout_secs(false),
-            &messages,
-        );
+            stream: false,
+            provider: &self.cfg.provider,
+            base_url: &self.cfg.base_url,
+            model: &self.cfg.model,
+            reasoning_effort: self.cfg.reasoning_effort.as_deref(),
+            temperature: self.cfg.temperature,
+            max_tokens: self.cfg.max_tokens,
+            timeout_secs: self.request_timeout_secs(false),
+            messages: &messages,
+        });
 
         let max_retries = 3usize;
         let mut retries_done = 0usize;

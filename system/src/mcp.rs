@@ -13,9 +13,41 @@ use serde_json::Value;
 
 use crate::memory::{DEFAULT_MEMO_DB_PATH, DateMemoDayAgg, MemoDb, MemoKind, MemoRow};
 
+// ===== 注释链（工具协议层：集中式实现，不拆文件）=====
+//（1）目标：工具新增/改字段时，沿链路可一眼定位改动点。
+//
+//（1）A 工具调用链（模型文本 -> ToolCall）
+//（2）core.rs:handle_model_stream_end
+//（3）-> mcp.rs:extract_tool_calls
+//（4）-> extract_tool_calls_strict（独立成行 <tool>...</tool>）
+//（5）-> extract_tool_calls_relaxed（兜底：同一行拼接/尾部噪音）
+//
+//（1）B 工具执行链（ToolCall -> ToolOutcome）
+//（2）core.rs:spawn_tool_execution
+//（3）-> mcp.rs:handle_tool_call_with_retry
+//（4）-> validate_tool_call（字段/约束校验）
+//（5）-> handle_tool_call（分发到 run_*）
+//（6）-> ToolOutcome{user_message, log_lines}
+//
+//（1）C 回执链（ToolOutcome -> 外置 context -> 下轮回放）
+//（2）core.rs:drain_async_events(AsyncEvent::ToolStreamEnd)
+//（3）-> format_tool_message_for_model（注入模型上下文的回执模板）
+//（4）-> context.rs:log_dyncontext(role=tool, mind=owner)
+//（5）-> 下轮：context.rs:read_contextlog_messages_for_mind(role=
+//（6）tool -> system 渲染)
+//
+//（1）D 输出预算与导出（避免撑爆上下文）
+//（2）truncate_tool_payload / maybe_export_tool_output
+//（3）触发：400行/20000字 或 1MB bytes 兜底
+//（4）回显：160行/12000字（头尾预览）
+//
+//（1）E 核心工具（当前主干）
+//（2）bash / adb / termux_api / pty / list / apply_patch /
+//（3）memory_check / memory_read / memory_add
+
 const BASH_SHELL: &str = "/data/data/com.termux/files/usr/bin/bash";
-// 在 Termux 场景下，PATH 可能被其它软件注入导致 `rg` 解析到不可执行的 wrapper。
-// 这里优先使用 Termux 自带的绝对路径，避免 search 退化到 grep。
+//（1）在 Termux 场景下，PATH 可能被其它软件注入导致 `rg` 解析到不可执行的 wrapper。
+//（2）这里优先使用 Termux 自带的绝对路径，避免 search 退化到 grep。
 const TERMUX_RG: &str = "/data/data/com.termux/files/usr/bin/rg";
 const ADB_SERIAL: &str = "127.0.0.1:5555";
 pub(crate) const OUTPUT_MAX_CHARS: usize = 20_000;
@@ -37,17 +69,18 @@ const SEARCH_CONTEXT_MAX_FILES: usize = 60;
 const SEARCH_CONTEXT_MAX_HITS_PER_FILE: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 10;
 const TOOL_TIMEOUT_KILL_SECS: u64 = 2;
-// termux_api 默认给更宽松的超时：避免某些系统 API（如 wifi 扫描/定位/SAF）在弱机上经常误超时。
+//（1）termux_api 默认给更宽松的超时：避免某些系统 API（如 wifi 扫描/定位/SAF）
+//（2）在弱机上经常误超时。
 const TERMUX_API_TIMEOUT_SECS: u64 = 25;
 const PATCH_TIMEOUT_MIN_SECS: u64 = 25;
 const PATCH_TIMEOUT_MID_SECS: u64 = 60;
 const PATCH_TIMEOUT_MAX_SECS: u64 = 120;
 
-// bash/adb/termux_api 等 shell 类工具：输出过大时落盘到这里，避免把 TUI/上下文撑爆。
+//（1）bash/adb/termux_api 等 shell 类工具：输出过大时落盘到这里，避免把 TUI/上下文撑爆。
 const SHELL_CACHE_DIR: &str = "log/bash-cache";
 const ADB_CACHE_DIR: &str = "log/adb-cache";
 const TERMUX_API_CACHE_DIR: &str = "log/termux-api-cache";
-// 统一导出触发的字节兜底阈值：当输出极大时无论行数/字符数是否超限，都落盘。
+//（1）统一导出触发的字节兜底阈值：当输出极大时无论行数/字符数是否超限，都落盘。
 pub(crate) const EXPORT_SAVE_THRESHOLD_BYTES: usize = 1_000_000;
 const SEARCH_CACHE_DIR: &str = "log/search-cache";
 const SEARCH_SAVE_THRESHOLD_BYTES: usize = 400_000;
@@ -59,7 +92,7 @@ const TOOL_OUTPUT_RAW_MAX_CHARS: usize = 20_000;
 const TOOL_OUTPUT_RAW_MAX_LINES: usize = 400;
 const TOOL_META_RAW_MAX_CHARS: usize = 20_000;
 const TOOL_META_RAW_MAX_LINES: usize = 200;
-// 当工具输出过大需要落盘时，优先返回“头尾预览”，避免上下文被整段日志撑爆。
+//（1）当工具输出过大需要落盘时，优先返回“头尾预览”，避免上下文被整段日志撑爆。
 const EXPORTED_PREVIEW_MAX_LINES: usize = 160;
 const EXPORTED_PREVIEW_MAX_CHARS: usize = 12_000;
 
@@ -93,7 +126,7 @@ fn maybe_export_text(
     out_lines_cap: usize,
     out_chars_cap: usize,
 ) -> (String, Option<ExportedOutputMeta>) {
-    let total_bytes = text.as_bytes().len();
+    let total_bytes = text.len();
     let raw_lines = text.lines().count();
     let truncated_by_lines = raw_lines > out_lines_cap;
     let truncated_by_chars = text.chars().count() > out_chars_cap;
@@ -131,7 +164,7 @@ fn memo_db_path_display() -> String {
 }
 
 fn pick_search_output_limits(call: &ToolCall) -> (usize, usize) {
-    // 低/中/高：低 400/20000，中翻倍，高=低*3
+    //（1）低/中/高：低 400/20000，中翻倍，高=低*3
     let lvl = call
         .output_level
         .as_deref()
@@ -149,8 +182,8 @@ fn pick_search_output_limits(call: &ToolCall) -> (usize, usize) {
 }
 
 fn pick_memory_output_limits(call: &ToolCall) -> (usize, usize) {
-    // memory_read 专用：metamemo（聊天记录）单日可能很长，允许更高的行数上限，
-    // 但字符上限保持一致，避免单次输出把上下文撑爆。
+    //（1）memory_read 专用：metamemo（聊天记录）单日可能很长，允许更高的行数上限，
+    //（2）但字符上限保持一致，避免单次输出把上下文撑爆。
     let lvl = call
         .output_level
         .as_deref()
@@ -172,7 +205,7 @@ fn tool_output_limits_for_history(call: &ToolCall) -> (usize, usize) {
         return pick_search_output_limits(call);
     }
     if call.tool == "memory_check" {
-        // memory_check 的回执偏“索引列表”，允许略高于通用工具的行数，避免把日期列表截断得太厉害。
+        //（1）memory_check 的回执偏“索引列表”，允许略高于通用工具的行数，避免把日期列表截断得太厉害。
         return (500, 20_000);
     }
     if call.tool == "memory_read" {
@@ -181,9 +214,7 @@ fn tool_output_limits_for_history(call: &ToolCall) -> (usize, usize) {
     (TOOL_OUTPUT_RAW_MAX_LINES, TOOL_OUTPUT_RAW_MAX_CHARS)
 }
 const PATCH_MAX_BYTES: usize = 500_000;
-#[allow(dead_code)]
 pub(crate) const EDIT_MAX_FILE_BYTES: usize = 800_000;
-#[allow(dead_code)]
 pub(crate) const EDIT_MAX_MATCHES: usize = 400;
 const MEMORY_CHECK_DEFAULT_RESULTS: usize = 10;
 const MEMORY_CHECK_MAX_RESULTS: usize = 20;
@@ -203,9 +234,9 @@ const SEARCH_EXCLUDE_DIRS: &[&str] = &[
 
 fn tool_tag_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // 只匹配“独立成行”的 <tool>...</tool>：
-    // - 避免把正文里的示例（如行内代码 `...<tool>{...}</tool>...`）误判为真实工具调用
-    // - 符合协议：工具调用应单独输出，不夹杂其它文字
+    //（1）只匹配“独立成行”的 <tool>...</tool>：
+    //（2）避免把正文里的示例（如行内代码 `...<tool>{...}</tool>...`）误判为真实工具调用
+    //（3）符合协议：工具调用应单独输出，不夹杂其它文字
     RE.get_or_init(|| {
         Regex::new(r"(?ims)^[ \t]*<tool>([\s\S]*?)</tool>[ \t]*$").expect("tool regex")
     })
@@ -268,6 +299,7 @@ fn parse_toggle_input(s: &str) -> Option<bool> {
     }
 }
 
+// ===== 工具协议：ToolCall（JSON schema）=====
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ToolCall {
     #[serde(default)]
@@ -275,14 +307,14 @@ pub struct ToolCall {
     #[serde(default)]
     pub input: String,
     #[serde(default)]
-    // brief: 一句话说明调用目的，用于可视化与审计。
+    //（1）brief: 一句话说明调用目的，用于可视化与审计。
     pub brief: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
-    // list：批量目标路径（优先于 path/input）
+    //（1）list：批量目标路径（优先于 path/input）
     #[serde(default)]
     pub paths: Option<Vec<String>>,
-    // list：同目录下的文件名数组（用于一次查看多个文件信息）
+    //（1）list：同目录下的文件名数组（用于一次查看多个文件信息）
     #[serde(default)]
     pub names: Option<Vec<String>>,
     #[serde(default)]
@@ -331,51 +363,53 @@ pub struct ToolCall {
     pub heartbeat_minutes: Option<usize>,
     #[serde(default)]
     pub interactive: Option<bool>,
-    // pty tool：目标 job_id（kill 等）
+    //（1）pty tool：目标 job_id（kill 等）
     #[serde(default)]
     pub job_id: Option<u64>,
-    // pty tool：目标 pid（kill 等）；兼容用户习惯，等价于 job_id
+    //（1）pty tool：目标 pid（kill 等）；兼容用户习惯，等价于 job_id
     #[serde(default)]
     pub pid: Option<u64>,
-    // pty tool：批量目标 job_ids（kill 等）
+    //（1）pty tool：批量目标 job_ids（kill 等）
     #[serde(default)]
     pub job_ids: Option<Vec<u64>>,
-    // pty tool：批量目标 pids（kill 等）；等价于 job_ids
+    //（1）pty tool：批量目标 pids（kill 等）；等价于 job_ids
     #[serde(default)]
     pub pids: Option<Vec<u64>>,
-    // pty tool：批量启动命令（run）
+    //（1）pty tool：批量启动命令（run）
     #[serde(default)]
     pub commands: Option<Vec<String>>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    // shell tools：工作目录（bash/adb/termux_api）
+    //（1）shell tools：工作目录（bash/adb/termux_api）
     #[serde(default)]
     pub cwd: Option<String>,
-    // shell tools：输出落盘策略 auto/always/never
+    //（1）shell tools：输出落盘策略 auto/always/never
     #[serde(default)]
     pub save: Option<String>,
-    // shell tools：额外可接受退出码（除 0 外也视为“成功/可预期”）
+    //（1）shell tools：额外可接受退出码（除 0 外也视为“成功/可预期”）
     #[serde(default)]
     pub ok_exit_codes: Option<Vec<i32>>,
 
-    // memory tools：将对应工具切换到“记忆源”而不是文件系统源
+    //（1）memory tools：将对应工具切换到“记忆源”而不是文件系统源
     #[serde(default)]
     pub memory: Option<bool>,
-    // memory tools：datememo/metamemo 的“区域/范围”选择（避免与 fastmemo 的 section 混用）
-    // - datememo: recent|past|older
-    // - metamemo: day
+    //（1）memory tools：datememo/metamemo 的“区域/范围”选择（避免与 fastmemo 的
+    //（2）section 混用）
+    //（3）datememo: recent|past|older
+    //（4）metamemo: day
     #[serde(default)]
     pub region: Option<String>,
-    // memory tools：sqlite 扫描上限（用于 datememo past/older 的 OR 拉取候选）
+    //（1）memory tools：sqlite 扫描上限（用于 datememo past/older 的 OR
+    //（2）拉取候选）
     #[serde(default)]
     pub scan_limit: Option<usize>,
-    // read_file：显式全量阅读（仅对小文件允许）
+    //（1）read_file：显式全量阅读（仅对小文件允许）
     #[serde(default)]
     pub full: Option<bool>,
 
-    // search 强化（可选）：命中上下文片段 + glob 过滤
+    //（1）search 强化（可选）：命中上下文片段 + glob 过滤
     #[serde(default)]
     pub context: Option<bool>,
     #[serde(default)]
@@ -391,51 +425,53 @@ pub struct ToolCall {
     #[serde(default)]
     pub exclude_dirs: Option<Vec<String>>,
 
-    // search 输出上限控制（可选）
+    //（1）search 输出上限控制（可选）
     #[serde(default)]
     pub output_level: Option<String>,
 
-    // list：递归深度（默认 1，最大 3）。为避免 token/性能暴涨，仍受 max_entries/输出预算约束。
+    //（1）list：递归深度（默认 1，最大 3）。为避免 token/性能暴涨，
+    //（2）仍受 max_entries/输出预算约束。
     #[serde(default)]
     pub depth: Option<usize>,
-    // list：最多返回多少条 entry（每条一行）。超出会截断并提示。
+    //（1）list：最多返回多少条 entry（每条一行）。超出会截断并提示。
     #[serde(default)]
     pub max_entries: Option<usize>,
-    // write_file：覆盖已存在的非空文件（需要显式确认）
+    //（1）write_file：覆盖已存在的非空文件（需要显式确认）
     #[serde(default)]
     pub overwrite: Option<bool>,
 
-    // 通用 op（用于 pty/list 等工具）
+    //（1）通用 op（用于 pty/list 等工具）
     #[serde(default)]
     pub op: Option<String>,
-    // steps：顺序执行多个子步骤（保留字段；当前未作为工具对外暴露）
+    //（1）steps：顺序执行多个子步骤（保留字段；当前未作为工具对外暴露）
     #[serde(default)]
     pub steps: Option<Vec<ToolCall>>,
     #[serde(default)]
     pub src: Option<String>,
     #[serde(default)]
     pub dst: Option<String>,
-    // 是否自动创建父目录（仅部分工具用到）
+    //（1）是否自动创建父目录（仅部分工具用到）
     #[serde(default)]
     pub parents: Option<bool>,
     #[serde(default)]
     pub recursive: Option<bool>,
     #[serde(default)]
     pub mode: Option<String>,
-    // search(format)：输出格式（如 coords 只返回坐标）
+    //（1）search(format)：输出格式（如 coords 只返回坐标）
     #[serde(default)]
     pub format: Option<String>,
 
-    // memory_check：同日内至少命中多少个“不同关键词”才算命中日（可选，默认自动推断）
+    //（1）memory_check：同日内至少命中多少个“不同关键词”才算命中日（可选，默认自动推断）
     #[serde(default)]
     pub min_kw_hits: Option<usize>,
 
-    // memory_read：一次读取多个精确日期（最多 5 个），用于批量回放某几天的日记/聊天记录。
-    // 仅用于 sqlite 的 datememo/metamemo。
+    //（1）memory_read：一次读取多个精确日期（最多 5 个），用于批量回放某几天的日记/聊天记录。
+    //（2）仅用于 sqlite 的 datememo/metamemo。
     #[serde(default)]
     pub dates: Option<Vec<String>>,
 
-    // memory_add：fastmemo 单区压缩写回。compact=true 时先清空该 section 的所有条目，再写入 1 条压缩后的内容。
+    //（1）memory_add：fastmemo 单区压缩写回。
+    //（2）compact=true 时先清空该 section 的所有条目，再写入 1 条压缩后的内容。
     #[serde(default)]
     pub compact: Option<bool>,
 }
@@ -493,11 +529,7 @@ fn parse_list_tokens(raw: &str, max: usize) -> Vec<String> {
             break;
         }
     }
-    if quote_end.is_some() {
-        push_token(&mut out, &mut buf);
-    } else {
-        push_token(&mut out, &mut buf);
-    }
+    push_token(&mut out, &mut buf);
     out.truncate(max);
     out
 }
@@ -681,7 +713,7 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "interactive" => {
                 call.interactive = val
                     .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+                    .or_else(|| val.as_str().and_then(parse_toggle_input));
             }
             "timeout_secs" => {
                 call.timeout_secs = val
@@ -702,7 +734,7 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "src" => {
                 call.src = s;
             }
-            // `to/dest` 对 mind_msg 是 target；否则作为 dst。
+            //（1）`to/dest` 对 mind_msg 是 target；否则作为 dst。
             "to" => {
                 if call.tool == "mind_msg" {
                     call.target = s;
@@ -716,12 +748,12 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "parents" => {
                 call.parents = val
                     .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+                    .or_else(|| val.as_str().and_then(parse_toggle_input));
             }
             "recursive" => {
                 call.recursive = val
                     .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+                    .or_else(|| val.as_str().and_then(parse_toggle_input));
             }
             "mode" => {
                 call.mode = s;
@@ -732,22 +764,23 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "overwrite" => {
                 call.overwrite = val
                     .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+                    .or_else(|| val.as_str().and_then(parse_toggle_input));
             }
             "compact" => {
                 call.compact = val
                     .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+                    .or_else(|| val.as_str().and_then(parse_toggle_input));
             }
             "steps" => {
                 call.steps = parse_steps_value_max(&val, 64);
             }
-            // pty kill 目标字段：兼容 snake_case 与常见 camelCase（部分模型会输出 jobId/jobIds）。
+            //（1）pty kill 目标字段：兼容 snake_case 与常见 camelCase（部分模型会输出
+            //（2）jobId/jobIds）。
             "job_id" => {
                 call.job_id = parse_u64_value(&val);
             }
             "pid" => {
-                // 兼容统一写法：pid:[1,2,3]（数组形式会归一到 pids）
+                //（1）兼容统一写法：pid:[1,2,3]（数组形式会归一到 pids）
                 if val.is_array() {
                     call.pids = parse_u64_list_value_max(&val, 16);
                 } else if let Some(list) = parse_u64_list_value_max(&val, 16) {
@@ -830,7 +863,7 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "memory" => {
                 call.memory = val
                     .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+                    .or_else(|| val.as_str().and_then(parse_toggle_input));
             }
             "scope" => {
                 call.region = s;
@@ -841,7 +874,7 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "full" => {
                 call.full = val
                     .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+                    .or_else(|| val.as_str().and_then(parse_toggle_input));
             }
             "output_level" => {
                 call.output_level = s;
@@ -855,7 +888,7 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
             "context" => {
                 call.context = val
                     .as_bool()
-                    .or_else(|| val.as_str().and_then(|x| parse_toggle_input(x)));
+                    .or_else(|| val.as_str().and_then(parse_toggle_input));
             }
             "context_lines" => {
                 call.context_lines = parse_usize_value(&val);
@@ -889,7 +922,7 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
                 call.min_kw_hits = parse_usize_value(&val);
             }
             "dates" => {
-                // 允许字符串或数组；并限制最多 5 个，避免一次读太多撑爆上下文。
+                //（1）允许字符串或数组；并限制最多 5 个，避免一次读太多撑爆上下文。
                 call.dates = parse_string_list_value_max(&val, 5);
             }
             "head" => {
@@ -914,7 +947,7 @@ fn apply_flat_fields(call: &mut ToolCall, m: &mut serde_json::Map<String, Value>
 
 fn apply_args_object(call: &mut ToolCall, obj: serde_json::Map<String, Value>) {
     let mut m = obj;
-    // 图灵化模块：允许把参数按模块放入子对象中（run/out/expect/policy），最后再合并扁平字段。
+    //（1）图灵化模块：允许把参数按模块放入子对象中（run/out/expect/policy），最后再合并扁平字段。
     for key in ["run", "out", "expect", "policy"] {
         if let Some(Value::Object(sub)) = m.remove(key) {
             let mut sub = sub;
@@ -1003,11 +1036,11 @@ fn parse_search_keywords(raw: &str) -> Vec<String> {
 }
 
 fn extract_search_inline_ctx_marker(raw_pattern: &str) -> (String, Option<usize>, bool) {
-    // 允许在 pattern 字符串里写快捷控制：
-    // - ctx / context：开启上下文（使用默认行数）
-    // - ctx:20 / ctx=20 / ctx:+20 / ctx:-20 / ctx:±20：开启上下文并设置行数
+    //（1）允许在 pattern 字符串里写快捷控制：
+    //（2）ctx / context：开启上下文（使用默认行数）
+    //（3）ctx:20 / ctx=20 / ctx:+20 / ctx:-20 / ctx:±20：开启上下文并设置行数
     //
-    // 轻量容错：识别后会从 pattern 里剔除该标记，避免误匹配。
+    //（1）轻量容错：识别后会从 pattern 里剔除该标记，避免误匹配。
     let s = raw_pattern.trim();
     if s.is_empty() {
         return (String::new(), None, false);
@@ -1064,9 +1097,9 @@ fn normalize_search_pattern(raw_pattern: &str) -> (String, Vec<String>) {
 }
 
 fn search_pattern_looks_like_regex(raw: &str) -> bool {
-    // 默认 search 走正则（rg/grep），但“多关键词 AND”是额外增强：
-    // - 仅在看起来像“纯关键词”时启用 AND，避免破坏用户正则语义（尤其是带空格的正则）。
-    // - 一旦包含常见正则元字符，就视为 regex。
+    //（1）默认 search 走正则（rg/grep），但“多关键词 AND”是额外增强：
+    //（2）仅在看起来像“纯关键词”时启用 AND，避免破坏用户正则语义（尤其是带空格的正则）。
+    //（3）一旦包含常见正则元字符，就视为 regex。
     let s = raw.trim();
     if s.is_empty() {
         return false;
@@ -1076,16 +1109,16 @@ fn search_pattern_looks_like_regex(raw: &str) -> bool {
 }
 
 fn parse_search_dsl_fallback(raw: &str) -> Option<(String, String, Option<bool>)> {
-    // 兼容一些“误把字段写进 pattern 字符串”的情况：
-    // - pattern=<...> in <root>
-    // - file=<...> in <root>
-    // - root=<root>, pattern=<...>
+    //（1）兼容一些“误把字段写进 pattern 字符串”的情况：
+    //（2）pattern=<...> in <root>
+    //（3）file=<...> in <root>
+    //（4）root=<root>, pattern=<...>
     let s = raw.trim();
     if s.is_empty() {
         return None;
     }
 
-    // 1) <key>=<val> in <root>
+    //（1）<key>=<val> in <root>
     if let Some((left, right)) = s.split_once(" in ") {
         let left = left.trim();
         let right = right.trim();
@@ -1102,10 +1135,10 @@ fn parse_search_dsl_fallback(raw: &str) -> Option<(String, String, Option<bool>)
         }
     }
 
-    // 2) root=... pattern=...
+    //（1）root=... pattern=...
     let lower = s.to_ascii_lowercase();
     if lower.contains("root=") && lower.contains("pattern=") {
-        // 粗解析：按逗号分段
+        //（1）粗解析：按逗号分段
         let mut root = None;
         let mut pat = None;
         for part in s.split(',') {
@@ -1204,7 +1237,7 @@ fn search_path_allowed(
 }
 
 fn parse_search_hit_line(line: &str) -> Option<(String, usize, String)> {
-    // 兼容 rg/grep 的常见输出：path:line:content
+    //（1）兼容 rg/grep 的常见输出：path:line:content
     let raw = line.trim_end();
     let a = raw.find(':')?;
     let b_rel = raw[a + 1..].find(':')?;
@@ -1216,8 +1249,8 @@ fn parse_search_hit_line(line: &str) -> Option<(String, usize, String)> {
 }
 
 pub(crate) fn sanitize_search_line(raw: &str) -> String {
-    // 防止把文件内容里的控制字符/ANSI escape 注入到 TUI，导致闪烁/乱码/震动等现象。
-    // 规则：保留可见字符与 '\t'；其它控制字符全部替换为空格。
+    //（1）防止把文件内容里的控制字符/ANSI escape 注入到 TUI，导致闪烁/乱码/震动等现象。
+    //（2）规则：保留可见字符与 '\t'；其它控制字符全部替换为空格。
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
         if ch == '\t' {
@@ -1225,7 +1258,7 @@ pub(crate) fn sanitize_search_line(raw: &str) -> String {
             continue;
         }
         if ch >= ' ' && ch != '\u{7f}' {
-            // 过滤 ESC（ANSI）与其它 C0/C1 控制
+            //（1）过滤 ESC（ANSI）与其它 C0/C1 控制
             if ch == '\u{1b}' {
                 out.push(' ');
             } else {
@@ -1239,8 +1272,8 @@ pub(crate) fn sanitize_search_line(raw: &str) -> String {
 }
 
 pub(crate) fn is_probably_binary_file(path: &Path) -> bool {
-    // 快速二进制探测：存在 NUL 基本可判定为 binary。
-    // 这能避免 sqlite/db 等文件被 AND/context 模式扫描后产生乱码与控制序列。
+    //（1）快速二进制探测：存在 NUL 基本可判定为 binary。
+    //（2）这能避免 sqlite/db 等文件被 AND/context 模式扫描后产生乱码与控制序列。
     let Ok(mut f) = fs::File::open(path) else {
         return false;
     };
@@ -1248,7 +1281,7 @@ pub(crate) fn is_probably_binary_file(path: &Path) -> bool {
     let Ok(n) = f.read(&mut buf) else {
         return false;
     };
-    buf[..n].iter().any(|b| *b == 0)
+    buf[..n].contains(&0)
 }
 
 fn resolve_search_hit_path(root: &str, hit_path: &str) -> PathBuf {
@@ -1573,7 +1606,7 @@ fn run_search_ranges(call: &ToolCall, pattern: &str, root: &str) -> anyhow::Resu
                 prev = ln;
                 continue;
             }
-            // flush range
+            //（1）flush range
             if start == prev {
                 out_lines.push(format!("{file}:L{start}"));
             } else {
@@ -1638,17 +1671,18 @@ fn resolve_mind_message(call: &ToolCall) -> String {
     input.to_string()
 }
 
+// ===== 工具调用解析：从 assistant 正文剥离 <tool>...</tool> 并返回“清理后的正文”=====
 pub fn extract_tool_calls(text: &str) -> anyhow::Result<(Vec<ToolCall>, String)> {
     if text.trim().is_empty() {
         return Ok((vec![], String::new()));
     }
-    // 先走严格模式：只接受“独立成行”的 <tool>...</tool>（最安全）。
+    //（1）先走严格模式：只接受“独立成行”的 <tool>...</tool>（最安全）。
     let (mut calls, mut spans) = extract_tool_calls_strict(text);
     if calls.is_empty() && text.contains("<tool>") && text.contains("</tool>") {
-        // 宽松兜底：某些供应商/中转会把 `<tool>` 块与其它文本拼在同一行（或尾部追加噪音），
-        // 导致严格模式 0 命中，从而误判“工具解析失败”。
+        //（1）宽松兜底：某些供应商/中转会把 `<tool>` 块与其它文本拼在同一行（或尾部追加噪音），
+        //（2）导致严格模式 0 命中，从而误判“工具解析失败”。
         //
-        // 注意：仍需要满足 JSON 可解析为合法 ToolCall，且避免在 ``` code fence 内触发。
+        //（1）注意：仍需要满足 JSON 可解析为合法 ToolCall，且避免在 ``` code fence 内触发。
         let (calls2, spans2) = extract_tool_calls_relaxed(text);
         if !calls2.is_empty() {
             calls = calls2;
@@ -1692,14 +1726,14 @@ fn extract_tool_calls_strict(text: &str) -> (Vec<ToolCall>, Vec<(usize, usize)>)
 }
 
 fn extract_tool_calls_relaxed(text: &str) -> (Vec<ToolCall>, Vec<(usize, usize)>) {
-    // 仅做线性扫描：提取 `<tool>` 与 `</tool>` 之间的 payload 并尝试解析 JSON。
-    // 规则：
-    // - 跳过 ``` code fence 内的内容（避免示例/文档被误触发执行）。
-    // - 只有 parse 成合法 ToolCall 才算命中。
+    //（1）仅做线性扫描：提取 `<tool>` 与 `</tool>` 之间的 payload 并尝试解析 JSON。
+    //（2）规则：
+    //（3）跳过 ``` code fence 内的内容（避免示例/文档被误触发执行）。
+    //（4）只有 parse 成合法 ToolCall 才算命中。
     let mut calls: Vec<ToolCall> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
 
-    // 预计算 fence 区域：任何位于奇数段 fence 内的 `<tool>` 都跳过。
+    //（1）预计算 fence 区域：任何位于奇数段 fence 内的 `<tool>` 都跳过。
     let mut fence_starts: Vec<usize> = Vec::new();
     let mut i = 0usize;
     while let Some(pos) = text[i..].find("```") {
@@ -1708,7 +1742,7 @@ fn extract_tool_calls_relaxed(text: &str) -> (Vec<ToolCall>, Vec<(usize, usize)>
         i = at + 3;
     }
     fn in_code_fence(fences: &[usize], idx: usize) -> bool {
-        // fences 记录每个 ``` 的起点；偶数->进入，奇数->退出。
+        //（1）fences 记录每个 ``` 的起点；偶数->进入，奇数->退出。
         let mut n = 0usize;
         for &p in fences {
             if p > idx {
@@ -1720,9 +1754,9 @@ fn extract_tool_calls_relaxed(text: &str) -> (Vec<ToolCall>, Vec<(usize, usize)>
     }
 
     fn line_prefix_allows_relaxed_tool(prefix: &str) -> bool {
-        // 允许：
-        // - 行首空白
-        // - UI/文本里常见的 bullet 前缀（例如 "● " / "○ " / "- "）
+        //（1）允许：
+        //（2）行首空白
+        //（3）UI/文本里常见的 bullet 前缀（例如 "● " / "○ " / "- "）
         let p = prefix.trim();
         p.is_empty() || matches!(p, "●" | "○" | "-" | "*" | ">")
     }
@@ -1760,10 +1794,10 @@ fn normalize_tool_payload(payload: &str) -> String {
     if !s.starts_with("```") {
         return s.to_string();
     }
-    // 兼容模型输出：
-    // ```json
-    // {"tool":"bash","input":"ls"}
-    // ```
+    //（1）兼容模型输出：
+    //（2）```json
+    //（3）{"tool":"bash","input":"ls"}
+    //（4）```
     let mut body = s;
     if let Some(pos) = body.find('\n') {
         body = &body[(pos + 1)..];
@@ -1805,7 +1839,8 @@ mod tests {
     #[test]
     fn parse_tool_call_basic() {
         let call =
-            parse_tool_call_payload(r#"{"tool":"list","op":"dir","cwd":".","brief":"列目录"}"#).expect("call");
+            parse_tool_call_payload(r#"{"tool":"list","op":"dir","cwd":".","brief":"列目录"}"#)
+                .expect("call");
         assert_eq!(call.tool, "list");
         assert_eq!(call.op.as_deref(), Some("dir"));
         assert_eq!(call.cwd.as_deref(), Some("."));
@@ -1820,7 +1855,6 @@ mod tests {
         .expect("call");
         assert_eq!(call.tool, "list");
         assert_eq!(call.names.as_ref().map(|v| v.len()), Some(3));
-
     }
 
     #[test]
@@ -2002,7 +2036,7 @@ fastmemo v1 | max_chars: 1800 | updated: 2026-01-27 20:30:13
         assert!(out.contains("[用户感知]"));
         assert!(out.contains("[环境感知]"));
         assert!(out.contains("[动态上下文]"));
-        // 去重后，“冷静理性”只应保留一次（作为 bullet）
+        //（1）去重后，“冷静理性”只应保留一次（作为 bullet）
         assert_eq!(out.matches("冷静理性").count(), 1);
     }
 
@@ -2109,7 +2143,7 @@ fn format_tool_message_with_limits(
     let mut msg = String::new();
     let label = tool_display_label(&call.tool);
     if !label.is_empty() {
-        msg.push_str(&render_tool_template(&msgs.tool_line, &[("TOOL", &label)]));
+        msg.push_str(&render_tool_template(msgs.tool_line, &[("TOOL", &label)]));
     }
     let mut input_preview = describe_tool_input(call, 400);
     let log_lines_filtered: Vec<String> = outcome
@@ -2138,19 +2172,21 @@ fn format_tool_message_with_limits(
         .filter(|s| !s.is_empty())
     {
         msg.push_str(&render_tool_template(
-            &msgs.explain_line,
+            msgs.explain_line,
             &[("BRIEF", brief)],
         ));
     }
     if !input_preview.is_empty() {
         msg.push_str(&render_tool_template(
-            &msgs.input_line,
+            msgs.input_line,
             &[("INPUT", &input_preview)],
         ));
     }
 
-    // apply_patch：UI 详情态需要完整展示 unified diff（不依赖 INPUT 的 preview）。
-    // 注意：该 PATCH 区块只用于 UI 可视化；模型侧上下文使用 `format_tool_message_for_model`，不会注入完整 diff。
+    //（1）apply_patch：UI 详情态需要完整展示 unified diff（不依赖 INPUT 的
+    //（2）preview）。
+    //（3）注意：该 PATCH 区块只用于 UI 可视化；
+    //（4）模型侧上下文使用 `format_tool_message_for_model`，不会注入完整 diff。
     if call.tool.trim() == "apply_patch" {
         let patch_text = call
             .patch
@@ -2164,7 +2200,7 @@ fn format_tool_message_with_limits(
         }
     }
 
-    msg.push_str(&msgs.output_header);
+    msg.push_str(msgs.output_header);
     let output = if outcome.user_message.trim().is_empty() {
         msgs.no_output.to_string()
     } else {
@@ -2175,13 +2211,13 @@ fn format_tool_message_with_limits(
         )
     };
     msg.push_str(&output);
-    msg.push_str(&msgs.output_footer);
+    msg.push_str(msgs.output_footer);
     if !log_lines_filtered.is_empty() {
-        msg.push_str(&msgs.meta_header);
+        msg.push_str(msgs.meta_header);
         let meta_join = log_lines_filtered.join("\n");
         let meta = truncate_tool_payload(meta_join.trim_end(), meta_max_lines, meta_max_chars);
         msg.push_str(&meta);
-        msg.push_str(&msgs.meta_footer);
+        msg.push_str(msgs.meta_footer);
     }
     msg.trim_end().to_string()
 }
@@ -2199,20 +2235,22 @@ pub fn format_tool_message_raw(call: &ToolCall, outcome: &ToolOutcome) -> String
 }
 
 pub fn format_tool_message_for_model(call: &ToolCall, outcome: &ToolOutcome) -> String {
-    // 模型侧：只注入“工具输出 + 必要 meta”，避免把 UI/可视化用的 TOOL/INPUT/EXPLAIN 结构回灌给模型，
-    // 否则会干扰模型对 `<tool>{...}</tool>` 工具调用协议的判断（把回执误学成调用格式）。
+    //（1）模型侧：只注入“工具输出 + 必要 meta”，
+    //（2）避免把 UI/可视化用的 TOOL/INPUT/EXPLAIN 结构回灌给模型，
+    //（3）否则会干扰模型对 `<tool>{...}</tool>` 工具调用协议的判断（把回执误学成调用格式）。
     //
-    // 约束：
-    // - 仍保持输出预算（避免上下文被日志撑爆）
-    // - 工具自身会在超阈值时导出到文件并返回 saved/path/lines/bytes 等信息
+    //（1）约束：
+    //（2）仍保持输出预算（避免上下文被日志撑爆）
+    //（3）工具自身会在超阈值时导出到文件并返回 saved/path/lines/bytes 等信息
     let (out_lines, out_chars) = tool_output_limits_for_history(call);
     let output = if outcome.user_message.trim().is_empty() {
         TOOL_MESSAGES.no_output.to_string()
     } else {
         truncate_tool_payload(outcome.user_message.trim_end(), out_lines, out_chars)
     };
-    // 允许工具通过 `[[AITERMUX_MODEL_NOTE]]...` 向模型注入“低歧义提示”（不在 UI 中展示）。
-    // 为避免模型误学内部前缀，这里把它规范成 meta 的 `note:` 行。
+    //（1）允许工具通过 `[[AITERMUX_MODEL_NOTE]]
+    //（2）...` 向模型注入“低歧义提示”（不在 UI 中展示）。
+    //（3）为避免模型误学内部前缀，这里把它规范成 meta 的 `note:` 行。
     const MODEL_NOTE_PREFIX: &str = "[[AITERMUX_MODEL_NOTE]]";
     let mut log_lines_for_model: Vec<String> = Vec::new();
     for line in &outcome.log_lines {
@@ -2321,8 +2359,10 @@ fn tool_usage(tool: &str) -> &'static str {
             r#"{"tool":"system_config","heartbeat_minutes":10,"brief":"调整心跳间隔"}"#
         }
         "skills_mcp" => r#"{"tool":"skills_mcp","category":"编程类","brief":"获取编程类工具说明"}"#,
-        "list" => r#"{"tool":"list","op":"dir","cwd":".","depth":1,"brief":"列目录"}
-{"tool":"list","op":"files","cwd":".","name":["main.rs"],"brief":"查看文件信息"}"#,
+        "list" => {
+            r#"{"tool":"list","op":"dir","cwd":".","depth":1,"brief":"列目录"}
+{"tool":"list","op":"files","cwd":".","name":["main.rs"],"brief":"查看文件信息"}"#
+        }
         "pty" => {
             r#"{"tool":"pty","op":"run","commands":["long_task.sh"],"brief":"后台终端任务（默认保持会话）"}
 {"tool":"pty","op":"input","pid":1,"commands":["echo hi"],"brief":"向指定 PTY 输入"}"#
@@ -2334,7 +2374,7 @@ fn tool_usage(tool: &str) -> &'static str {
 pub(crate) fn tool_format_error(tool: &str, reason: &str) -> ToolOutcome {
     let usage = tool_usage(tool);
     ToolOutcome {
-        // 只把“简短原因”展示给用户；具体用法放进 meta 供模型自愈，避免 UI 被大段 JSON 占满。
+        //（1）只把“简短原因”展示给用户；具体用法放进 meta 供模型自愈，避免 UI 被大段 JSON 占满。
         user_message: format!("格式错误：{reason}"),
         log_lines: vec!["状态:fail".to_string(), format!("usage:{usage}")],
     }
@@ -2349,10 +2389,10 @@ fn ensure_outcome_status(outcome: &mut ToolOutcome) {
         return;
     }
     let msg = outcome.user_message.trim();
-    // 约定：只有明确 `状态:fail` 才算“失败”。此处只做“兜底补状态”，避免误判把“情况汇报”
-    //（如 ok_not_found/ok_timeout）标成失败。
+    //（1）约定：只有明确 `状态:fail` 才算“失败”。此处只做“兜底补状态”，避免误判把“情况汇报”
+    //（2）（如 ok_not_found/ok_timeout）标成失败。
     //
-    // 若未来要更精确，请让各工具显式写入 `状态:*` 行，而不是依赖该兜底逻辑。
+    //（1）若未来要更精确，请让各工具显式写入 `状态:*` 行，而不是依赖该兜底逻辑。
     let fail = msg.contains("格式错误") || msg.contains("未知工具") || msg.contains("工具执行失败");
     if fail {
         outcome.log_lines.insert(0, "状态:fail".to_string());
@@ -2363,7 +2403,7 @@ fn ensure_outcome_status(outcome: &mut ToolOutcome) {
 
 fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
     let tool = call.tool.as_str();
-    // 大多数工具必须提供 brief（审计/可视化用途）。
+    //（1）大多数工具必须提供 brief（审计/可视化用途）。
     if call.brief.as_deref().unwrap_or("").trim().is_empty() {
         return Err(tool_format_error(tool, "缺少 brief"));
     }
@@ -2418,8 +2458,8 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
             if resolve_memory_path_label(path).is_none() {
                 return Err(tool_format_error(tool, "缺少有效 path"));
             }
-            // 收敛协议：memory_read 仅支持 dates 数组（单日也用 dates:["YYYY-MM-DD"]）。
-            // 不再支持 date_start/date_end，避免模型混用两套参数导致误读/误判。
+            //（1）收敛协议：memory_read 仅支持 dates 数组（单日也用 dates:["YYYY-MM-DD"]）。
+            //（2）不再支持 date_start/date_end，避免模型混用两套参数导致误读/误判。
             if call
                 .date_start
                 .as_deref()
@@ -2429,10 +2469,16 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty())
             {
-                return Err(tool_format_error(tool, "memory_read 不支持 date_start/date_end；请用 dates"));
+                return Err(tool_format_error(
+                    tool,
+                    "memory_read 不支持 date_start/date_end；请用 dates",
+                ));
             }
             let Some(ds) = call.dates.as_ref().filter(|v| !v.is_empty()) else {
-                return Err(tool_format_error(tool, "memory_read 缺少 dates（YYYY-MM-DD 数组，最多5个）"));
+                return Err(tool_format_error(
+                    tool,
+                    "memory_read 缺少 dates（YYYY-MM-DD 数组，最多5个）",
+                ));
             };
             for raw_day in ds.iter().take(5) {
                 if parse_memory_date(raw_day).is_none() {
@@ -2520,10 +2566,16 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
                         ));
                     }
                     let has_cmds = call.commands.as_ref().is_some_and(|v| !v.is_empty());
-                    let has_text = call.content.as_deref().is_some_and(|s| !s.trim().is_empty())
-                        || call.input.trim().len() > 0;
+                    let has_text = call
+                        .content
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                        || !call.input.trim().is_empty();
                     if !has_cmds && !has_text {
-                        return Err(tool_format_error(tool, "pty.input 缺少 commands/content/input"));
+                        return Err(tool_format_error(
+                            tool,
+                            "pty.input 缺少 commands/content/input",
+                        ));
                     }
                 }
                 _ => {
@@ -2532,13 +2584,16 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
             }
         }
         "list" => {
-            // list 不支持 paths（避免多路径心智负担）；path 为空时默认 "."（执行阶段兜底）。
+            //（1）list 不支持 paths（避免多路径心智负担）；path 为空时默认 "."（执行阶段兜底）。
             if call
                 .paths
                 .as_ref()
                 .is_some_and(|v| v.iter().any(|p| !p.trim().is_empty()))
             {
-                return Err(tool_format_error(tool, "list 不支持 paths，请用 cwd 指定目录"));
+                return Err(tool_format_error(
+                    tool,
+                    "list 不支持 paths，请用 cwd 指定目录",
+                ));
             }
             let op = call.op.as_deref().unwrap_or("").trim().to_ascii_lowercase();
             if op.is_empty() {
@@ -2547,9 +2602,14 @@ fn validate_tool_call(call: &ToolCall) -> Result<(), ToolOutcome> {
             if !op.is_empty() && op != "dir" && op != "files" {
                 return Err(tool_format_error(tool, "list.op 仅支持 dir/files"));
             }
-            // 收敛协议：list 只基于 cwd 工作；不要使用 path/input 指向其它目录。
-            if call.path.as_deref().unwrap_or("").trim().len() > 0 || !call.input.trim().is_empty() {
-                return Err(tool_format_error(tool, "list 不支持 path/input；请用 cwd 指定目录"));
+            //（1）收敛协议：list 只基于 cwd 工作；不要使用 path/input 指向其它目录。
+            if !call.path.as_deref().unwrap_or("").trim().is_empty()
+                || !call.input.trim().is_empty()
+            {
+                return Err(tool_format_error(
+                    tool,
+                    "list 不支持 path/input；请用 cwd 指定目录",
+                ));
             }
             let has_names = call
                 .names
@@ -2579,7 +2639,7 @@ fn requires_confirmation_reason(input: &str) -> Option<String> {
     }
     let lower = s.to_ascii_lowercase();
 
-    // 1) 典型破坏性/高风险命令：宁可多确认，也不要误伤。
+    //（1）典型破坏性/高风险命令：宁可多确认，也不要误伤。
     fn danger_cmd_re() -> &'static Regex {
         static RE: OnceLock<Regex> = OnceLock::new();
         RE.get_or_init(|| {
@@ -2612,7 +2672,7 @@ fn requires_confirmation_reason(input: &str) -> Option<String> {
         return Some(reason.to_string());
     }
 
-    // 2) 触碰系统敏感路径：这里宁可保守确认，避免误伤 Android 系统分区/伪文件系统
+    //（1）触碰系统敏感路径：这里宁可保守确认，避免误伤 Android 系统分区/伪文件系统
     let sensitive_paths = [
         "/system/",
         "/vendor/",
@@ -2627,7 +2687,7 @@ fn requires_confirmation_reason(input: &str) -> Option<String> {
         .find(|p| lower.contains(**p))
         .copied();
     if let Some(path) = hit_path {
-        // 读操作不确认；只在明显“写/改”的情况下确认。
+        //（1）读操作不确认；只在明显“写/改”的情况下确认。
         let write_markers = [
             ">",
             ">>",
@@ -2663,6 +2723,7 @@ pub fn tool_requires_confirmation(call: &ToolCall) -> Option<String> {
     }
 }
 
+// ===== 工具执行入口：单次调用（不负责重试；包含参数校验与分发）=====
 pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     if let Err(outcome) = validate_tool_call(call) {
         let mut outcome = outcome;
@@ -2689,7 +2750,7 @@ pub fn handle_tool_call(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         other => {
             let msgs = &TOOL_MESSAGES;
             Ok(ToolOutcome {
-                user_message: render_tool_template(&msgs.unknown_tool, &[("TOOL", other)]),
+                user_message: render_tool_template(msgs.unknown_tool, &[("TOOL", other)]),
                 log_lines: vec!["状态:fail".to_string()],
             })
         }
@@ -2704,6 +2765,7 @@ fn outcome_is_timeout(outcome: &ToolOutcome) -> bool {
 }
 
 pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutcome {
+    // ===== 工具执行入口：带重试包装（仅对“无副作用/可安全重试”的超时场景启用）=====
     fn timeout_retry_safe(tool: &str) -> bool {
         matches!(tool, "memory_check" | "memory_read" | "skills_mcp")
     }
@@ -2715,7 +2777,7 @@ pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutco
                 ensure_outcome_status(&mut outcome);
                 if outcome_is_timeout(&outcome) {
                     last = Some(outcome);
-                    // 超时不一定是“错误”，更不应对有副作用的工具进行自动重试。
+                    //（1）超时不一定是“错误”，更不应对有副作用的工具进行自动重试。
                     let safe = timeout_retry_safe(call.tool.as_str());
                     if !safe {
                         break;
@@ -2729,7 +2791,7 @@ pub fn handle_tool_call_with_retry(call: &ToolCall, retries: usize) -> ToolOutco
                     user_message: {
                         let err = format!("{e:#}");
                         let msgs = &TOOL_MESSAGES;
-                        render_tool_template(&msgs.tool_failed, &[("ERR", &err)])
+                        render_tool_template(msgs.tool_failed, &[("ERR", &err)])
                     },
                     log_lines: vec!["状态:fail".to_string()],
                 });
@@ -2827,12 +2889,13 @@ fn current_dir_display() -> String {
 }
 
 pub(crate) fn default_workdir() -> String {
-    // 工具默认在 AItermux 工程根目录执行（~/AItermux），避免把程序目录（~/AItermux/system）当 cwd 误操作。
+    //（1）工具默认在 AItermux 工程根目录执行（~/AItermux），
+    //（2）避免把程序目录（~/AItermux/system）当 cwd 误操作。
     //
-    // 优先级：
-    // 1) AITERMUX_WORKDIR（允许用户显式覆盖）
-    // 2) $HOME/AItermux（若存在）
-    // 3) 当前进程 cwd
+    //（1）优先级：
+    //（2）AITERMUX_WORKDIR（允许用户显式覆盖）
+    //（3）$HOME/AItermux（若存在）
+    //（4）当前进程 cwd
     if let Ok(v) = std::env::var("AITERMUX_WORKDIR") {
         let t = v.trim();
         if !t.is_empty() {
@@ -2854,12 +2917,13 @@ pub(crate) fn default_workdir() -> String {
 }
 
 fn expand_cwd_alias(raw: &str) -> String {
-    // cwd 支持最少必要的别名，避免模型混淆：
-    // - . / ./... : 工程根目录 ~/AItermux
-    // - ~ / ~/... : 工程根目录 ~/AItermux
-    // - home / home/... : 工程根目录 ~/AItermux
-    // - $HOME / $HOME/... : 工程根目录 ~/AItermux（仅作为 cwd 别名；与系统 HOME 概念区分）
-    // - ${HOME} / ${HOME}/... : 同上
+    //（1）cwd 支持最少必要的别名，避免模型混淆：
+    //（2）. / ./... : 工程根目录 ~/AItermux
+    //（3）~ / ~/... : 工程根目录 ~/AItermux
+    //（4）home / home/... : 工程根目录 ~/AItermux
+    //（5）$HOME / $HOME/... : 工程根目录 ~/AItermux（仅作为 cwd 别名；
+    //（6）与系统 HOME 概念区分）
+    //（7）${HOME} / ${HOME}/... : 同上
     let s = raw.trim();
     if s.is_empty() {
         return String::new();
@@ -2933,7 +2997,7 @@ fn exit_is_ok(code: i32, ok_exit_codes: Option<&[i32]>) -> bool {
     if code == 0 {
         return true;
     }
-    ok_exit_codes.unwrap_or(&[]).iter().any(|x| *x == code)
+    ok_exit_codes.unwrap_or(&[]).contains(&code)
 }
 
 pub(crate) fn format_bytes(bytes: u64) -> String {
@@ -3010,16 +3074,16 @@ fn run_bash(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .output()
         .with_context(|| format!("bash 执行失败：{cmd}"))?;
     let elapsed = started.elapsed();
-    Ok(build_shell_outcome_bash(
+    Ok(build_shell_outcome_bash(ShellOutcomeArgs {
         out,
         elapsed,
         timeout_used,
-        &cwd_display,
+        cwd_display: &cwd_display,
         cmd,
-        timeout_hint,
-        parse_shell_save_mode(call.save.as_deref()),
-        call.ok_exit_codes.as_deref(),
-    ))
+        timeout_hint_secs: timeout_hint,
+        save_mode: parse_shell_save_mode(call.save.as_deref()),
+        ok_exit_codes: call.ok_exit_codes.as_deref(),
+    }))
 }
 
 pub(crate) fn try_write_shell_cache_impl(
@@ -3060,16 +3124,28 @@ fn try_write_shell_cache(path: &str, stdout: &[u8], stderr: &[u8]) -> bool {
     try_write_shell_cache_impl(SHELL_CACHE_DIR, path, stdout, stderr)
 }
 
-fn build_shell_outcome_bash(
+struct ShellOutcomeArgs<'a> {
     out: std::process::Output,
     elapsed: std::time::Duration,
     timeout_used: bool,
-    cwd_display: &str,
-    cmd: &str,
+    cwd_display: &'a str,
+    cmd: &'a str,
     timeout_hint_secs: Option<u64>,
     save_mode: ShellSaveMode,
-    ok_exit_codes: Option<&[i32]>,
-) -> ToolOutcome {
+    ok_exit_codes: Option<&'a [i32]>,
+}
+
+fn build_shell_outcome_bash(args: ShellOutcomeArgs<'_>) -> ToolOutcome {
+    let ShellOutcomeArgs {
+        out,
+        elapsed,
+        timeout_used,
+        cwd_display,
+        cmd,
+        timeout_hint_secs,
+        save_mode,
+        ok_exit_codes,
+    } = args;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let code = status_code(out.status.code());
@@ -3115,7 +3191,7 @@ fn build_shell_outcome_bash(
     };
     body = annotate_timeout(body, timed_out, timeout_hint_secs);
     body = annotate_nonzero_exit(body, timed_out, code);
-    // 提示：bash 工具每次都是独立 shell，不支持 job control（%1/%2...）。
+    //（1）提示：bash 工具每次都是独立 shell，不支持 job control（%1/%2...）。
     if code != 0 {
         let cmd_trim = cmd.trim();
         let looks_like_job_kill = cmd_trim.starts_with("kill %") || cmd_trim.contains(" kill %");
@@ -3142,7 +3218,7 @@ fn build_shell_outcome_bash(
             || stderr_lower.contains("no such process")
             || stderr_lower.contains("not found");
         if looks_like_kill && not_found {
-            // 这类情况通常是“目标不存在/已结束”，对用户而言是可预期状态。
+            //（1）这类情况通常是“目标不存在/已结束”，对用户而言是可预期状态。
             status = "ok_not_found".to_string();
         }
     }
@@ -3168,16 +3244,17 @@ fn build_shell_outcome_bash(
     }
 }
 
-fn build_shell_outcome_adb(
-    out: std::process::Output,
-    elapsed: std::time::Duration,
-    timeout_used: bool,
-    cwd_display: &str,
-    cmd: &str,
-    timeout_hint_secs: Option<u64>,
-    save_mode: ShellSaveMode,
-    ok_exit_codes: Option<&[i32]>,
-) -> ToolOutcome {
+fn build_shell_outcome_adb(args: ShellOutcomeArgs<'_>) -> ToolOutcome {
+    let ShellOutcomeArgs {
+        out,
+        elapsed,
+        timeout_used,
+        cwd_display,
+        cmd,
+        timeout_hint_secs,
+        save_mode,
+        ok_exit_codes,
+    } = args;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let code = status_code(out.status.code());
@@ -3256,14 +3333,14 @@ fn ensure_adb_connected() -> bool {
     if is_adb_ready() {
         return true;
     }
-    // 尽量自愈：adb server 未启动时先拉起。
+    //（1）尽量自愈：adb server 未启动时先拉起。
     let _ = adb_quick(&["start-server"], 6);
-    // 尝试直连（可能已处于 tcp 模式，仅断线）。
+    //（1）尝试直连（可能已处于 tcp 模式，仅断线）。
     let _ = adb_quick(&["connect", ADB_SERIAL], 8);
     if is_adb_ready() {
         return true;
     }
-    // 尝试脚本化打开 tcp 并重启 adbd（需要 root）。
+    //（1）尝试脚本化打开 tcp 并重启 adbd（需要 root）。
     let _ = try_prepare_adb_tcp();
     let _ = adb_quick(&["connect", ADB_SERIAL], 10);
     is_adb_ready()
@@ -3310,18 +3387,18 @@ fn run_adb(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             "connect" | "disconnect" | "start-server" | "kill-server" | "version"
         );
 
-    // 第一次使用 adb 时尽量自动拉起 tcp 连接；只有在“确实需要设备”的命令且自愈失败时才报错返回。
-    // 对 devices 这类全局命令：尝试自愈，但不因失败而提前返回，避免干扰用户自助排查。
+    //（1）第一次使用 adb 时尽量自动拉起 tcp 连接；只有在“确实需要设备”的命令且自愈失败时才报错返回。
+    //（2）对 devices 这类全局命令：尝试自愈，但不因失败而提前返回，避免干扰用户自助排查。
     let auto_connected = if skip_autoconnect {
         false
     } else {
         ensure_adb_connected()
     };
 
-    // 兼容 deepseek-cli：input 不含 adb 前缀。
+    //（1）兼容 deepseek-cli：input 不含 adb 前缀。
     let cmd = if global_cmd {
         if first == "devices" && !auto_connected {
-            // ignore: 允许直接展示 adb devices 自身输出
+            //（1）ignore: 允许直接展示 adb devices 自身输出
         }
         format!("adb {input}")
     } else {
@@ -3365,20 +3442,20 @@ fn run_adb(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .output()
         .with_context(|| format!("adb 执行失败：{cmd}"))?;
     let elapsed = started.elapsed();
-    Ok(build_shell_outcome_adb(
+    Ok(build_shell_outcome_adb(ShellOutcomeArgs {
         out,
         elapsed,
         timeout_used,
-        &cwd_display,
-        input,
-        timeout_hint,
-        parse_shell_save_mode(call.save.as_deref()),
-        call.ok_exit_codes.as_deref(),
-    ))
+        cwd_display: &cwd_display,
+        cmd: input,
+        timeout_hint_secs: timeout_hint,
+        save_mode: parse_shell_save_mode(call.save.as_deref()),
+        ok_exit_codes: call.ok_exit_codes.as_deref(),
+    }))
 }
 
 fn try_prepare_adb_tcp() -> bool {
-    // 兼容不同 ROM：service/persist 两种 key 都尝试，最后 restart adbd。
+    //（1）兼容不同 ROM：service/persist 两种 key 都尝试，最后 restart adbd。
     let cmd = "su -c 'setprop service.adb.tcp.port 5555; setprop persist.adb.tcp.port 5555; setprop ctl.restart adbd'";
     let (mut command, _) = build_command(BASH_SHELL, &["-lc", cmd]);
     command
@@ -3387,16 +3464,17 @@ fn try_prepare_adb_tcp() -> bool {
         .unwrap_or(false)
 }
 
-fn build_shell_outcome_termux_api(
-    out: std::process::Output,
-    elapsed: std::time::Duration,
-    timeout_used: bool,
-    cwd_display: &str,
-    cmd: &str,
-    timeout_hint_secs: Option<u64>,
-    save_mode: ShellSaveMode,
-    ok_exit_codes: Option<&[i32]>,
-) -> ToolOutcome {
+fn build_shell_outcome_termux_api(args: ShellOutcomeArgs<'_>) -> ToolOutcome {
+    let ShellOutcomeArgs {
+        out,
+        elapsed,
+        timeout_used,
+        cwd_display,
+        cmd,
+        timeout_hint_secs,
+        save_mode,
+        ok_exit_codes,
+    } = args;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let code = status_code(out.status.code());
@@ -3506,87 +3584,69 @@ fn run_termux_api(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .output()
         .with_context(|| format!("termux_api 执行失败：{input}"))?;
     let elapsed = started.elapsed();
-    Ok(build_shell_outcome_termux_api(
+    Ok(build_shell_outcome_termux_api(ShellOutcomeArgs {
         out,
         elapsed,
         timeout_used,
-        &cwd_display,
-        input,
-        timeout_hint,
-        parse_shell_save_mode(call.save.as_deref()),
-        call.ok_exit_codes.as_deref(),
-    ))
+        cwd_display: &cwd_display,
+        cmd: input,
+        timeout_hint_secs: timeout_hint,
+        save_mode: parse_shell_save_mode(call.save.as_deref()),
+        ok_exit_codes: call.ok_exit_codes.as_deref(),
+    }))
 }
 
-fn find_files_by_name_with_timeout(
-    root: &Path,
-    needles: &[String],
+struct FindFilesByNameCtx<'a> {
+    needles: &'a [String],
     limit: usize,
     started: Instant,
     timeout_secs: u64,
-    include_re: &[Regex],
-    exclude_re: &[Regex],
-    extra_exclude_dirs: &[String],
-    out: &mut Vec<String>,
-) -> bool {
+    include_re: &'a [Regex],
+    exclude_re: &'a [Regex],
+    extra_exclude_dirs: &'a [String],
+    out: &'a mut Vec<String>,
+}
+
+fn find_files_by_name_with_timeout(root: &Path, ctx: &mut FindFilesByNameCtx<'_>) -> bool {
     fn is_excluded_dir(name: &str) -> bool {
         SEARCH_EXCLUDE_DIRS
             .iter()
             .any(|d| d.eq_ignore_ascii_case(name))
     }
 
-    if needles.is_empty() || limit == 0 {
+    if ctx.needles.is_empty() || ctx.limit == 0 {
         return true;
     }
 
-    fn walk(
-        dir: &Path,
-        needles: &[String],
-        limit: usize,
-        started: Instant,
-        timeout_secs: u64,
-        include_re: &[Regex],
-        exclude_re: &[Regex],
-        extra_exclude_dirs: &[String],
-        out: &mut Vec<String>,
-    ) -> bool {
-        if out.len() >= limit {
+    fn walk(dir: &Path, ctx: &mut FindFilesByNameCtx<'_>) -> bool {
+        if ctx.out.len() >= ctx.limit {
             return true;
         }
-        if timeout_secs > 0 && started.elapsed().as_secs() >= timeout_secs {
+        if ctx.timeout_secs > 0 && ctx.started.elapsed().as_secs() >= ctx.timeout_secs {
             return false;
         }
         let Ok(rd) = fs::read_dir(dir) else {
             return true;
         };
         for entry in rd.flatten() {
-            if out.len() >= limit {
+            if ctx.out.len() >= ctx.limit {
                 return true;
             }
-            if timeout_secs > 0 && started.elapsed().as_secs() >= timeout_secs {
+            if ctx.timeout_secs > 0 && ctx.started.elapsed().as_secs() >= ctx.timeout_secs {
                 return false;
             }
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if path.is_dir() {
                 if is_excluded_dir(&name)
-                    || extra_exclude_dirs
+                    || ctx
+                        .extra_exclude_dirs
                         .iter()
                         .any(|d| d.eq_ignore_ascii_case(name.as_str()))
                 {
                     continue;
                 }
-                if !walk(
-                    &path,
-                    needles,
-                    limit,
-                    started,
-                    timeout_secs,
-                    include_re,
-                    exclude_re,
-                    extra_exclude_dirs,
-                    out,
-                ) {
+                if !walk(&path, ctx) {
                     return false;
                 }
                 continue;
@@ -3595,54 +3655,48 @@ fn find_files_by_name_with_timeout(
                 continue;
             }
             let lower = name.to_ascii_lowercase();
-            if needles.iter().all(|kw| lower.contains(kw)) {
-                if !search_path_allowed(&path, include_re, exclude_re, extra_exclude_dirs) {
+            if ctx.needles.iter().all(|kw| lower.contains(kw)) {
+                if !search_path_allowed(
+                    &path,
+                    ctx.include_re,
+                    ctx.exclude_re,
+                    ctx.extra_exclude_dirs,
+                ) {
                     continue;
                 }
                 let display = path.to_string_lossy().to_string();
                 let shown = short_display_path(&display);
                 if shown.is_empty() {
-                    out.push(shorten_path(&display));
+                    ctx.out.push(shorten_path(&display));
                 } else if shown == "." {
-                    out.push(".".to_string());
+                    ctx.out.push(".".to_string());
                 } else if shown.starts_with('/')
                     || shown.starts_with('~')
                     || shown.starts_with("./")
                     || shown.starts_with("...")
                 {
-                    out.push(shown);
+                    ctx.out.push(shown);
                 } else {
-                    out.push(format!("./{shown}"));
+                    ctx.out.push(format!("./{shown}"));
                 }
             }
         }
         true
     }
 
-    walk(
-        root,
-        needles,
-        limit,
-        started,
-        timeout_secs,
-        include_re,
-        exclude_re,
-        extra_exclude_dirs,
-        out,
-    )
+    walk(root, ctx)
 }
 
-
 // -----------------------------
-// list (filesystem base)
+//（1）list (filesystem base)
 // -----------------------------
 
 const LIST_MAX_DEPTH_CAP: usize = 3;
 const LIST_MAX_DEPTH_DEFAULT: usize = 1;
 const LIST_STAT_SCAN_MAX_BYTES: u64 = 2_000_000;
-// list：目录条目默认上限（不可配置）
+//（1）list：目录条目默认上限（不可配置）
 const LIST_DIR_ENTRY_CAP: usize = 300;
-// list：当目录条目超过上限时，回显给模型的“条目预览”数量（中间截断）
+//（1）list：当目录条目超过上限时，回显给模型的“条目预览”数量（中间截断）
 const LIST_DIR_EXPORT_PREVIEW_ENTRIES: usize = 160;
 const FS_CACHE_DIR: &str = "log/fs-cache";
 
@@ -3686,7 +3740,6 @@ fn abs_path_from_cwd(raw: &str) -> PathBuf {
         .join(p)
 }
 
-
 fn real_display_path(path: &Path) -> String {
     if path.as_os_str().is_empty() {
         return String::new();
@@ -3700,9 +3753,9 @@ fn real_display_path(path: &Path) -> String {
 
 fn fmt_time(ts: std::io::Result<std::time::SystemTime>) -> String {
     ts.ok()
-        .and_then(|t| {
+        .map(|t| {
             let dt: chrono::DateTime<chrono::Local> = t.into();
-            Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            dt.format("%Y-%m-%d %H:%M:%S").to_string()
         })
         .unwrap_or_else(|| "unknown".to_string())
 }
@@ -3721,14 +3774,17 @@ fn fmt_mode(meta: &fs::Metadata) -> String {
 }
 
 fn maybe_export_fs_text(file_prefix: &str, text: &str) -> (String, Option<ExportedOutputMeta>) {
-    let total_bytes = text.as_bytes().len();
+    let total_bytes = text.len();
     let raw_lines = text.lines().count();
     let truncated_by_lines = raw_lines > OUTPUT_MAX_LINES;
     let truncated_by_chars = text.chars().count() > OUTPUT_MAX_CHARS;
     let need_save =
         total_bytes > EXPORT_SAVE_THRESHOLD_BYTES || truncated_by_lines || truncated_by_chars;
     if !need_save {
-        return (truncate_tool_payload(text, OUTPUT_MAX_LINES, OUTPUT_MAX_CHARS), None);
+        return (
+            truncate_tool_payload(text, OUTPUT_MAX_LINES, OUTPUT_MAX_CHARS),
+            None,
+        );
     }
     let _ = fs::create_dir_all(FS_CACHE_DIR);
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -3736,7 +3792,10 @@ fn maybe_export_fs_text(file_prefix: &str, text: &str) -> (String, Option<Export
     let path = format!("{FS_CACHE_DIR}/{file_prefix}_{ts}_{pid}.log");
     let ok = try_write_shell_cache_impl(FS_CACHE_DIR, &path, text.as_bytes(), &[]);
     if !ok {
-        return (truncate_tool_payload(text, OUTPUT_MAX_LINES, OUTPUT_MAX_CHARS), None);
+        return (
+            truncate_tool_payload(text, OUTPUT_MAX_LINES, OUTPUT_MAX_CHARS),
+            None,
+        );
     }
     let abs_saved = real_display_path(Path::new(&path));
     let meta = exported_meta(abs_saved, total_bytes, raw_lines);
@@ -3751,7 +3810,7 @@ fn maybe_export_fs_text(file_prefix: &str, text: &str) -> (String, Option<Export
 }
 
 fn export_fs_text_always(file_prefix: &str, text: &str) -> Option<ExportedOutputMeta> {
-    let total_bytes = text.as_bytes().len();
+    let total_bytes = text.len();
     let raw_lines = text.lines().count();
     let _ = fs::create_dir_all(FS_CACHE_DIR);
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -3783,12 +3842,17 @@ fn list_preview_middle_truncate(lines: &[String], want: usize) -> Vec<String> {
 fn list_one_file_abs(abs: &Path) -> anyhow::Result<(bool, u64, String)> {
     let abs_display = display_path_best_effort(abs);
     if abs_display.is_empty() {
-        return Ok((false, 0, "path: (empty)\nstatus: fail\nreason: empty path".to_string()));
+        return Ok((
+            false,
+            0,
+            "path: (empty)\nstatus: fail\nreason: empty path".to_string(),
+        ));
     }
     if !abs.exists() {
         return Ok((false, 0, format!("path: {abs_display}\nstatus: not_found")));
     }
-    let meta = fs::symlink_metadata(abs).with_context(|| format!("获取文件信息失败：{abs_display}"))?;
+    let meta =
+        fs::symlink_metadata(abs).with_context(|| format!("获取文件信息失败：{abs_display}"))?;
     let real = abs_display;
     let readonly = meta.permissions().readonly();
     let mode = fmt_mode(&meta);
@@ -3880,20 +3944,25 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .clamp(1, LIST_MAX_DEPTH_CAP);
     let base_dir = fs_tool_base_dir(call);
     let cwd_log = short_cwd_display(&display_path_best_effort(&base_dir));
-    let op = call.op.as_deref().unwrap_or("dir").trim().to_ascii_lowercase();
-    // list 不支持 paths：避免模型产生“多路径 list”心智负担。
-            if call
-                .paths
-                .as_ref()
-                .is_some_and(|v| v.iter().any(|p| !p.trim().is_empty()))
-            {
-                return Ok(tool_format_error(
-                    "list",
-                    "list 不支持 paths；用 cwd 指定目录；同目录多文件用 name 数组。",
-                ));
-            }
+    let op = call
+        .op
+        .as_deref()
+        .unwrap_or("dir")
+        .trim()
+        .to_ascii_lowercase();
+    //（1）list 不支持 paths：避免模型产生“多路径 list”心智负担。
+    if call
+        .paths
+        .as_ref()
+        .is_some_and(|v| v.iter().any(|p| !p.trim().is_empty()))
+    {
+        return Ok(tool_format_error(
+            "list",
+            "list 不支持 paths；用 cwd 指定目录；同目录多文件用 name 数组。",
+        ));
+    }
 
-    // 收敛协议：list 只基于 cwd 工作（由 validate_tool_call 保证）。
+    //（1）收敛协议：list 只基于 cwd 工作（由 validate_tool_call 保证）。
     let names = call
         .names
         .as_ref()
@@ -3921,7 +3990,7 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         });
     }
 
-    // op=files：输出 cwd 目录下 names 的文件信息（纯文件名）
+    //（1）op=files：输出 cwd 目录下 names 的文件信息（纯文件名）
     if op == "files" {
         if !abs.is_dir() {
             return Ok(tool_format_error("list", "list.op=files 需要 cwd 指向目录"));
@@ -3983,7 +4052,7 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         });
     }
 
-    // op=dir：列目录（若 path 实际是文件，则退化成“看文件信息”，兼容用户习惯）
+    //（1）op=dir：列目录（若 path 实际是文件，则退化成“看文件信息”，兼容用户习惯）
     if abs.is_file() || abs.symlink_metadata().map(|m| m.is_file()).unwrap_or(false) {
         let (_ok, _bytes, body) = list_one_file_abs(&abs)?;
         let mut log = format!(
@@ -4002,7 +4071,7 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         });
     }
 
-    // 目录：枚举（递归 depth），条目上限固定为 300（不可配置）
+    //（1）目录：枚举（递归 depth），条目上限固定为 300（不可配置）
     let cwd_display = display_path_best_effort(&base_dir);
 
     let mut out: Vec<String> = Vec::new();
@@ -4014,18 +4083,22 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let mut produced = 0usize;
     let mut truncated = false;
 
+    struct ListDirRecCtx<'a> {
+        max_level: usize,
+        max_entries: usize,
+        produced: &'a mut usize,
+        truncated: &'a mut bool,
+        out: &'a mut Vec<String>,
+    }
+
     fn list_dir_rec(
         root: &Path,
         rel_prefix: &str,
         level: usize,
-        max_level: usize,
-        max_entries: usize,
-        produced: &mut usize,
-        truncated: &mut bool,
-        out: &mut Vec<String>,
+        ctx: &mut ListDirRecCtx<'_>,
     ) -> anyhow::Result<()> {
-        if *produced >= max_entries {
-            *truncated = true;
+        if *ctx.produced >= ctx.max_entries {
+            *ctx.truncated = true;
             return Ok(());
         }
         let mut items: Vec<(String, PathBuf)> = Vec::new();
@@ -4033,8 +4106,8 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             Ok(rd) => rd,
             Err(_) => {
                 let here = real_display_path(root);
-                out.push(format!("dir | unreadable:1 | {here}"));
-                *produced = produced.saturating_add(1);
+                ctx.out.push(format!("dir | unreadable:1 | {here}"));
+                *ctx.produced = ctx.produced.saturating_add(1);
                 return Ok(());
             }
         };
@@ -4045,15 +4118,25 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         items.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (name, ep) in items.into_iter() {
-            if *produced >= max_entries {
-                *truncated = true;
+            if *ctx.produced >= ctx.max_entries {
+                *ctx.truncated = true;
                 break;
             }
             let meta = fs::metadata(&ep).ok();
             let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
             let is_file = meta.as_ref().is_some_and(|m| m.is_file());
-            let kind = if is_dir { "dir" } else if is_file { "file" } else { "other" };
-            let hidden = if name.starts_with('.') { " hidden:1" } else { "" };
+            let kind = if is_dir {
+                "dir"
+            } else if is_file {
+                "file"
+            } else {
+                "other"
+            };
+            let hidden = if name.starts_with('.') {
+                " hidden:1"
+            } else {
+                ""
+            };
             let size_part = if is_file {
                 let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                 format!(" size:{}({})", bytes, format_bytes(bytes))
@@ -4068,37 +4151,26 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             if is_dir {
                 rel = format!("{rel}/");
             }
-            out.push(format!("{kind}{size_part}{hidden} | {rel}"));
-            *produced = produced.saturating_add(1);
+            ctx.out.push(format!("{kind}{size_part}{hidden} | {rel}"));
+            *ctx.produced = ctx.produced.saturating_add(1);
 
-            if is_dir && level < max_level && !*truncated {
-                list_dir_rec(
-                    &ep,
-                    &rel.trim_end_matches('/'),
-                    level.saturating_add(1),
-                    max_level,
-                    max_entries,
-                    produced,
-                    truncated,
-                    out,
-                )?;
+            if is_dir && level < ctx.max_level && !*ctx.truncated {
+                list_dir_rec(&ep, rel.trim_end_matches("/"), level.saturating_add(1), ctx)?;
             }
         }
         Ok(())
     }
 
-    list_dir_rec(
-        &abs,
-        "",
-        1,
-        depth,
-        LIST_DIR_ENTRY_CAP,
-        &mut produced,
-        &mut truncated,
-        &mut out,
-    )?;
+    let mut ctx = ListDirRecCtx {
+        max_level: depth,
+        max_entries: LIST_DIR_ENTRY_CAP,
+        produced: &mut produced,
+        truncated: &mut truncated,
+        out: &mut out,
+    };
+    list_dir_rec(&abs, "", 1, &mut ctx)?;
 
-    // 将 entries/truncated 回填到 header（第 3 行）
+    //（1）将 entries/truncated 回填到 header（第 3 行）
     if let Some(line) = out.get_mut(2) {
         *line = format!(
             "depth: {depth} | entries: {produced} | truncated: {}",
@@ -4110,10 +4182,11 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let raw_lines = body.lines().count();
     let raw_chars = body.chars().count();
     let (body2, saved) = if truncated {
-        // 超过 300 条：强制导出，并只回显 160 条（中间截断）
+        //（1）超过 300 条：强制导出，并只回显 160 条（中间截断）
         let meta = export_fs_text_always("list_dir", &body);
         let entries = if out.len() >= 4 { &out[4..] } else { &[] };
-        let preview_entries = list_preview_middle_truncate(entries, LIST_DIR_EXPORT_PREVIEW_ENTRIES);
+        let preview_entries =
+            list_preview_middle_truncate(entries, LIST_DIR_EXPORT_PREVIEW_ENTRIES);
         let mut preview_lines: Vec<String> = Vec::new();
         preview_lines.extend(out.iter().take(4).cloned()); // header + blank
         preview_lines.extend(preview_entries);
@@ -4152,8 +4225,6 @@ fn run_list_tool(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     })
 }
 
-
-
 pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     if call.memory.unwrap_or(false) {
         return run_search_memory_like("search", call);
@@ -4178,20 +4249,19 @@ pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .trim()
         .to_string();
     let mut search_files = call.file.unwrap_or(false);
-    // 若调用方没有显式提供 root（或仅是 "."），但把字段写进了 pattern 字符串，则尽量自愈解析。
+    //（1）若调用方没有显式提供 root（或仅是 "."），但把字段写进了 pattern 字符串，则尽量自愈解析。
     if call.root.as_deref().unwrap_or("").trim().is_empty()
         && call.path.as_deref().unwrap_or("").trim().is_empty()
+        && let Some((p2, r2, f2)) = parse_search_dsl_fallback(&pattern)
     {
-        if let Some((p2, r2, f2)) = parse_search_dsl_fallback(&pattern) {
-            pattern = p2;
-            root = r2;
-            if let Some(f) = f2 {
-                search_files = f;
-            }
+        pattern = p2;
+        root = r2;
+        if let Some(f) = f2 {
+            search_files = f;
         }
     }
 
-    // 允许在 pattern 内联 ctx 标记（仅当未显式传 context* 字段时生效）
+    //（1）允许在 pattern 内联 ctx 标记（仅当未显式传 context* 字段时生效）
     let inline_ctx_allowed = call.context.is_none()
         && call.context_lines.is_none()
         && call.context_files.is_none()
@@ -4235,9 +4305,10 @@ pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let include_re = compile_globs(&include_globs);
     let exclude_re = compile_globs(&exclude_globs);
 
-    // search(format=coords)：只返回坐标（abs_path:line），不返回命中行内容。
-    // search(format=ranges)：只返回行号范围（abs_path:Lx-Ly），用于指导按需 read。
-    // 仅对“内容搜索”生效；文件名搜索（file:true）与上下文搜索（context:true）忽略该字段。
+    //（1）search(format=coords)：只返回坐标（abs_path:line），不返回命中行内容。
+    //（2）search(format=ranges)：只返回行号范围（abs_path:Lx-Ly），
+    //（3）用于指导按需 read。
+    //（4）仅对“内容搜索”生效；文件名搜索（file:true）与上下文搜索（context:true）忽略该字段。
     let format = call
         .format
         .as_deref()
@@ -4259,17 +4330,17 @@ pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             .take(SEARCH_MAX_KEYWORDS)
             .collect();
         let mut matches: Vec<String> = Vec::new();
-        let finished = find_files_by_name_with_timeout(
-            Path::new(&root),
-            &needles,
-            max_matches,
+        let mut ctx = FindFilesByNameCtx {
+            needles: &needles,
+            limit: max_matches,
             started,
-            timeout_hint.unwrap_or(SEARCH_TIMEOUT_SECS),
-            &include_re,
-            &exclude_re,
-            &extra_exclude_dirs,
-            &mut matches,
-        );
+            timeout_secs: timeout_hint.unwrap_or(SEARCH_TIMEOUT_SECS),
+            include_re: &include_re,
+            exclude_re: &exclude_re,
+            extra_exclude_dirs: &extra_exclude_dirs,
+            out: &mut matches,
+        };
+        let finished = find_files_by_name_with_timeout(Path::new(&root), &mut ctx);
         let elapsed = started.elapsed();
         let match_count = matches.len();
         let mut body = if match_count == 0 {
@@ -4287,7 +4358,7 @@ pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             body = annotate_timeout(body, true, timeout_hint);
         }
 
-        let total_bytes = body.as_bytes().len();
+        let total_bytes = body.len();
         let raw_lines = body.lines().count();
         let truncated_by_lines = raw_lines > out_lines;
         let truncated_by_chars = body.chars().count() > out_chars;
@@ -4372,21 +4443,21 @@ pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             exclude_re: &exclude_re,
         }));
     }
-    // 多关键词 AND：仅在“纯关键词”模式启用；带正则元字符时保留 regex 语义（rg/grep）。
+    //（1）多关键词 AND：仅在“纯关键词”模式启用；带正则元字符时保留 regex 语义（rg/grep）。
     if needles.len() >= 2 && !search_pattern_looks_like_regex(&pattern_effective) {
-        return Ok(run_search_keywords_and(
-            &root,
-            &needles,
+        return Ok(run_search_keywords_and(SearchKeywordsAndArgs {
+            root: &root,
+            needles: &needles,
             max_matches,
             started,
-            timeout_hint.unwrap_or(SEARCH_TIMEOUT_SECS),
-            &pattern_preview,
+            timeout_secs: timeout_hint.unwrap_or(SEARCH_TIMEOUT_SECS),
+            pattern_preview: &pattern_preview,
             out_lines,
             out_chars,
-            &include_re,
-            &exclude_re,
-            &extra_exclude_dirs,
-        ));
+            include_re: &include_re,
+            exclude_re: &exclude_re,
+            extra_exclude_dirs: &extra_exclude_dirs,
+        }));
     }
     let mut engine = "rg";
     let mut rg_args: Vec<String> = vec![
@@ -4402,7 +4473,7 @@ pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         rg_args.push("--glob".to_string());
         rg_args.push(format!("!**/{d}/**"));
     }
-    // 默认排除常见二进制/数据库文件：避免输出乱码、抖动与无意义 token 消耗。
+    //（1）默认排除常见二进制/数据库文件：避免输出乱码、抖动与无意义 token 消耗。
     for g in ["!**/*.db", "!**/*.sqlite", "!**/*.sqlite3"] {
         rg_args.push("--glob".to_string());
         rg_args.push(g.to_string());
@@ -4474,10 +4545,7 @@ pub(crate) fn run_search(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         combined
     };
 
-    let total_bytes = stdout
-        .as_bytes()
-        .len()
-        .saturating_add(stderr.as_bytes().len());
+    let total_bytes = stdout.len().saturating_add(stderr.len());
     let raw_lines = raw_body.lines().count();
     let truncated_by_lines = raw_lines > out_lines;
     let truncated_by_chars = raw_body.chars().count() > out_chars;
@@ -4789,7 +4857,8 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
         if label == "fastmemo" {
             let text = fs::read_to_string(&path).unwrap_or_default();
             let mut block_hits = 0usize;
-            // fastmemo 的 block 头部是日期；memory_check/search(memory) 默认不做复杂区间筛选，避免误命中。
+            //（1）fastmemo 的 block 头部是日期；memory_check/search(memory)
+            //（2）默认不做复杂区间筛选，避免误命中。
             if range_active {
                 continue;
             }
@@ -4859,7 +4928,7 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
         used_sqlite = true;
 
         // --- datememo/metamemo 规则增强 ---
-        // metamemo：仅允许“精确日期”检索（必须带日期），且要求 section 标记为 day（当天）。
+        //（1）metamemo：仅允许“精确日期”检索（必须带日期），且要求 section 标记为 day（当天）。
         if is_meta {
             let reg = call_region_or_section(call);
             let sec = reg.trim();
@@ -4925,11 +4994,11 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
             continue;
         }
 
-        // datememo：支持区域 recent/past/older；若未显式指定区域，则默认 recent7d。
+        //（1）datememo：支持区域 recent/past/older；若未显式指定区域，则默认 recent7d。
         let region = parse_memo_date_region(&call_region_or_section(call))
             .unwrap_or(MemoDateRegion::Recent7d);
         let (mut region_start, mut region_end) = default_date_range_for_region(region);
-        // 调用方显式指定日期范围则优先使用
+        //（1）调用方显式指定日期范围则优先使用
         if start_date.is_some() || end_date.is_some() {
             region_start = start_date;
             region_end = end_date;
@@ -4937,7 +5006,7 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
 
         match region {
             MemoDateRegion::Recent7d => {
-                // 一周内：支持单关键词，直接返回匹配记录（内容）。
+                //（1）一周内：支持单关键词，直接返回匹配记录（内容）。
                 let limit = call.count.unwrap_or(80).clamp(1, 200);
                 let (rows, label_total, _stats, min_date, max_date) =
                     db.check_by_keywords(kind, &keywords, region_start, region_end, limit)?;
@@ -4972,7 +5041,7 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
                 continue;
             }
             MemoDateRegion::Past1y | MemoDateRegion::Older => {
-                // 过去/以前：必须多关键词；按“同一天内至少命中 2 个关键词”判定强命中。
+                //（1）过去/以前：必须多关键词；按“同一天内至少命中 2 个关键词”判定强命中。
                 if keywords.len() < 2 {
                     return Ok(tool_format_error(
                         tool_tag,
@@ -5013,10 +5082,10 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
                     if agg.samples.len() < 3 {
                         let header = build_preview(&memo_row_header(&content), 160);
                         let mut line = header;
-                        if let Some(p) = memo_row_preview(&content, &keywords) {
-                            if !p.trim().is_empty() {
-                                line.push_str(&format!(" | {}", build_preview(&p, 160)));
-                            }
+                        if let Some(p) = memo_row_preview(&content, &keywords)
+                            && !p.trim().is_empty()
+                        {
+                            line.push_str(&format!(" | {}", build_preview(&p, 160)));
                         }
                         agg.samples.push(line);
                     }
@@ -5031,7 +5100,7 @@ fn run_search_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<Too
                         weak.push((day, agg));
                     }
                 }
-                // 倒序（新日期优先）
+                //（1）倒序（新日期优先）
                 strong.sort_by(|a, b| b.0.cmp(&a.0));
                 weak.sort_by(|a, b| b.0.cmp(&a.0));
                 if strong.is_empty() && weak.is_empty() {
@@ -5256,9 +5325,9 @@ fn scan_keywords_and_hits(args: &SearchWithContextArgs<'_>) -> (Vec<SearchHit>, 
     (hits, stats)
 }
 
-fn build_context_pack(
-    root: &str,
-    mut hits: Vec<SearchHit>,
+struct BuildContextPackArgs<'a> {
+    root: &'a str,
+    hits: Vec<SearchHit>,
     context_lines: usize,
     context_files: usize,
     hits_per_file: usize,
@@ -5269,12 +5338,30 @@ fn build_context_pack(
     out_chars: usize,
     note_cap_reached: bool,
     note_scan_limit: bool,
-    pattern_preview: &str,
-) -> ToolOutcome {
-    // 先按文件 + 行号排序，确保输出稳定可复现
+    pattern_preview: &'a str,
+}
+
+fn build_context_pack(args: BuildContextPackArgs<'_>) -> ToolOutcome {
+    let BuildContextPackArgs {
+        root,
+        mut hits,
+        context_lines,
+        context_files,
+        hits_per_file,
+        started,
+        timed_out,
+        timeout_secs,
+        out_lines,
+        out_chars,
+        note_cap_reached,
+        note_scan_limit,
+        pattern_preview,
+    } = args;
+
+    //（1）先按文件 + 行号排序，确保输出稳定可复现
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line_no.cmp(&b.line_no)));
 
-    // file 去重 + 每文件 hit 限制
+    //（1）file 去重 + 每文件 hit 限制
     let mut picked: Vec<(PathBuf, Vec<SearchHit>)> = Vec::new();
     let mut cur_path: Option<PathBuf> = None;
     let mut cur_hits: Vec<SearchHit> = Vec::new();
@@ -5358,12 +5445,12 @@ fn build_context_pack(
         ranges.sort_by_key(|(s, _)| *s);
         let mut merged: Vec<(usize, usize)> = Vec::new();
         for (s, e) in ranges.into_iter() {
-            if let Some((ms, me)) = merged.last_mut() {
-                if s <= *me + 1 {
-                    *me = (*me).max(e);
-                    *ms = (*ms).min(s);
-                    continue;
-                }
+            if let Some((ms, me)) = merged.last_mut()
+                && s <= *me + 1
+            {
+                *me = (*me).max(e);
+                *ms = (*ms).min(s);
+                continue;
             }
             merged.push((s, e));
         }
@@ -5430,7 +5517,7 @@ fn build_context_pack(
     }
 
     let elapsed = started.elapsed();
-    let total_bytes = body.as_bytes().len();
+    let total_bytes = body.len();
     let raw_lines = body.lines().count();
     let truncated_by_lines = raw_lines > out_lines;
     let truncated_by_chars = body.chars().count() > out_chars;
@@ -5478,27 +5565,27 @@ fn build_context_pack(
 }
 
 fn run_search_with_context(args: SearchWithContextArgs<'_>) -> ToolOutcome {
-    // AND 多关键词：走 Rust scanner（可控阈值 + 结果稳定）
+    //（1）AND 多关键词：走 Rust scanner（可控阈值 + 结果稳定）
     if args.needles.len() >= 2 {
         let (hits, stats) = scan_keywords_and_hits(&args);
-        return build_context_pack(
-            args.root,
+        return build_context_pack(BuildContextPackArgs {
+            root: args.root,
             hits,
-            args.context_lines,
-            args.context_files,
-            args.hits_per_file,
-            args.started,
-            stats.timed_out,
-            args.timeout_secs,
-            args.out_lines,
-            args.out_chars,
-            stats.cap_reached,
-            stats.scan_limit_reached,
-            args.pattern_preview,
-        );
+            context_lines: args.context_lines,
+            context_files: args.context_files,
+            hits_per_file: args.hits_per_file,
+            started: args.started,
+            timed_out: stats.timed_out,
+            timeout_secs: args.timeout_secs,
+            out_lines: args.out_lines,
+            out_chars: args.out_chars,
+            note_cap_reached: stats.cap_reached,
+            note_scan_limit: stats.scan_limit_reached,
+            pattern_preview: args.pattern_preview,
+        });
     }
 
-    // 单 pattern：尽量复用 rg/grep 的输出语义（regex），再二次读取文件上下文
+    //（1）单 pattern：尽量复用 rg/grep 的输出语义（regex），再二次读取文件上下文
     let mut engine = "rg";
     let mut rg_args: Vec<String> = vec![
         "--line-number".to_string(),
@@ -5599,7 +5686,7 @@ fn run_search_with_context(args: SearchWithContextArgs<'_>) -> ToolOutcome {
         };
     }
 
-    // 若工具报错且无输出：返回失败信息（保留 stderr 关键摘要）
+    //（1）若工具报错且无输出：返回失败信息（保留 stderr 关键摘要）
     if code != 0 && hits.is_empty() && !timed_out {
         let err = if stderr.trim().is_empty() {
             format!("search failed (exit:{code})")
@@ -5618,36 +5705,52 @@ fn run_search_with_context(args: SearchWithContextArgs<'_>) -> ToolOutcome {
     }
 
     let note_cap_reached = hits.len() >= args.max_matches;
-    build_context_pack(
-        args.root,
+    build_context_pack(BuildContextPackArgs {
+        root: args.root,
         hits,
-        args.context_lines,
-        args.context_files,
-        args.hits_per_file,
-        args.started,
+        context_lines: args.context_lines,
+        context_files: args.context_files,
+        hits_per_file: args.hits_per_file,
+        started: args.started,
         timed_out,
-        args.timeout_secs,
-        args.out_lines,
-        args.out_chars,
+        timeout_secs: args.timeout_secs,
+        out_lines: args.out_lines,
+        out_chars: args.out_chars,
         note_cap_reached,
-        false,
-        args.pattern_preview,
-    )
+        note_scan_limit: false,
+        pattern_preview: args.pattern_preview,
+    })
 }
 
-fn run_search_keywords_and(
-    root: &str,
-    needles: &[String],
+struct SearchKeywordsAndArgs<'a> {
+    root: &'a str,
+    needles: &'a [String],
     max_matches: usize,
     started: Instant,
     timeout_secs: u64,
-    pattern_preview: &str,
+    pattern_preview: &'a str,
     out_lines: usize,
     out_chars: usize,
-    include_re: &[Regex],
-    exclude_re: &[Regex],
-    extra_exclude_dirs: &[String],
-) -> ToolOutcome {
+    include_re: &'a [Regex],
+    exclude_re: &'a [Regex],
+    extra_exclude_dirs: &'a [String],
+}
+
+fn run_search_keywords_and(args: SearchKeywordsAndArgs<'_>) -> ToolOutcome {
+    let SearchKeywordsAndArgs {
+        root,
+        needles,
+        max_matches,
+        started,
+        timeout_secs,
+        pattern_preview,
+        out_lines,
+        out_chars,
+        include_re,
+        exclude_re,
+        extra_exclude_dirs,
+    } = args;
+
     let ctx_args = SearchWithContextArgs {
         root,
         pattern: "",
@@ -5719,7 +5822,7 @@ fn run_search_keywords_and(
         body = annotate_timeout(body, true, Some(timeout_secs));
     }
 
-    let total_bytes = body.as_bytes().len();
+    let total_bytes = body.len();
     let raw_lines = body.lines().count();
     let truncated_by_lines = raw_lines > out_lines;
     let truncated_by_chars = body.chars().count() > out_chars;
@@ -5907,7 +6010,7 @@ pub(crate) fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         });
     }
     if !patch_text.ends_with("\n") {
-        patch_text.push_str("\n");
+        patch_text.push('\n');
     }
     if let Err(err) = validate_unified_patch(&patch_text) {
         return Ok(ToolOutcome {
@@ -5927,19 +6030,14 @@ pub(crate) fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     };
 
     let started = Instant::now();
-    let cwd_exec = if let Some(cwd) = call
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let cwd_exec = if let Some(cwd) = call.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         expand_cwd_alias(cwd)
     } else {
         default_workdir()
     };
     let cwd_display = short_cwd_display(&cwd_exec);
     let (add, del) = count_patch_changes(&patch_text);
-    // 先 dry-run：避免 patch 在失败时“部分应用”导致工作区混乱。
+    //（1）先 dry-run：避免 patch 在失败时“部分应用”导致工作区混乱。
     let (pre_code, pre_stdout, pre_stderr, pre_timed_out) =
         run_patch_command(&patch_text, strip, true, &cwd_exec)?;
     let pre_elapsed = started.elapsed();
@@ -5978,9 +6076,9 @@ pub(crate) fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             )],
         });
     }
-    // 自动化策略：
-    // - fuzz：拒绝（未应用），因为上下文未精确匹配，风险更高。
-    // - offset：允许（上下文匹配但行号偏移）。
+    //（1）自动化策略：
+    //（2）fuzz：拒绝（未应用），因为上下文未精确匹配，风险更高。
+    //（3）offset：允许（上下文匹配但行号偏移）。
     if pre_report.fuzz {
         return Ok(ToolOutcome {
             user_message: if pre_body.trim().is_empty() {
@@ -5998,8 +6096,9 @@ pub(crate) fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         });
     }
 
-    // 正式应用
-    let (code, stdout, stderr, timed_out) = run_patch_command(&patch_text, strip, false, &cwd_exec)?;
+    //（1）正式应用
+    let (code, stdout, stderr, timed_out) =
+        run_patch_command(&patch_text, strip, false, &cwd_exec)?;
     let elapsed = started.elapsed();
     let body = annotate_timeout(
         truncate_command_output(collect_output(&stdout, &stderr)),
@@ -6012,7 +6111,7 @@ pub(crate) fn run_apply_patch(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let result_tag = if timed_out {
         "timeout"
     } else if success && report.fuzz {
-        // 理论上 dry-run 已拦截 fuzz；保留兜底标记，避免静默。
+        //（1）理论上 dry-run 已拦截 fuzz；保留兜底标记，避免静默。
         "ok_fuzz"
     } else if success && report.offset {
         "ok_offset"
@@ -6074,14 +6173,15 @@ fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolO
         } else {
             MemoKind::Meta
         };
-        // sqlite memo：read 仅支持“精确到单日”的读取（便于稳定检索与导出），不支持 start_line/max_lines。
+        //（1）sqlite memo：read 仅支持“精确到单日”的读取（便于稳定检索与导出），
+        //（2）不支持 start_line/max_lines。
         if use_slice {
             return Ok(tool_format_error(
                 tool_tag,
                 "sqlite 记忆读取不支持 start_line/max_lines；请使用 dates（精确日期数组）",
             ));
         }
-        // metamemo 要求显式标记 section=day（当天）
+        //（1）metamemo 要求显式标记 section=day（当天）
         if label == "metamemo" {
             let reg = call_region_or_section(call);
             let sec = reg.trim();
@@ -6093,7 +6193,7 @@ fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolO
                 ));
             }
         }
-        // 收敛协议：仅支持批量 dates（最多 5 天）；单日也用 dates:["YYYY-MM-DD"]。
+        //（1）收敛协议：仅支持批量 dates（最多 5 天）；单日也用 dates:["YYYY-MM-DD"]。
         let mut days: Vec<NaiveDate> = Vec::new();
         if has_date {
             return Ok(tool_format_error(
@@ -6109,7 +6209,10 @@ fn run_read_memory_like(tool_tag: &str, call: &ToolCall) -> anyhow::Result<ToolO
         };
         for raw_day in ds.iter().take(5) {
             let Some(day) = parse_memory_date(raw_day) else {
-                return Ok(tool_format_error(tool_tag, "dates 含无效日期（需 YYYY-MM-DD）"));
+                return Ok(tool_format_error(
+                    tool_tag,
+                    "dates 含无效日期（需 YYYY-MM-DD）",
+                ));
             };
             if !days.contains(&day) {
                 days.push(day);
@@ -6400,8 +6503,12 @@ fn parse_datememo_scope(raw: &str) -> Option<DateMemoScope> {
         "recent" | "r" | "近" | "最近" | "近三月" | "近三个月" | "3m" | "last3m" => {
             Some(DateMemoScope::Recent3m)
         }
-        "past" | "p" | "过去" | "近一年" | "一年" | "1y" | "last1y" => Some(DateMemoScope::Past1y),
-        "older" | "o" | "old" | "陈年" | "陈年往事" | "一年以前" | ">1y" => Some(DateMemoScope::Older),
+        "past" | "p" | "过去" | "近一年" | "一年" | "1y" | "last1y" => {
+            Some(DateMemoScope::Past1y)
+        }
+        "older" | "o" | "old" | "陈年" | "陈年往事" | "一年以前" | ">1y" => {
+            Some(DateMemoScope::Older)
+        }
         _ => None,
     }
 }
@@ -6485,8 +6592,8 @@ fn min_kw_hits_for_check(keywords_len: usize) -> usize {
         0 => 0,
         1 => 1,
         2 => 2,
-        // 3->2, 4->3, 5->3, 6->4 ... 约等于 ceil(n*0.6)
-        n => ((n * 3) + 4) / 5,
+        //（1）3->2, 4->3, 5->3, 6->4 ... 约等于 ceil(n*0.6)
+        n => (n * 3).div_ceil(5),
     }
     .clamp(1, keywords_len.max(1))
 }
@@ -6494,10 +6601,10 @@ fn min_kw_hits_for_check(keywords_len: usize) -> usize {
 fn ts_to_time_hhmmss(ts: &str) -> String {
     let t = ts.trim();
     if t.len() >= 19 {
-        // "YYYY-MM-DD HH:MM:SS"
+        //（1）"YYYY-MM-DD HH:MM:SS"
         return t[11..19].to_string();
     }
-    // 兜底：尽量截断末尾 8 位时间
+    //（1）兜底：尽量截断末尾 8 位时间
     let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() >= 14 {
         let h = &digits[8..10];
@@ -6518,7 +6625,8 @@ fn format_date_range(start: Option<NaiveDate>, end: Option<NaiveDate>) -> Option
 }
 
 fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
-    // memory_check：仅用于日记（datememo）的“导航式检索”，输出以“日期”为核心，便于后续 memory_read 精读。
+    //（1）memory_check：仅用于日记（datememo）的“导航式检索”，输出以“日期”为核心，
+    //（2）便于后续 memory_read 精读。
     let pattern = call.pattern.as_deref().unwrap_or(call.input.trim()).trim();
     if pattern.is_empty() {
         return Ok(tool_format_error("memory_check", "缺少 pattern"));
@@ -6538,7 +6646,7 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     {
         return Ok(tool_format_error("memory_check", "仅支持 datememo（日记）"));
     }
-    // 兼容旧字段：root/path；新设计只允许 datememo（或为空=默认）。
+    //（1）兼容旧字段：root/path；新设计只允许 datememo（或为空=默认）。
     let raw_scope = call
         .region
         .as_deref()
@@ -6558,11 +6666,11 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     }
     min_kw_hits = min_kw_hits.min(keywords.len().max(1));
 
-    // 输出形态：
-    // - 默认 auto：命中少给少量预览、命中多给索引/按月汇总（省电+稳定）。
-    // - format=index：强制索引（不拉正文预览）。
-    // - format=month：强制按月汇总。
-    // - format=preview：在 hit_days<=50 时也拉取每日日记样本（更耗电，需显式选择）。
+    //（1）输出形态：
+    //（2）默认 auto：命中少给少量预览、命中多给索引/按月汇总（省电+稳定）。
+    //（3）format=index：强制索引（不拉正文预览）。
+    //（4）format=month：强制按月汇总。
+    //（5）format=preview：在 hit_days<=50 时也拉取每日日记样本（更耗电，需显式选择）。
     let fmt = call
         .format
         .as_deref()
@@ -6578,9 +6686,11 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         .unwrap_or("mid")
         .trim()
         .to_ascii_lowercase();
-    let prefer_preview = force_preview || out_level == "high" || out_level == "h" || out_level == "large";
+    let prefer_preview =
+        force_preview || out_level == "high" || out_level == "h" || out_level == "large";
 
-    // 日期范围：若显式指定 date_start/date_end（支持 YYYY-MM-DD / YYYY/MM/DD / YYYY-MM / YYYY/MM），则覆盖 scope。
+    //（1）日期范围：若显式指定 date_start/date_end（支持 YYYY-MM-DD /
+    //（2）YYYY/MM/DD / YYYY-MM / YYYY/MM），则覆盖 scope。
     let today = Local::now().date_naive();
     let three_months_ago = today - chrono::Duration::days(92);
     let one_year_ago = today - chrono::Duration::days(365);
@@ -6614,9 +6724,9 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let db = MemoDb::open_default()?;
     let mut hit_days: Vec<DateMemoDayAgg> =
         db.datememo_aggregate_days_by_keywords_or(&keywords, start, end)?;
-    // 过滤：按“同日命中不同关键词数”做阈值。
+    //（1）过滤：按“同日命中不同关键词数”做阈值。
     hit_days.retain(|d| d.kw_hits >= min_kw_hits);
-    // 已按 date DESC 排序（SQL），这里保持。
+    //（1）已按 date DESC 排序（SQL），这里保持。
     let hit_days_total = hit_days.len();
     let hit_entries_total: usize = hit_days.iter().map(|d| d.entries).sum();
 
@@ -6644,8 +6754,8 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         });
     }
 
-    // 推荐：从最近的一小段里挑 3 个“更值得读”的日期（kw_hits 优先，其次 entries）。
-    // 目的：让模型快速进入 memory_read，而不是盯着长列表发呆。
+    //（1）推荐：从最近的一小段里挑 3 个“更值得读”的日期（kw_hits 优先，其次 entries）。
+    //（2）目的：让模型快速进入 memory_read，而不是盯着长列表发呆。
     let mut recommended: Vec<(String, usize, usize)> = Vec::new(); // (date, kw_hits, entries)
     for d in hit_days.iter().take(30) {
         recommended.push((d.date.clone(), d.kw_hits, d.entries));
@@ -6658,7 +6768,7 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     recommended.truncate(3);
 
     let mut details = String::new();
-    // 分档输出：按“命中天数”控制信息密度（省电默认）。
+    //（1）分档输出：按“命中天数”控制信息密度（省电默认）。
     if !force_month && hit_days_total <= 10 && !force_index {
         for d in hit_days.iter() {
             let t_latest = ts_to_time_hhmmss(&d.latest_ts);
@@ -6673,13 +6783,14 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
                     d.date, t_latest, d.kw_hits, d.entries
                 ));
             }
-            // 命中极少：允许 1 条短预览（最多 1 条样本，避免多次查询/输出膨胀）。
+            //（1）命中极少：允许 1 条短预览（最多 1 条样本，避免多次查询/输出膨胀）。
             let samples = db
                 .datememo_fetch_samples_for_day(&d.date, &keywords, 1)
                 .unwrap_or_default();
             if let Some((ts, content)) = samples.first() {
                 let t = ts_to_time_hhmmss(ts);
-                let snippet = memo_row_preview(content, &keywords).unwrap_or_else(|| memo_row_header(content));
+                let snippet = memo_row_preview(content, &keywords)
+                    .unwrap_or_else(|| memo_row_header(content));
                 let snippet = build_preview(&snippet, 120);
                 if t.is_empty() {
                     details.push_str(&format!("  - {snippet}\n"));
@@ -6762,7 +6873,7 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
         }
         details.push_str("[命中较多：按月汇总（以 DB 时间为准）]\n");
         let month_count = by_month.len();
-        // 月份太多时只给月汇总（避免再次刷屏）。
+        //（1）月份太多时只给月汇总（避免再次刷屏）。
         let show_days = month_count <= 24;
         for (month, agg) in by_month.iter().rev() {
             details.push_str(&format!(
@@ -6770,7 +6881,7 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
                 agg.hit_days, agg.hit_entries
             ));
             if show_days {
-                // 每月最多列 31 天；这里按日期倒序（已是全局倒序插入），保持即可。
+                //（1）每月最多列 31 天；这里按日期倒序（已是全局倒序插入），保持即可。
                 for (day, entries) in agg.days.iter() {
                     details.push_str(&format!("  - {day} | entries:{entries}\n"));
                 }
@@ -6812,13 +6923,11 @@ fn run_datememo_check(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     out.push_str("next: memory_read(path=datememo, dates=[YYYY-MM-DD])\n");
     out.push_str(details.trim_end());
 
-    // 输出上限：超过阈值则导出到 memory-cache
+    //（1）输出上限：超过阈值则导出到 memory-cache
     let (body2, saved) = maybe_export_text(MEMORY_CACHE_DIR, "datememo_check", &out, 500, 20_000);
     let mut log = format!(
         "状态:0 | 耗时:{}ms | source:sqlite | table:datememo | hit_days:{} | hit_entries:{}",
-        elapsed_ms,
-        hit_days_total,
-        hit_entries_total
+        elapsed_ms, hit_days_total, hit_entries_total
     );
     if let Some(meta) = saved.as_ref() {
         log.push_str(&format!(" | saved:{}", meta.path));
@@ -6851,15 +6960,17 @@ fn normalize_fastmemo_section(raw: &str) -> Option<&'static str> {
     }
     let key = s.to_ascii_lowercase();
     match key.as_str() {
-        // v3 canonical（四区）
+        //（1）v3 canonical（四区）
         "自我感知" | "自我" | "人格" | "风格" | "style" | "self" => Some("自我感知"),
         "用户感知" | "用户" | "画像" | "user" => Some("用户感知"),
         "环境感知" | "环境" | "env" | "system" => Some("环境感知"),
-        "动态上下文" | "动态" | "动态池" | "动态上下文池" | "动态context池" | "动态摘要池" | "contextpool"
-        | "dynamic" => Some("动态上下文"),
-        // 兼容旧名：事件感知 -> 动态上下文
-        "事件感知" | "事件" | "事件池" | "event" | "events" | "history" => Some("动态上下文"),
-        // v1/v2 -> v3 mapping (best-effort)
+        "动态上下文" | "动态" | "动态池" | "动态上下文池" | "动态context池" | "动态摘要池"
+        | "contextpool" | "dynamic" => Some("动态上下文"),
+        //（1）兼容旧名：事件感知 -> 动态上下文
+        "事件感知" | "事件" | "事件池" | "event" | "events" | "history" => {
+            Some("动态上下文")
+        }
+        //（1）v1/v2 -> v3 mapping (best-effort)
         "动态成长人格" => Some("自我感知"),
         "用户感知画像" => Some("用户感知"),
         "人生旅程" | "历史感知" | "里程碑" => Some("动态上下文"),
@@ -6983,8 +7094,8 @@ fn parse_fastmemo_sections(raw: &str) -> std::collections::HashMap<String, Vec<S
         if trimmed.trim_start().starts_with('[') && trimmed.contains(']') {
             let name = normalize_section_name(trimmed);
             if !name.is_empty() {
+                map.entry(name.clone()).or_default();
                 current = Some(name);
-                map.entry(current.clone().unwrap()).or_default();
             }
             continue;
         }
@@ -7018,9 +7129,9 @@ fn migrate_fastmemo_to_v2(raw: &str) -> String {
         }
     }
 
-    // 结构自愈：
-    // - 每区去重（保留最后一次出现）
-    // - 每区最多保留最后 10 条（更贴近“近期有效信息”）
+    //（1）结构自愈：
+    //（2）每区去重（保留最后一次出现）
+    //（3）每区最多保留最后 10 条（更贴近“近期有效信息”）
     for name in fastmemo_section_headers_v3() {
         let items = seed.entry(name).or_default();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -7091,10 +7202,11 @@ fn normalize_fastmemo_content_to_bullets(content: &str) -> Vec<String> {
 fn ensure_fastmemo_section(lines: &mut Vec<String>, section: &str) -> usize {
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.contains(']') {
-            if normalize_fastmemo_section(trimmed) == Some(section) {
-                return idx;
-            }
+        if trimmed.starts_with('[')
+            && trimmed.contains(']')
+            && normalize_fastmemo_section(trimmed) == Some(section)
+        {
+            return idx;
         }
     }
     if !lines.is_empty() && !lines.last().unwrap_or(&String::new()).trim().is_empty() {
@@ -7127,8 +7239,8 @@ fn fastmemo_count_items_in_bounds(lines: &[String], start: usize, end: usize) ->
 
 fn fastmemo_clear_section(lines: &mut Vec<String>, header_idx: usize) {
     let end = fastmemo_next_header_idx(lines, header_idx);
-    // 保留结构：header 后只保留 1 个空行（避免脏结构影响后续插入）。
-    if header_idx + 1 <= end {
+    //（1）保留结构：header 后只保留 1 个空行（避免脏结构影响后续插入）。
+    if header_idx < end {
         lines.splice(header_idx + 1..end, [String::new()]);
     }
 }
@@ -7152,10 +7264,10 @@ fn fastmemo_section_counts(text: &str) -> std::collections::HashMap<&'static str
             current = normalize_fastmemo_section(trimmed);
             continue;
         }
-        if let Some(sec) = current {
-            if trimmed.starts_with("- ") {
-                *counts.entry(sec).or_insert(0) += 1;
-            }
+        if let Some(sec) = current
+            && trimmed.starts_with("- ")
+        {
+            *counts.entry(sec).or_insert(0) += 1;
         }
     }
     for sec in fastmemo_section_headers_v3() {
@@ -7176,27 +7288,27 @@ fn run_memory_add(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     let started = Instant::now();
 
     if label == "metamemo" {
-        // metamemo 由系统自动记录对话；不允许模型手动追加，避免污染/重复与协议混乱。
-        return Ok(tool_format_error("memory_add", "metamemo 不支持 memory_add"));
+        //（1）metamemo 由系统自动记录对话；不允许模型手动追加，避免污染/重复与协议混乱。
+        return Ok(tool_format_error(
+            "memory_add",
+            "metamemo 不支持 memory_add",
+        ));
     }
     if label == "datememo" {
         let kind = MemoKind::Date;
-        let first = content
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("");
+        let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
         let mut ts = String::new();
         let mut speaker = String::new();
         let parts: Vec<&str> = first.split('|').map(|s| s.trim()).collect();
-        if let Some(p) = parts.first() {
-            if !p.is_empty() {
-                ts = p.to_string();
-            }
+        if let Some(p) = parts.first()
+            && !p.is_empty()
+        {
+            ts = p.to_string();
         }
-        if let Some(p) = parts.get(1) {
-            if !p.is_empty() {
-                speaker = p.to_string();
-            }
+        if let Some(p) = parts.get(1)
+            && !p.is_empty()
+        {
+            speaker = p.to_string();
         }
         if ts.is_empty() {
             ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -7233,7 +7345,10 @@ fn run_memory_add(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
     }
 
     if label != "fastmemo" {
-        return Ok(tool_format_error("memory_add", "仅支持 fastmemo/datememo/metamemo"));
+        return Ok(tool_format_error(
+            "memory_add",
+            "仅支持 fastmemo/datememo/metamemo",
+        ));
     }
     ensure_memory_file(&label, &path)?;
     let section_raw = call.section.as_deref().unwrap_or("").trim();
@@ -7310,10 +7425,13 @@ fn run_memory_add(call: &ToolCall) -> anyhow::Result<ToolOutcome> {
             counts.get("环境感知").copied().unwrap_or(0),
             counts.get("动态上下文").copied().unwrap_or(0),
         ),
-        format!("fastmemo_section_usage | section:{} | items:{}/10", section, sec_n),
+        format!(
+            "fastmemo_section_usage | section:{} | items:{}/10",
+            section, sec_n
+        ),
     ];
     if sec_n >= 10 && !compact {
-        // 供 core 层触发“自动压缩”用的标记；不要把它写进正文（避免污染模型输出）。
+        //（1）供 core 层触发“自动压缩”用的标记；不要把它写进正文（避免污染模型输出）。
         log_lines.push("fastmemo_compact_pending:1".to_string());
     }
     Ok(ToolOutcome {
@@ -7384,7 +7502,7 @@ pub(crate) fn ensure_memory_file(label: &str, path: &str) -> anyhow::Result<()> 
         return Ok(());
     }
     if fs::metadata(path).is_ok() {
-        // 结构自愈：任何“非规范 v2”都尝试重建为 v2（尽量保留原有 bullet）。
+        //（1）结构自愈：任何“非规范 v2”都尝试重建为 v2（尽量保留原有 bullet）。
         let text = fs::read_to_string(path).unwrap_or_default();
         if text.trim().is_empty() {
             let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -7396,11 +7514,10 @@ pub(crate) fn ensure_memory_file(label: &str, path: &str) -> anyhow::Result<()> 
             text.trim_start().starts_with("fastmemo v1") || text.contains("[动态成长人格]");
         let is_v3 = is_fastmemo_v3_struct(&text);
         let is_v2 = is_fastmemo_v2_struct(&text);
-        // 兼容：v2 结构将被迁移到 v3；v3 结构保持不动（除非发现未知 section）。
-        let needs_repair =
-            looks_v1 || is_v2 || (!is_v3 && !is_v2) || fastmemo_has_unknown_sections(&text);
+        //（1）兼容：v2 结构将被迁移到 v3；v3 结构保持不动（除非发现未知 section）。
+        let needs_repair = looks_v1 || is_v2 || !is_v3 || fastmemo_has_unknown_sections(&text);
         if needs_repair {
-            // 保护：修复前做一次备份（避免结构修复导致信息丢失）。
+            //（1）保护：修复前做一次备份（避免结构修复导致信息丢失）。
             let now = Local::now().format("%Y%m%d-%H%M%S").to_string();
             let backup = format!("{path}.bak-{now}");
             let _ = fs::copy(path, &backup);
@@ -7652,8 +7769,7 @@ fn memory_label_for_path(path: &str) -> String {
         "metamemo".to_string()
     } else if lower.contains("datememo") {
         "datememo".to_string()
-    
-} else if lower.contains("fastmemo") {
+    } else if lower.contains("fastmemo") {
         "fastmemo".to_string()
     } else {
         String::new()
@@ -7759,11 +7875,17 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
             return String::new();
         }
 
-        // 统一工程根目录显示：. ~ home 都指向 AItermux（显示为 AItermux）
-        // ./system 等价于 AItermux/system（显示为 AItermux/system）
+        //（1）统一工程根目录显示：. ~ home 都指向 AItermux（显示为 AItermux）
+        //（2）./system 等价于 AItermux/system（显示为 AItermux/system）
         //
-        // 注意：这里是“展示规则”，不依赖 $HOME，避免当用户环境的 HOME 被改写时出现 ./system 之类的歧义。
-        if raw == "." || raw == "~" || raw.eq_ignore_ascii_case("home") || raw == "$HOME" || raw == "${HOME}" {
+        //（1）注意：这里是“展示规则”，不依赖 $HOME，
+        //（2）避免当用户环境的 HOME 被改写时出现 ./system 之类的歧义。
+        if raw == "."
+            || raw == "~"
+            || raw.eq_ignore_ascii_case("home")
+            || raw == "$HOME"
+            || raw == "${HOME}"
+        {
             return "AItermux".to_string();
         }
         if let Some(rest) = raw.strip_prefix("./") {
@@ -7821,7 +7943,6 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
         }
         format!("./{display}")
     }
-
 
     fn format_date_range(start: Option<NaiveDate>, end: Option<NaiveDate>) -> Option<String> {
         if start.is_none() && end.is_none() {
@@ -8119,7 +8240,12 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
             build_preview(category, limit)
         }
         "list" => {
-            let op = call.op.as_deref().unwrap_or("dir").trim().to_ascii_lowercase();
+            let op = call
+                .op
+                .as_deref()
+                .unwrap_or("dir")
+                .trim()
+                .to_ascii_lowercase();
             let cwd = call.cwd.as_deref().unwrap_or(".").trim();
             let cwd = if cwd.is_empty() { "." } else { cwd };
             let depth = call.depth.unwrap_or(LIST_MAX_DEPTH_DEFAULT);
@@ -8146,7 +8272,7 @@ fn describe_tool_input(call: &ToolCall, limit: usize) -> String {
 
 pub fn tool_display_label(tool: &str) -> String {
     match tool.trim() {
-        // UI 展示层：直接使用工具名（避免把 bash 显示成 “Run” 造成困惑）
+        //（1）UI 展示层：直接使用工具名（避免把 bash 显示成 “Run” 造成困惑）
         "bash" => "BASH",
         "adb" => "SHELL",
         "termux_api" => "TERMUX",
@@ -8171,22 +8297,23 @@ pub(crate) fn shorten_path(raw: &str) -> String {
     short_tail_path(raw, 2)
 }
 
-// cwd 的展示规则：
-// - 如果在 $HOME 下：显示为 `~` 或 `~/<rel>`（省 token，避免 Android 沙盒长路径）
-// - 否则：显示真实的绝对路径（便于排查/定位）
+//（1）cwd 的展示规则：
+//（2）如果在 $HOME 下：显示为 `~` 或 `~/<rel>`（省 token，避免 Android 沙盒长路径）
+//（3）否则：显示真实的绝对路径（便于排查/定位）
 fn short_cwd_display(raw: &str) -> String {
     let path = raw.trim();
     if path.is_empty() {
         return String::new();
     }
     let mut p = path.to_string();
-    // 将相对路径先解析成绝对（避免 cwd:system 这种歧义）
-    if !p.starts_with('/') && !p.starts_with('~') {
-        if let Ok(base) = std::env::current_dir() {
-            p = base.join(path).to_string_lossy().to_string();
-        }
+    //（1）将相对路径先解析成绝对（避免 cwd:system 这种歧义）
+    if !p.starts_with('/')
+        && !p.starts_with('~')
+        && let Ok(base) = std::env::current_dir()
+    {
+        p = base.join(path).to_string_lossy().to_string();
     }
-    // 尝试 canonicalize（失败则直接用解析后的路径）
+    //（1）尝试 canonicalize（失败则直接用解析后的路径）
     let p = std::fs::canonicalize(&p)
         .ok()
         .and_then(|x| x.to_str().map(|s| s.to_string()))
@@ -8195,7 +8322,8 @@ fn short_cwd_display(raw: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let home = home.trim_end_matches('/').to_string();
     if !home.is_empty() {
-        // 工程根目录优先显示为 AItermux（避免 cwd:~/AItermux 与 cwd:./system 这类歧义）。
+        //（1）工程根目录优先显示为 AItermux（避免 cwd:~/AItermux 与 cwd:./system
+        //（2）这类歧义）。
         let project = format!("{home}/AItermux");
         if p == project {
             return "AItermux".to_string();
@@ -8209,7 +8337,7 @@ fn short_cwd_display(raw: &str) -> String {
             return format!("AItermux/{rest}");
         }
 
-        // 其次才对系统 HOME 做 ~ 显示。
+        //（1）其次才对系统 HOME 做 ~ 显示。
         let home_prefix = format!("{home}/");
         if p == home {
             return "~".to_string();
@@ -8298,7 +8426,7 @@ pub(crate) fn normalize_tool_path(raw: &str) -> String {
         return String::new();
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    // 工程根别名：home -> ~/AItermux
+    //（1）工程根别名：home -> ~/AItermux
     if !home.is_empty() {
         let project = format!("{home}/AItermux");
         if path == "." {
@@ -8318,7 +8446,11 @@ pub(crate) fn normalize_tool_path(raw: &str) -> String {
             }
             return format!("{project}/{rest}");
         }
-        if path == "$HOME" || path == "${HOME}" || path.starts_with("$HOME/") || path.starts_with("${HOME}/") {
+        if path == "$HOME"
+            || path == "${HOME}"
+            || path.starts_with("$HOME/")
+            || path.starts_with("${HOME}/")
+        {
             let rest = path
                 .trim_start_matches("$HOME")
                 .trim_start_matches("${HOME}")
@@ -8511,7 +8643,6 @@ struct PatchReport {
     failed: bool,
 }
 
-
 fn parse_patch_report(body: &str) -> PatchReport {
     let mut report = PatchReport::default();
     for line in body.lines() {
@@ -8583,9 +8714,10 @@ fn run_command_output_with_optional_timeout(
     let timed_out = timeout_used && is_timeout_status(code);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    // Termux 环境下可能存在“被覆盖到 PATH 的不可执行 rg”（例如被某些工具链注入的 musl 二进制）。
-    // 这会导致 search 工具走 rg 时稳定返回 127（cannot execute / required file not found）。
-    // 这里做一次兜底：检测到典型错误后改用 Termux 自带的 rg 路径重试。
+    //（1）Termux 环境下可能存在“被覆盖到 PATH 的不可执行 rg”（例如被某些工具链注入的 musl 二进制）。
+    //（2）这会导致 search 工具走 rg 时稳定返回 127（cannot execute / required
+    //（3）file not found）。
+    //（4）这里做一次兜底：检测到典型错误后改用 Termux 自带的 rg 路径重试。
     if program == "rg"
         && code == 127
         && (stderr.contains("cannot execute") || stderr.contains("required file not found"))

@@ -1,10 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
-use std::io;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -47,12 +43,16 @@ mod ui;
 
 pub(crate) use context::{
     ApiMessage, ContextUsage, DogState, FASTMEMO_PATH, clear_contextmemo, clear_dyncontext_file,
-    contextmemo_size_kb,
-    fastmemo_event_count_and_any_ge10, fastmemo_max_section_usage, load_contextmemo_tokens,
-    log_contextmemo, log_dyncontext, normalize_messages_for_model_context, read_contextmemo_text,
-    read_fastmemo_for_context,
+    contextmemo_size_kb, fastmemo_event_count_and_any_ge10, fastmemo_max_section_usage,
+    load_contextmemo_tokens, log_contextmemo, log_dyncontext, normalize_messages_for_model_context,
+    read_contextmemo_text, read_fastmemo_for_context,
 };
 use providers::DogClient;
+
+// ===== 分区索引 =====
+//（1）入口：run_loop。
+//（2）请求：start_user_chat_request -> provider -> stream。
+//（3）工具：stream_end -> tool -> 回执入 context。
 
 mod messages {
     use crate::mcp::ToolCall;
@@ -75,7 +75,8 @@ mod messages {
     }
 
     fn default_tool_result_assistant() -> String {
-        // 注入到上下文的工具回执头：务必“零歧义”，避免模型误以为还在等待回执。
+        //（1）工具回执头必须零歧义。
+        //（2）避免误判为仍在等待回执。
         "{HEADER}\n{RESULT}".to_string()
     }
 
@@ -101,8 +102,8 @@ mod messages {
     }
 
     fn default_pty_started_model_note() -> String {
-        // 默认不向模型注入“PTY 启动提示”：避免触发模型继续连发工具/PTY。
-        // 启动阶段只需 UI 展示；模型应等待 PTY Done 或 PTY 审计 tick。
+        //（1）默认不注入 PTY 启动提示到模型上下文。
+        //（2）启动阶段只做界面提示；等待 Done 或审计事件。
         String::new()
     }
 
@@ -165,7 +166,8 @@ mod messages {
             input_preview = "（空）".to_string();
         }
 
-        // 兼容旧模板（如仍引用 {CALL_JSON}）：只提供极简一行摘要，避免超行/超长。
+        //（1）兼容旧模板（如引用 {CALL_JSON}）。
+        //（2）仅提供单行摘要，避免过长。
         let call_json = serde_json::json!({
             "tool": call.tool.as_str(),
             "brief": brief,
@@ -185,7 +187,8 @@ mod messages {
             ],
         );
 
-        // 兜底：如果用户自定义模板没写 y/n 提示，仍保证折叠态首行包含（便于手机端操作）。
+        //（1）若模板未写 y/n 提示，补到首行。
+        //（2）保证手机端折叠态可操作。
         if let Some(first) = out.lines().next().map(str::trim).filter(|s| !s.is_empty())
             && first.starts_with("[sys:工具确认]")
             && !first.contains("y确认")
@@ -223,15 +226,15 @@ use crate::messages::{McpMessages, PtyMessages};
 use crate::pseudo_terminal::{
     DrawPtyPanelArgs, HandleAsyncEventPtyJobDoneArgs, HandleAsyncEventPtyReadyArgs,
     HandleAsyncEventPtyToolRequestArgs, HandlePtyViewKeyArgs, PendingPtySnapshot, PtyControl,
-    PtyDoneBatches, PtyDoneFollowup, PtyFocus, PtyUiState, apply_mouse_wheel_to_pty_view,
-    apply_touch_drag_to_pty_view, current_pty_audit_target, defer_pty_audit, draw_pty_panel,
-    handle_async_event_pty_job_done, handle_async_event_pty_output, handle_async_event_pty_ready,
-    handle_async_event_pty_spawned, handle_async_event_pty_tool_request, handle_pty_view_key,
-    is_pty_panel_active, load_pty_help_prompt, load_pty_started_notice_prompt,
-    prune_pending_pty_snapshot, pty_bottom_height, pty_status_line_override,
-    render_pty_audit_prompt, running_owner_count, snap_cursor_out_of_pty_snapshot_placeholder,
-    spawn_interactive_bash_execution, try_remove_pty_snapshot_placeholder_at_cursor,
-    try_show_pty_view_on_home,
+    PtyDoneBatches, PtyDoneFollowup, PtyFocus, PtyUiState, TryShowPtyViewOnHomeArgs,
+    apply_mouse_wheel_to_pty_view, apply_touch_drag_to_pty_view, current_pty_audit_target,
+    defer_pty_audit, draw_pty_panel, handle_async_event_pty_job_done,
+    handle_async_event_pty_output, handle_async_event_pty_ready, handle_async_event_pty_spawned,
+    handle_async_event_pty_tool_request, handle_pty_view_key, is_pty_panel_active,
+    load_pty_help_prompt, load_pty_started_notice_prompt, prune_pending_pty_snapshot,
+    pty_bottom_height, pty_status_line_override, render_pty_audit_prompt, running_owner_count,
+    snap_cursor_out_of_pty_snapshot_placeholder, spawn_interactive_bash_execution,
+    try_remove_pty_snapshot_placeholder_at_cursor, try_show_pty_view_on_home,
 };
 
 pub use crate::commands::CommandSpec;
@@ -239,6 +242,11 @@ use crate::types::{BRIEF_TOOL_MARKER, THINK_TOOL_MARKER, THINKING_MARKER};
 pub use crate::types::{
     ChatFocus, ContextLine, Core, Message, MindKind, Mode, PulseDir, Role, Screen, SettingsFocus,
 };
+
+// ===== 常量 =====
+//（1）预算阈值集中在此。
+//（2）默认偏保守，避免撑爆上下文。
+//（3）具体策略在对应逻辑处解释。
 
 const TOOL_STREAM_PREVIEW_MAX: usize = 8000;
 const TOOL_CALLS_MAX_PER_ASSISTANT_MSG: usize = 3;
@@ -250,12 +258,12 @@ const HEARTBEAT_BANNER: &str = "♡";
 const PTY_SCROLLBACK_MAX: u16 = 3000;
 const PTY_SNAPSHOT_MAX_CHARS: usize = 8000;
 const PTY_DOUBLE_ESC_MS: u64 = 350;
-// 交互 PTY：结束时回传给模型的“可读输出”预算（防止撑爆上下文）。
+//（1）交互 PTY 回传预算，防撑爆上下文。
 const PTY_RETURN_SCREEN_MAX_CHARS: usize = 12_000;
 const PTY_RETURN_RAW_TAIL_BYTES: u64 = 64 * 1024;
 const PTY_RETURN_RAW_TAIL_MAX_CHARS: usize = 6_000;
 const PTY_RETURN_STDIN_MAX_CHARS: usize = 2_000;
-// 与命令类工具的“导出阈值”对齐：避免 PTY Done 回执撑爆上下文。
+//（1）对齐命令类工具导出阈值。
 const PTY_DONE_BATCH_TOOL_MAX_CHARS: usize = 20_000;
 const PTY_DONE_BATCH_TAIL_MAX_CHARS: usize = 1_600;
 const DEFAULT_WELCOME_SHORTCUTS_PROMPT: &str =
@@ -266,14 +274,14 @@ const USER_PTY_SNAPSHOT_MARKER_BEGIN: &str = "[[AITERMUX_PTY_SNAPSHOT_BEGIN|";
 const USER_PTY_SNAPSHOT_MARKER_END: &str = "[[AITERMUX_PTY_SNAPSHOT_END|";
 const USER_PTY_SNAPSHOT_PLACEHOLDER: &str = "〔PTY,Terminal快照〕";
 const MODEL_NOTE_PREFIX: &str = "[[AITERMUX_MODEL_NOTE]]";
-// DeepSeek/Codex 都没有统一的 tool role 方案。
-// 当前策略：
-// - tool call 会从 assistant 正文剥离（避免把 JSON 直接污染聊天内容）；写入“模型上下文”的必须是 assistant 原样 `<tool>...</tool>` 块；
-// - tool result 写入“模型上下文”时必须是协议层标准回执块（带 `[MCP:工具输出code001]...` 头），且不得回灌任何 UI 优化文本；
-// - 请求期允许注入“额外 system 指令”（例如 Context Compact / Mind 协同），但必须：
-//   1) 只注入协议层文本（不包含 UI 渲染产物）
-//   2) 在 contexttest 中可观测
-//   3) 默认不把“占位/伪交互”写进上下文，避免调试漂移与自激循环
+//（1）工具调用只走 `<tool>...</tool>` 原文。
+//（2）工具回执只走 `[MCP:...]` 标准块。
+//（3）占位与伪交互不写入上下文。
+
+// ===== 低层工具 =====
+//（1）进程/IO 等系统级小工具。
+//（2）失败优先静默返回，不影响主流程。
+//（3）仅在必要处调用。
 
 #[cfg(unix)]
 fn set_fd_nonblocking(fd: i32, enabled: bool) {
@@ -358,6 +366,10 @@ fn kill_process_tree(pid: i32, sig: i32, depth: usize) {
     }
 }
 
+// ===== 工具解析（Hint）=====
+//（1）只做轻量扫描，用于 UI/预览。
+//（2）最终解析以完整块为准。
+//（3）失败返回 None，不做纠错。
 fn find_tool_start(text: &str) -> Option<usize> {
     text.find("<tool>")
 }
@@ -366,7 +378,7 @@ fn extract_tool_name_hint(text: &str) -> Option<String> {
     let pos = text.find("\"tool\"")?;
     let rest = &text[pos + "\"tool\"".len()..];
     let mut iter = rest.chars();
-    // skip whitespace until ':'
+    //（1）skip whitespace until ':'
     for ch in iter.by_ref() {
         if ch == ':' {
             break;
@@ -455,7 +467,7 @@ fn build_tool_stream_stub_text(label: &str, tool_slice: &str) -> String {
         .unwrap_or_default();
 
     if input.is_empty() {
-        // 兜底：展示正在输出的 JSON 尾部（压缩空白），用于“跑马提示”。
+        //（1）兜底：展示正在输出的 JSON 尾部（压缩空白），用于“跑马提示”。
         let compact = tool_slice
             .replace('\n', " ")
             .split_whitespace()
@@ -499,7 +511,9 @@ fn normalize_mind_target_kind(raw: &str) -> Option<MindKind> {
     match t.as_str() {
         "dog" | "sub" | "todog" | "to_dog" | "to-dog" | "潜意识" => Some(MindKind::Sub),
         "main" | "tomain" | "to_main" | "to-main" | "主意识" | "萤" => Some(MindKind::Main),
-        "memory" | "mem" | "tomemory" | "to_memory" | "to-memory" | "记忆" => Some(MindKind::Memory),
+        "memory" | "mem" | "tomemory" | "to_memory" | "to-memory" | "记忆" => {
+            Some(MindKind::Memory)
+        }
         _ => None,
     }
 }
@@ -558,6 +572,10 @@ fn open_thinking_tail(raw: &str) -> Option<String> {
     }
 }
 
+// ===== 输入编辑 =====
+//（1）处理粘贴、游标、限长与插入。
+//（2）以手机端体验为优先。
+//（3）不在此处做业务规则。
 fn reset_paste_burst(
     burst_count: &mut usize,
     burst_last_at: &mut Option<Instant>,
@@ -666,7 +684,7 @@ fn build_active_status(args: ActiveStatusArgs<'_>) -> Option<String> {
         return Some(status.to_string());
     }
     if sending_until.is_some_and(|t| now < t) {
-        // 仅 Codex 会设置 sending_until（用于首包/连接期间的体感提示）。
+        //（1）仅 Codex 会设置 sending_until（用于首包/连接期间的体感提示）。
         return Some("Connecting...".to_string());
     }
     if let Some(dir) = mind_pulse {
@@ -695,8 +713,10 @@ fn build_active_status(args: ActiveStatusArgs<'_>) -> Option<String> {
         }
         return Some("Connecting...".to_string());
     }
-    // Codex（Responses API）下的伪流式：状态栏不展示 Thinking/Typing，只展示 Working → brief（持久）。
-    // brief_expected 由 brief 工具占位是否存在决定（仅 Codex 会创建 brief stub）。
+    //（1）Codex Responses：伪流式。
+    //（2）顶栏不显示 Thinking/Typing。
+    //（3）只显示 Working -> brief。
+    //（4）brief_expected 由 brief stub 决定。
     if brief_expected {
         if let Some(header) = status_header_from_brief_text(brief_text) {
             return Some(header);
@@ -748,7 +768,7 @@ fn settings_field_hint(section: SettingsSection, kind: SettingsFieldKind) -> &'s
             SettingsFieldKind::DateKbLimit => "Diary trigger threshold (KB, 0=off)",
             SettingsFieldKind::HeartbeatMinutes => "Heartbeat interval (min, 0=off)",
             SettingsFieldKind::SseEnabled => "Toggle SSE",
-            SettingsFieldKind::ChatTarget => "Switch model (Main/Dog)",
+            SettingsFieldKind::ChatTarget => "Switch tab (Matrix/Dog/Memory)",
             SettingsFieldKind::ExecPermission => "Tool execution permission (safe/full)",
             SettingsFieldKind::DogPrompt => "Edit DOG prompt",
             SettingsFieldKind::MainPrompt => "Edit MAIN prompt",
@@ -1483,7 +1503,7 @@ mod think_association_tests {
         core.push_tool("TOOL: BASH\nEXPLAIN: a\nINPUT: pwd\n".to_string());
         core.push_tool("TOOL: BASH\nEXPLAIN: b\nINPUT: date\n".to_string());
 
-        // Selecting either tool receipt should still associate the same think block.
+        //（1）选中任意 tool 回执，都应关联同一个 think 块。
         assert_eq!(find_think_message_for_selection(&core, 2), Some(1));
         assert_eq!(find_think_message_for_selection(&core, 3), Some(1));
     }
@@ -1645,7 +1665,6 @@ fn load_main_api_config() -> (MainApiConfig, Option<String>, PathBuf) {
     (cfg, err, path_buf)
 }
 
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct MainApiOverrides {
@@ -1689,24 +1708,24 @@ fn merge_main_api_overrides(mut base: MainApiConfig, ov: MainApiOverrides) -> Ma
         }
     };
     let set_opt_u64 = |dst: &mut u64, v: Option<u64>| {
-        if let Some(v) = v {
-            if v > 0 {
-                *dst = v;
-            }
+        if let Some(v) = v
+            && v > 0
+        {
+            *dst = v;
         }
     };
     let set_opt_u32 = |dst: &mut Option<u32>, v: Option<u32>| {
-        if let Some(v) = v {
-            if v > 0 {
-                *dst = Some(v);
-            }
+        if let Some(v) = v
+            && v > 0
+        {
+            *dst = Some(v);
         }
     };
 
-    if let Some(v) = ov.api_key {
-        if !v.trim().is_empty() {
-            base.api_key = Some(v.trim().to_string());
-        }
+    if let Some(v) = ov.api_key
+        && !v.trim().is_empty()
+    {
+        base.api_key = Some(v.trim().to_string());
     }
     set_opt_str(&mut base.provider, ov.provider);
     set_opt_str(&mut base.base_url, ov.base_url);
@@ -1717,9 +1736,7 @@ fn merge_main_api_overrides(mut base: MainApiConfig, ov: MainApiOverrides) -> Ma
             base.reasoning_effort = Some(t);
         }
     }
-    if let Some(v) = ov.temperature {
-        base.temperature = Some(v);
-    }
+    base.temperature = ov.temperature;
     set_opt_u64(&mut base.timeout_secs, ov.timeout_secs);
     set_opt_u32(&mut base.max_tokens, ov.max_tokens);
     if let Some(v) = ov.prompt_path {
@@ -1732,10 +1749,10 @@ fn merge_main_api_overrides(mut base: MainApiConfig, ov: MainApiOverrides) -> Ma
     if let Some(pp) = ov.provider_profiles {
         if let Some(p) = pp.deepseek {
             set_opt_str(&mut base.provider_profiles.deepseek.base_url, p.base_url);
-            if let Some(v) = p.api_key {
-                if !v.trim().is_empty() {
-                    base.provider_profiles.deepseek.api_key = Some(v.trim().to_string());
-                }
+            if let Some(v) = p.api_key
+                && !v.trim().is_empty()
+            {
+                base.provider_profiles.deepseek.api_key = Some(v.trim().to_string());
             }
             set_opt_str(&mut base.provider_profiles.deepseek.model, p.model);
             if let Some(v) = p.reasoning_effort {
@@ -1744,17 +1761,18 @@ fn merge_main_api_overrides(mut base: MainApiConfig, ov: MainApiOverrides) -> Ma
                     base.provider_profiles.deepseek.reasoning_effort = Some(t);
                 }
             }
-            if let Some(v) = p.temperature {
-                base.provider_profiles.deepseek.temperature = Some(v);
-            }
-            set_opt_u32(&mut base.provider_profiles.deepseek.max_tokens, p.max_tokens);
+            base.provider_profiles.deepseek.temperature = p.temperature;
+            set_opt_u32(
+                &mut base.provider_profiles.deepseek.max_tokens,
+                p.max_tokens,
+            );
         }
         if let Some(p) = pp.codex {
             set_opt_str(&mut base.provider_profiles.codex.base_url, p.base_url);
-            if let Some(v) = p.api_key {
-                if !v.trim().is_empty() {
-                    base.provider_profiles.codex.api_key = Some(v.trim().to_string());
-                }
+            if let Some(v) = p.api_key
+                && !v.trim().is_empty()
+            {
+                base.provider_profiles.codex.api_key = Some(v.trim().to_string());
             }
             set_opt_str(&mut base.provider_profiles.codex.model, p.model);
             if let Some(v) = p.reasoning_effort {
@@ -1763,9 +1781,7 @@ fn merge_main_api_overrides(mut base: MainApiConfig, ov: MainApiOverrides) -> Ma
                     base.provider_profiles.codex.reasoning_effort = Some(t);
                 }
             }
-            if let Some(v) = p.temperature {
-                base.provider_profiles.codex.temperature = Some(v);
-            }
+            base.provider_profiles.codex.temperature = p.temperature;
             set_opt_u32(&mut base.provider_profiles.codex.max_tokens, p.max_tokens);
         }
     }
@@ -1774,7 +1790,7 @@ fn merge_main_api_overrides(mut base: MainApiConfig, ov: MainApiOverrides) -> Ma
 }
 
 fn load_memory_api_config(main_cfg: &MainApiConfig) -> (MainApiConfig, Option<String>, PathBuf) {
-    // Memory 默认复用 MAIN 配置（保持同步）。memoryAPI.json 仅作为可选 overrides。
+    //（1）Memory 默认复用 MAIN 配置；memoryAPI.json 可覆盖。
     let path_buf = resolve_config_path_from_env("YING_MEMORY_CONFIG", "config/memoryAPI.json");
     let (mut ov, err) = load_json_config::<MainApiOverrides>(&path_buf, "MEMORY 配置");
     if let Ok(key) =
@@ -1800,7 +1816,7 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
     if cfg.context_k < 8 || cfg.context_k > 1024 {
         cfg.context_k = 128;
     }
-    // 日记压缩阈值：以 contextmemo 文件大小（KB）计算；0 表示关闭自动写日记。
+    //（1）日记压缩阈值：以 contextmemo 文件大小（KB）计算；0 表示关闭自动写日记。
     if cfg.date_kb_limit > 200_000 {
         cfg.date_kb_limit = 256;
     }
@@ -1834,7 +1850,7 @@ fn normalize_common_api_fields(
         if !(0.0..=1.5).contains(&temp) {
             *temperature = None;
         } else if p == "deepseek" && (temp - 1.0).abs() < 1e-6 {
-            // DeepSeek 官方默认 temperature=1。把 1 视为 default（省 token/避免误把 default 当配置）。
+            //（1）DeepSeek temperature 默认 1；把 1 视为默认值。
             *temperature = None;
         }
     }
@@ -1857,7 +1873,8 @@ fn normalize_chat_target_value(raw: &str) -> String {
     match lower.as_str() {
         "main" | "m" => "main".to_string(),
         "dog" | "sub" | "s" => "dog".to_string(),
-        _ => "dog".to_string(),
+        "memory" | "mem" => "memory".to_string(),
+        _ => "main".to_string(),
     }
 }
 
@@ -1871,37 +1888,13 @@ fn normalize_heartbeat_minutes(value: usize) -> usize {
 fn parse_chat_target(raw: &str) -> MindKind {
     match normalize_chat_target_value(raw).as_str() {
         "main" => MindKind::Main,
+        "memory" => MindKind::Memory,
         _ => MindKind::Sub,
     }
 }
 
-fn reset_state_for_target(
-    target: MindKind,
-    dog_state: &mut DogState,
-    main_state: &mut DogState,
-    memory_state: &mut DogState,
-    mind_ctx_idx_main: &mut Option<usize>,
-    mind_ctx_idx_dog: &mut Option<usize>,
-    mind_ctx_idx_memory: &mut Option<usize>,
-) {
-    match target {
-        MindKind::Main => {
-            main_state.reset_context();
-            *mind_ctx_idx_main = None;
-        }
-        MindKind::Sub => {
-            dog_state.reset_context();
-            *mind_ctx_idx_dog = None;
-        }
-        MindKind::Memory => {
-            memory_state.reset_context();
-            *mind_ctx_idx_memory = None;
-        }
-    }
-}
-
 const HEARTBEAT_DEFER_SECS: u64 = 600;
-// 关闭心跳时，把 next_heartbeat_at 推到足够远，避免极端情况下被其它逻辑误触发。
+//（1）关闭心跳时，把 next_heartbeat_at 推到足够远，避免极端情况下被其它逻辑误触发。
 const HEARTBEAT_DISABLED_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 const PTY_AUDIT_INTERVAL_SECS: u64 = 600;
 const PTY_AUDIT_DEFER_SECS: u64 = 120;
@@ -2063,9 +2056,9 @@ fn format_tool_call_preview(call: &ToolCall) -> String {
 }
 
 fn extract_tool_blocks_verbatim(text: &str) -> String {
-    // 从模型原文里提取 <tool>...</tool> 块（逐块拼接），用于“原样回放”进上下文：
-    // - 不注入任何 UI/摘要格式
-    // - 不把工具回执伪装成工具调用
+    //（1）从模型原文里提取 <tool>...</tool> 块（逐块拼接），用于“原样回放”进上下文：
+    //（2）不注入任何 UI/摘要格式
+    //（3）不把工具回执伪装成工具调用
     let mut out: Vec<String> = Vec::new();
     let mut rest = text;
     loop {
@@ -2131,10 +2124,10 @@ fn record_request_in_tokens(
 }
 
 fn format_chat_target(raw: &str) -> String {
-    if normalize_chat_target_value(raw) == "main" {
-        "MAIN".to_string()
-    } else {
-        "MEMORY".to_string()
+    match normalize_chat_target_value(raw).as_str() {
+        "main" => "MAIN".to_string(),
+        "memory" => "MEMORY".to_string(),
+        _ => "DOG".to_string(),
     }
 }
 
@@ -2189,8 +2182,7 @@ fn load_pty_audit_prompt(sys_cfg: &SystemConfig) -> (String, Option<String>, Pat
     (text, err, path)
 }
 
-const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str =
-    "系统：fastmemo 某分区已达到10条，需要压缩（由 MEMORY 执行）。\n\n目标：只压缩1个分区，然后停止。\n步骤：\n1 调用 memory_read(path=fastmemo) 读取原文\n2 找到条目数>=10的第一个分区，优先级：自我感知>用户感知>环境感知>动态上下文\n3 将该分区10条压缩为1条 bullet（长期稳定/可复用/关键信息；不确定丢弃；不要写回大段日志/代码）\n4 调用 memory_add(path=fastmemo, section=..., compact=true, content=\"- ...\") 写回";
+const DEFAULT_FASTMEMO_COMPACT_PROMPT: &str = "系统：fastmemo 某分区已达到10条，需要压缩（由 MEMORY 执行）。\n\n目标：只压缩1个分区，然后停止。\n步骤：\n1 调用 memory_read(path=fastmemo) 读取原文\n2 找到条目数>=10的第一个分区，优先级：自我感知>用户感知>环境感知>动态上下文\n3 将该分区10条压缩为1条 bullet（长期稳定/可复用/关键信息；不确定丢弃；不要写回大段日志/代码）\n4 调用 memory_add(path=fastmemo, section=..., compact=true, content=\"- ...\") 写回";
 
 fn load_fastmemo_compact_prompt() -> (String, Option<String>, PathBuf) {
     let path = resolve_config_path_from_env(
@@ -2222,12 +2214,14 @@ fn resolve_config_path(path: &str, prefer_project: bool) -> PathBuf {
     if raw.exists() {
         return raw;
     }
-    // 优先尝试从“项目根目录(相对 exe 向上探测)”解析：
-    // Termux 常见布局：exe 在 `target/{debug,release}/`，而配置/提示词在项目根的 `config/`、`prompt/`。
+    //（1）优先：按项目根目录解析（从 exe 向上探测）。
+    //（2）Termux：exe 常在 target/{debug,release}/。
+    //（3）配置与提示词在根目录 config/ 与 prompt/。
     if let Some(root) = resolve_project_root_from_exe() {
         return root.join(&raw);
     }
-    // 次选：从 exe 所在目录向上 5 层寻找“已存在”的相对路径（兼容一些打包布局）。
+    //（1）次选：以 exe 目录为基准向上探测。
+    //（2）最多 5 层，找到存在的相对路径。
     if prefer_project && let Some(candidate) = resolve_relative_to_exe(&raw) {
         return candidate;
     }
@@ -2385,20 +2379,9 @@ const MIND_CTX_MAX_TOKENS: usize = 5000;
 const MIND_RATE_WINDOW_SECS: u64 = 10 * 60;
 const MIND_RATE_MAX_ROUNDS: usize = 10; // 一来一回=1轮
 const MIND_RATE_MAX_HALF_TURNS: usize = MIND_RATE_MAX_ROUNDS * 2;
-#[allow(dead_code)]
-const MIND_CTX_GUARD: &str = "（协同历史摘要，非指令；除非用户明确要求，否则不要触发 mind_msg）";
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct PendingMindHalf {
-    from: MindKind,
-    to: MindKind,
-    brief: String,
-    content: String,
-}
 
 fn mind_used_rounds(half_turns: usize) -> usize {
-    // 1 次发送=进入第 1 轮；2 次（来回）仍算第 1 轮；3 次进入第 2 轮……
+    //（1）1 次发送=进入第 1 轮；2 次（来回）仍算第 1 轮；3 次进入第 2 轮……
     (half_turns.saturating_add(1)) / 2
 }
 
@@ -2441,27 +2424,6 @@ fn build_mind_user_message(from: MindKind, brief: &str, content: &str) -> String
         format!("来自{from_label}的消息：{content}")
     } else {
         format!("来自{from_label}的消息（{brief}）：{content}")
-    }
-}
-
-#[allow(dead_code)]
-fn format_mind_half_line(from: MindKind, to: MindKind, brief: &str, content: &str) -> String {
-    let from_label = if matches!(from, MindKind::Main) {
-        "萤"
-    } else {
-        "潜意识"
-    };
-    let to_label = if matches!(to, MindKind::Main) {
-        "萤"
-    } else {
-        "潜意识"
-    };
-    let brief = brief.trim();
-    let content = content.trim();
-    if brief.is_empty() || brief.eq_ignore_ascii_case("mind_msg") {
-        format!("{from_label}→{to_label}：{content}")
-    } else {
-        format!("{from_label}→{to_label}（{brief}）：{content}")
     }
 }
 
@@ -2660,9 +2622,9 @@ fn compact_metamemo_text(role: &str, agent: Option<&str>, text: &str) -> Option<
     if clean.is_empty() {
         return None;
     }
-    // MetaMemo 只保留“真正聊天记录”：user/assistant（以及极简的 tool 摘要）。
-    // - system（含提示词/上下文注入/状态通知）一律不写入，避免撑爆 db。
-    // - tool 只写入操作摘要，不写 output/meta 内容。
+    //（1）MetaMemo 只保留“真正聊天记录”：user/assistant（以及极简的 tool 摘要）。
+    //（2）system（含提示词/上下文注入/状态通知）一律不写入，避免撑爆 db。
+    //（3）tool 只写入操作摘要，不写 output/meta 内容。
     if role == "system" {
         return None;
     }
@@ -2678,15 +2640,15 @@ fn compact_metamemo_text(role: &str, agent: Option<&str>, text: &str) -> Option<
     if role == "user" {
         let cmd = clean.trim();
         let lower = cmd.to_ascii_lowercase();
-        // 明确的 UI 指令不属于“聊天内容”，不进 MetaMemo。
+        //（1）明确的 UI 指令不属于“聊天内容”，不进 MetaMemo。
         if lower == "/quit"
             || lower == "/q"
             || lower == "/cmd"
             || lower == "/settings"
-            || lower.starts_with("/turn ")
-            || lower.starts_with("/trun ")
-            || lower.starts_with("/switch ")
             || lower.starts_with("/sse ")
+            || lower == "/help"
+            || lower == "/terminal"
+            || lower == "/term"
         {
             return None;
         }
@@ -2700,7 +2662,7 @@ fn summarize_tool_for_metamemo(text: &str, agent: Option<&str>) -> Option<String
     if clean.is_empty() {
         return None;
     }
-    // 仅保留 tool 头部信息：操作/说明/input/mind，并在 output/meta 前截止。
+    //（1）仅保留 tool 头部信息：操作/说明/input/mind，并在 output/meta 前截止。
     let mut parts: Vec<String> = Vec::new();
     let mut tool_name: Option<String> = None;
     let agent = agent.unwrap_or("");
@@ -2835,7 +2797,7 @@ fn read_tail_text(path: &str, max_bytes: u64) -> Option<String> {
     }
     let mut buf = Vec::new();
     let _ = f.read_to_end(&mut buf).ok()?;
-    // raw PTY bytes 可能含 ANSI/不可见控制符：这里不强行剥离，只做 lossy 解码与 NUL 清理。
+    //（1）PTY 原始字节可能含控制符；仅做 lossy 解码与 NUL 清理。
     let mut s = String::from_utf8_lossy(&buf).to_string();
     s.retain(|ch| ch != '\u{0}');
     Some(s)
@@ -2912,6 +2874,7 @@ fn summarize_api_error_for_user(raw: &str) -> String {
     format!("{reason}（ID:{id}）")
 }
 
+// ===== 工具链（Tool Stream 状态机 + 回执注入 + 续跑）=====
 struct ToolStreamState {
     idx: usize,
     owner: MindKind,
@@ -2933,24 +2896,6 @@ enum ApiConfigKind {
     Main,
     Dog,
     Memory,
-}
-
-#[allow(dead_code)]
-fn api_kind_label(kind: ApiConfigKind) -> &'static str {
-    match kind {
-        ApiConfigKind::Main => "主",
-        ApiConfigKind::Dog => "辅",
-        ApiConfigKind::Memory => "记忆",
-    }
-}
-
-#[allow(dead_code)]
-fn next_api_kind(kind: ApiConfigKind) -> ApiConfigKind {
-    match kind {
-        ApiConfigKind::Main => ApiConfigKind::Dog,
-        ApiConfigKind::Dog => ApiConfigKind::Memory,
-        ApiConfigKind::Memory => ApiConfigKind::Main,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3052,13 +2997,21 @@ fn settings_tab_index_for_click(
         let label_w = UnicodeWidthStr::width(label.as_str());
         let gap_w = 2usize;
         if !use_second {
-            let needed = if width1 == 0 { label_w } else { label_w.saturating_add(gap_w) };
+            let needed = if width1 == 0 {
+                label_w
+            } else {
+                label_w.saturating_add(gap_w)
+            };
             if width1.saturating_add(needed) > max_w && width1 > 0 {
                 use_second = true;
             }
         }
         if use_second {
-            let start = if width2 == 0 { 0 } else { width2.saturating_add(gap_w) };
+            let start = if width2 == 0 {
+                0
+            } else {
+                width2.saturating_add(gap_w)
+            };
             let end = start.saturating_add(label_w);
             if line == 1 {
                 let c = rel_col as usize;
@@ -3068,7 +3021,11 @@ fn settings_tab_index_for_click(
             }
             width2 = end;
         } else {
-            let start = if width1 == 0 { 0 } else { width1.saturating_add(gap_w) };
+            let start = if width1 == 0 {
+                0
+            } else {
+                width1.saturating_add(gap_w)
+            };
             let end = start.saturating_add(label_w);
             if line == 0 {
                 let c = rel_col as usize;
@@ -3181,7 +3138,7 @@ fn materialize_placeholders(base: &str, pairs: &[(String, String)]) -> String {
             out.push_str(actual);
             idx = pos.saturating_add(ph.len());
         } else {
-            // 不应发生：兜底避免死循环
+            //（1）不应发生：兜底避免死循环
             out.push_str(&base[idx..]);
             break;
         }
@@ -3189,16 +3146,28 @@ fn materialize_placeholders(base: &str, pairs: &[(String, String)]) -> String {
     out
 }
 
-fn drain_input_for_send(
-    input: &mut String,
-    cursor: &mut usize,
-    input_chars: &mut usize,
-    last_input_at: &mut Option<Instant>,
-    pending_pastes: &mut Vec<(String, String)>,
-    paste_capture: &mut Option<PasteCapture>,
-    command_menu_suppress: &mut bool,
-    pending_pty_snapshot: &mut Option<PendingPtySnapshot>,
-) -> DrainedSendText {
+struct DrainInputForSendArgs<'a> {
+    input: &'a mut String,
+    cursor: &'a mut usize,
+    input_chars: &'a mut usize,
+    last_input_at: &'a mut Option<Instant>,
+    pending_pastes: &'a mut Vec<(String, String)>,
+    paste_capture: &'a mut Option<PasteCapture>,
+    command_menu_suppress: &'a mut bool,
+    pending_pty_snapshot: &'a mut Option<PendingPtySnapshot>,
+}
+
+fn drain_input_for_send(args: DrainInputForSendArgs<'_>) -> DrainedSendText {
+    let DrainInputForSendArgs {
+        input,
+        cursor,
+        input_chars,
+        last_input_at,
+        pending_pastes,
+        paste_capture,
+        command_menu_suppress,
+        pending_pty_snapshot,
+    } = args;
     let base = input.trim_end().to_string();
     let mut ui_text = base.clone();
     let mut placeholders: Vec<(String, String)> = Vec::new();
@@ -3209,7 +3178,7 @@ fn drain_input_for_send(
             let chars = count_chars(actual);
             let lines = actual.lines().count().max(1);
 
-            // UI：隐藏原文（展开时可见）
+            //（1）UI：隐藏原文（展开时可见）
             ui_text.push_str("\n\n");
             ui_text.push_str(&format!(
                 "{USER_PASTE_MARKER_BEGIN}id={id}|lines={lines}|chars={chars}|saved=]]\n"
@@ -3218,8 +3187,8 @@ fn drain_input_for_send(
             ui_text.push('\n');
             ui_text.push_str(&format!("{USER_PASTE_MARKER_END}id={id}]]"));
 
-            // 发给模型：必须是粘贴原文（协议层原文），禁止只发摘要/路径，
-            // 否则会造成“模型没收到原文”的错觉，并导致后续分析/修复偏离。
+            //（1）发给模型：必须是粘贴原文（协议层原文），禁止只发摘要/路径，
+            //（2）否则会造成“模型没收到原文”的错觉，并导致后续分析/修复偏离。
             placeholders.push((ph.clone(), actual.clone()));
         }
     }
@@ -3299,7 +3268,8 @@ fn commit_settings_input(args: CommitSettingsInputArgs<'_>) {
     let CommitSettingsInputArgs {
         kind,
         section,
-        api_kind,        buffer,
+        api_kind,
+        buffer,
         settings,
         now,
         dog_cfg,
@@ -3331,7 +3301,8 @@ fn commit_settings_input(args: CommitSettingsInputArgs<'_>) {
     apply_settings_with_notice(ApplySettingsWithNoticeArgs {
         kind,
         section,
-        api_kind,        value: buffer,
+        api_kind,
+        value: buffer,
         settings,
         now,
         dog_cfg,
@@ -3802,17 +3773,20 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 value: summarize_prompt(dog_prompt_text),
                 kind: SettingsFieldKind::DogPrompt,
                 api_kind: None,
-                },            SettingsFieldSpec {
+            },
+            SettingsFieldSpec {
                 label: "2 MAIN prompt",
                 value: summarize_prompt(main_prompt_text),
                 kind: SettingsFieldKind::MainPrompt,
                 api_kind: None,
-                },            SettingsFieldSpec {
+            },
+            SettingsFieldSpec {
                 label: "3 MAIN Context",
                 value: summarize_prompt(&context_prompts.main_prompt),
                 kind: SettingsFieldKind::ContextMainPrompt,
                 api_kind: None,
-                },        ],
+            },
+        ],
     }
 }
 
@@ -3878,25 +3852,52 @@ fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
         },
         SettingsFieldKind::ReasoningEffort => match section {
             SettingsSection::Api => match api_kind {
-                ApiConfigKind::Main => normalize_reasoning_effort_or_default(main_cfg.reasoning_effort.as_deref()).to_string(),
-                ApiConfigKind::Dog => normalize_reasoning_effort_or_default(dog_cfg.reasoning_effort.as_deref()).to_string(),
-                ApiConfigKind::Memory => normalize_reasoning_effort_or_default(memory_cfg.reasoning_effort.as_deref()).to_string(),
+                ApiConfigKind::Main => {
+                    normalize_reasoning_effort_or_default(main_cfg.reasoning_effort.as_deref())
+                        .to_string()
+                }
+                ApiConfigKind::Dog => {
+                    normalize_reasoning_effort_or_default(dog_cfg.reasoning_effort.as_deref())
+                        .to_string()
+                }
+                ApiConfigKind::Memory => {
+                    normalize_reasoning_effort_or_default(memory_cfg.reasoning_effort.as_deref())
+                        .to_string()
+                }
             },
             _ => "high".to_string(),
         },
         SettingsFieldKind::Temperature => match section {
             SettingsSection::Api => match api_kind {
-                ApiConfigKind::Main => main_cfg.temperature.map(|t| t.to_string()).unwrap_or_default(),
-                ApiConfigKind::Dog => dog_cfg.temperature.map(|t| t.to_string()).unwrap_or_default(),
-                ApiConfigKind::Memory => memory_cfg.temperature.map(|t| t.to_string()).unwrap_or_default(),
+                ApiConfigKind::Main => main_cfg
+                    .temperature
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
+                ApiConfigKind::Dog => dog_cfg
+                    .temperature
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
+                ApiConfigKind::Memory => memory_cfg
+                    .temperature
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
             },
             _ => String::new(),
         },
         SettingsFieldKind::MaxTokens => match section {
             SettingsSection::Api => match api_kind {
-                ApiConfigKind::Main => main_cfg.max_tokens.map(|v| v.to_string()).unwrap_or_default(),
-                ApiConfigKind::Dog => dog_cfg.max_tokens.map(|v| v.to_string()).unwrap_or_default(),
-                ApiConfigKind::Memory => memory_cfg.max_tokens.map(|v| v.to_string()).unwrap_or_default(),
+                ApiConfigKind::Main => main_cfg
+                    .max_tokens
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                ApiConfigKind::Dog => dog_cfg
+                    .max_tokens
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                ApiConfigKind::Memory => memory_cfg
+                    .max_tokens
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
             },
             _ => String::new(),
         },
@@ -3956,9 +3957,16 @@ fn selected_reasoning_effort(
     memory_cfg: &MainApiConfig,
 ) -> String {
     match api_kind {
-        ApiConfigKind::Dog => normalize_reasoning_effort_or_default(dog_cfg.reasoning_effort.as_deref()).to_string(),
-        ApiConfigKind::Main => normalize_reasoning_effort_or_default(main_cfg.reasoning_effort.as_deref()).to_string(),
-        ApiConfigKind::Memory => normalize_reasoning_effort_or_default(memory_cfg.reasoning_effort.as_deref()).to_string(),
+        ApiConfigKind::Dog => {
+            normalize_reasoning_effort_or_default(dog_cfg.reasoning_effort.as_deref()).to_string()
+        }
+        ApiConfigKind::Main => {
+            normalize_reasoning_effort_or_default(main_cfg.reasoning_effort.as_deref()).to_string()
+        }
+        ApiConfigKind::Memory => {
+            normalize_reasoning_effort_or_default(memory_cfg.reasoning_effort.as_deref())
+                .to_string()
+        }
     }
 }
 
@@ -4109,10 +4117,10 @@ struct ApplySettingsEditArgs<'a> {
     sys_cfg_path: &'a Path,
     dog_state: &'a mut DogState,
     main_state: &'a mut DogState,
-    memory_state: &'a mut DogState,
-    mind_ctx_idx_main: &'a mut Option<usize>,
-    mind_ctx_idx_dog: &'a mut Option<usize>,
-    mind_ctx_idx_memory: &'a mut Option<usize>,
+    _memory_state: &'a mut DogState,
+    _mind_ctx_idx_main: &'a mut Option<usize>,
+    _mind_ctx_idx_dog: &'a mut Option<usize>,
+    _mind_ctx_idx_memory: &'a mut Option<usize>,
     main_prompt_text: &'a mut String,
     dog_client: &'a mut Option<DogClient>,
     main_client: &'a mut Option<DogClient>,
@@ -4127,7 +4135,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
     let ApplySettingsEditArgs {
         kind,
         section,
-        api_kind,        value,
+        api_kind,
+        value,
         dog_cfg,
         main_cfg,
         memory_cfg,
@@ -4138,10 +4147,10 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
         sys_cfg_path,
         dog_state,
         main_state,
-        memory_state,
-        mind_ctx_idx_main,
-        mind_ctx_idx_dog,
-        mind_ctx_idx_memory,
+        _memory_state: _,
+        _mind_ctx_idx_main: _,
+        _mind_ctx_idx_dog: _,
+        _mind_ctx_idx_memory: _,
         main_prompt_text,
         dog_client,
         main_client,
@@ -4180,7 +4189,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                         save_active_to_profile_main(memory_cfg);
                         memory_cfg.provider = next.clone();
                         apply_profile_to_active_main(memory_cfg);
-                        store_config_file(memory_cfg_path, memory_cfg).map_err(|e| e.to_string())?;
+                        store_config_file(memory_cfg_path, memory_cfg)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -4204,7 +4214,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                     ApiConfigKind::Memory => {
                         memory_cfg.base_url = trimmed.to_string();
                         save_active_to_profile_main(memory_cfg);
-                        store_config_file(memory_cfg_path, memory_cfg).map_err(|e| e.to_string())?;
+                        store_config_file(memory_cfg_path, memory_cfg)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -4230,7 +4241,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                     ApiConfigKind::Memory => {
                         memory_cfg.api_key = next;
                         save_active_to_profile_main(memory_cfg);
-                        store_config_file(memory_cfg_path, memory_cfg).map_err(|e| e.to_string())?;
+                        store_config_file(memory_cfg_path, memory_cfg)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -4254,7 +4266,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                     ApiConfigKind::Memory => {
                         memory_cfg.model = trimmed.to_string();
                         save_active_to_profile_main(memory_cfg);
-                        store_config_file(memory_cfg_path, memory_cfg).map_err(|e| e.to_string())?;
+                        store_config_file(memory_cfg_path, memory_cfg)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -4282,7 +4295,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                     ApiConfigKind::Memory => {
                         memory_cfg.reasoning_effort = Some(next);
                         save_active_to_profile_main(memory_cfg);
-                        store_config_file(memory_cfg_path, memory_cfg).map_err(|e| e.to_string())?;
+                        store_config_file(memory_cfg_path, memory_cfg)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -4294,12 +4308,11 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                 let t: f32 = trimmed.parse().map_err(|_| "温度需为数字".to_string())?;
                 if !(0.0..=1.5).contains(&t) {
                     return Err("温度范围 0~1.5".to_string());
+                }
+                if (t - 1.0).abs() < 1e-6 {
+                    None
                 } else {
-                    if (t - 1.0).abs() < 1e-6 {
-                        None
-                    } else {
-                        Some(t)
-                    }
+                    Some(t)
                 }
             };
             if matches!(section, SettingsSection::Api) {
@@ -4317,7 +4330,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                     ApiConfigKind::Memory => {
                         memory_cfg.temperature = next;
                         save_active_to_profile_main(memory_cfg);
-                        store_config_file(memory_cfg_path, memory_cfg).map_err(|e| e.to_string())?;
+                        store_config_file(memory_cfg_path, memory_cfg)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -4347,7 +4361,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                     ApiConfigKind::Memory => {
                         memory_cfg.max_tokens = Some(v);
                         save_active_to_profile_main(memory_cfg);
-                        store_config_file(memory_cfg_path, memory_cfg).map_err(|e| e.to_string())?;
+                        store_config_file(memory_cfg_path, memory_cfg)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -4359,9 +4374,7 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             let raw = trimmed
                 .trim_end_matches(['k', 'K', 'b', 'B'])
                 .trim_end_matches(['k', 'K']); // 兼容输入 "256KB"/"256k"
-            let v: usize = raw
-                .parse()
-                .map_err(|_| "日记阈值需为数字".to_string())?;
+            let v: usize = raw.parse().map_err(|_| "日记阈值需为数字".to_string())?;
             if v > 200_000 {
                 return Err("日记阈值范围 0~200000KB（0=关闭）".to_string());
             }
@@ -4406,26 +4419,16 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
         }
         SettingsFieldKind::ChatTarget => {
             let next = if trimmed.is_empty() {
-                if normalize_chat_target_value(&sys_cfg.chat_target) == "main" {
-                    "dog".to_string()
-                } else {
-                    "main".to_string()
+                match normalize_chat_target_value(&sys_cfg.chat_target).as_str() {
+                    "main" => "dog".to_string(),
+                    "dog" => "memory".to_string(),
+                    _ => "main".to_string(),
                 }
             } else {
                 normalize_chat_target_value(trimmed)
             };
             sys_cfg.chat_target = next;
             store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
-            let target = parse_chat_target(&sys_cfg.chat_target);
-            reset_state_for_target(
-                target,
-                dog_state,
-                main_state,
-                memory_state,
-                mind_ctx_idx_main,
-                mind_ctx_idx_dog,
-                mind_ctx_idx_memory,
-            );
         }
         SettingsFieldKind::DogPrompt => {
             let text = value.to_string();
@@ -4448,7 +4451,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
         }
     }
 
-    if matches!(section, SettingsSection::Api) && matches!(api_kind, ApiConfigKind::Dog)
+    if matches!(section, SettingsSection::Api)
+        && matches!(api_kind, ApiConfigKind::Dog)
         && matches!(
             kind,
             SettingsFieldKind::Provider
@@ -4471,7 +4475,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             }
         }
     }
-    if matches!(section, SettingsSection::Api) && matches!(api_kind, ApiConfigKind::Main)
+    if matches!(section, SettingsSection::Api)
+        && matches!(api_kind, ApiConfigKind::Main)
         && matches!(
             kind,
             SettingsFieldKind::Provider
@@ -4494,7 +4499,8 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             }
         }
     }
-    if matches!(section, SettingsSection::Api) && matches!(api_kind, ApiConfigKind::Memory)
+    if matches!(section, SettingsSection::Api)
+        && matches!(api_kind, ApiConfigKind::Memory)
         && matches!(
             kind,
             SettingsFieldKind::Provider
@@ -4556,7 +4562,8 @@ fn apply_settings_with_notice(args: ApplySettingsWithNoticeArgs<'_>) {
     let ApplySettingsWithNoticeArgs {
         kind,
         section,
-        api_kind,        value,
+        api_kind,
+        value,
         settings,
         now,
         dog_cfg,
@@ -4586,7 +4593,8 @@ fn apply_settings_with_notice(args: ApplySettingsWithNoticeArgs<'_>) {
     match apply_settings_edit(ApplySettingsEditArgs {
         kind,
         section,
-        api_kind,        value,
+        api_kind,
+        value,
         dog_cfg,
         main_cfg,
         memory_cfg,
@@ -4597,10 +4605,10 @@ fn apply_settings_with_notice(args: ApplySettingsWithNoticeArgs<'_>) {
         sys_cfg_path,
         dog_state,
         main_state,
-        memory_state,
-        mind_ctx_idx_main,
-        mind_ctx_idx_dog,
-        mind_ctx_idx_memory,
+        _memory_state: memory_state,
+        _mind_ctx_idx_main: mind_ctx_idx_main,
+        _mind_ctx_idx_dog: mind_ctx_idx_dog,
+        _mind_ctx_idx_memory: mind_ctx_idx_memory,
         main_prompt_text,
         dog_client,
         main_client,
@@ -4798,7 +4806,6 @@ struct StartUserChatRequestArgs<'a> {
     core: &'a mut Core,
     metamemo: &'a mut Option<MetaMemo>,
     context_usage: &'a mut ContextUsage,
-    pending_mind_half: &'a mut Option<PendingMindHalf>,
     dog_state: &'a mut DogState,
     main_state: &'a mut DogState,
     memory_state: &'a mut DogState,
@@ -4834,6 +4841,7 @@ struct StartUserChatRequestArgs<'a> {
     memory_client: &'a Option<DogClient>,
 }
 
+// ===== 请求生命周期（用户输入 -> 上下文快照 -> provider 请求 -> 流式事件）=====
 fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result<()> {
     let StartUserChatRequestArgs {
         now,
@@ -4844,7 +4852,6 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
         core,
         metamemo,
         context_usage,
-        pending_mind_half,
         dog_state,
         main_state,
         memory_state,
@@ -4885,16 +4892,18 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
     if model_text.trim().is_empty() {
         return Ok(());
     }
-    // Memory 测试入口：发送 `test` 给 Memory 时，直接把主 contextmemo 填充到 Date 阈值，
-    // 以验证“计数→触发写日记→写入 datememo→清空 contextmemo”的闭环。
-    //
-    // 注意：
-    // - 写入内容带 `[TEST-FILL]` 标记；datesummary 提示词会明确要求忽略这些行。
-    // - 本次不向模型发起对话请求，只触发“即将写日记”的条件。
+    //（1）Memory 测试入口：输入 test 直接填充 Date 计数到阈值。
+    //（2）验证：计数 -> 写日记 -> 写入 datememo -> 清空 contextmemo。
+    //（3）写入带 [TEST-FILL] 标记；datesummary 会要求忽略。
+    //（4）本次不发起对话请求，只触发写日记条件。
     if target == MindKind::Memory && model_text.trim().eq_ignore_ascii_case("test") {
         let kb_limit = sys_cfg.date_kb_limit;
         if kb_limit > 0 {
-            fill_contextmemo_to_kb_limit_for_test(&config.contextmemo_path, context_usage, kb_limit);
+            fill_contextmemo_to_kb_limit_for_test(
+                &config.contextmemo_path,
+                context_usage,
+                kb_limit,
+            );
         }
         core.history.push(Message {
             role: Role::System,
@@ -4905,17 +4914,16 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
         *follow_bottom = true;
         return Ok(());
     }
-    // Internal DeepSeek role-needed placeholder:
-    // - Not shown in chat UI (ui_text is empty already)
-    // - Must not be written into long-term model context (DogState/memos)
-    //
-    // Providers will still append a tail placeholder at request time if needed.
+    //（1）DeepSeek role-needed 内部占位符（协议需要）。
+    //（2）UI 不显示（ui_text 为空）。
+    //（3）不得写入长期上下文（DogState/memo）。
+    //（4）尾占位由 provider 在请求期按需追加。
     let internal_role_needed_placeholder =
         ui_text.trim().is_empty() && crate::context::is_role_needed_user_placeholder(&model_text);
     *active_request_is_internal_placeholder = internal_role_needed_placeholder;
-    let _ = pending_mind_half.take();
 
-    // Memory 专属聊天界面：用户输入不进入主聊天时间线（避免污染），改为写入 Memory 频道。
+    //（1）Memory 专属聊天：用户输入写入 Memory 频道。
+    //（2）不进入主聊天时间线，避免污染。
     if target == MindKind::Memory && !ui_text.trim().is_empty() {
         core.history.push(Message {
             role: Role::User,
@@ -4929,9 +4937,9 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
     thinking_full_text.clear();
     *thinking_started_at = None;
     *thinking_pending_idle = false;
-    // 统一由 ModelStreamStart 决定是否插入 think/brief/working 占位：
-    // - 避免在这里“预判 provider”导致 Codex/DeepSeek 状态不一致，从而出现双占位（Thinking... + Working...）；
-    // - 也避免后续新增 provider 时漏改这里造成回归。
+    //（1）占位由 ModelStreamStart 决定（think/brief/working）。
+    //（2）避免预判 provider 导致双占位或状态不一致。
+    //（3）减少新增 provider 时的漏改风险。
     *thinking_in_progress = false;
     *thinking_idx = None;
 
@@ -4955,7 +4963,7 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
     }
 
     defer_heartbeat(next_heartbeat_at, now);
-    // 保留用户展开状态：发送新消息不应强制把 Tab/Shift+Tab 的展开形态重置。
+    //（1）保留用户展开状态：发送新消息不应强制把 Tab/Shift+Tab 的展开形态重置。
     *scroll = u16::MAX;
     *follow_bottom = true;
 
@@ -5031,251 +5039,6 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
             core,
             token_totals,
             token_total_path,
-            context_usage,
-            active_request_in_tokens,
-            in_tokens,
-        );
-    } else {
-        *mode = Mode::Idle;
-        let label = mind_label(target);
-        let msg = format!("{label} 未配置 API Key，无法请求。");
-        push_system_and_log(core, metamemo, context_usage, None, &msg);
-        push_sys_log(
-            sys_log,
-            config.sys_log_limit,
-            format!("{label}: 未配置 API Key"),
-        );
-    }
-    Ok(())
-}
-
-#[allow(dead_code, unused_variables, clippy::too_many_arguments)]
-fn handle_send_text(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    now: Instant,
-    send: String,
-    target: MindKind,
-    core: &mut Core,
-    render_cache: &mut ui::ChatRenderCache,
-    metamemo: &mut Option<MetaMemo>,
-    context_usage: &mut ContextUsage,
-    mode: &mut Mode,
-    active_kind: &mut MindKind,
-    chat_target: &mut MindKind,
-    dog_state: &mut DogState,
-    main_state: &mut DogState,
-    memory_state: &mut DogState,
-    mind_ctx_idx_main: &mut Option<usize>,
-    mind_ctx_idx_dog: &mut Option<usize>,
-    mind_ctx_idx_memory: &mut Option<usize>,
-    screen: &mut Screen,
-    help_ui: &mut HelpUiState,
-    should_exit: &mut bool,
-    sse_enabled: &mut bool,
-    pending_cmd_shell: &mut bool,
-    exit_code: &mut i32,
-    sys_cfg: &mut SystemConfig,
-    sys_cfg_path: &Path,
-    sys_log: &mut VecDeque<String>,
-    config: &AppConfig,
-    tx: &mpsc::Sender<AsyncEvent>,
-    pending_tools: &mut VecDeque<ToolCall>,
-    pending_tool_confirm: &mut Option<(ToolCall, String, usize)>,
-    request_seq: &mut u64,
-    active_request_id: &mut Option<u64>,
-    active_cancel: &mut Option<Arc<AtomicBool>>,
-    sending_until: &mut Option<Instant>,
-    thinking_text: &mut String,
-    thinking_full_text: &mut String,
-    thinking_idx: &mut Option<usize>,
-    thinking_in_progress: &mut bool,
-    thinking_pending_idle: &mut bool,
-    thinking_started_at: &mut Option<Instant>,
-    expanded_tool_idxs: &mut BTreeSet<usize>,
-    expanded_thinking_idxs: &mut BTreeSet<usize>,
-    scroll: &mut u16,
-    follow_bottom: &mut bool,
-    next_heartbeat_at: &mut Instant,
-    dog_client: &Option<DogClient>,
-    main_client: &Option<DogClient>,
-    token_totals: &mut TokenTotals,
-    token_total_path: &Path,
-    active_request_in_tokens: &mut Option<u64>,
-    token_total_path_store: &Path,
-    run_log_path: &str,
-    pending_mind_half: &mut Option<PendingMindHalf>,
-    mind_context: &mut MindContextPool,
-    response_count: &mut u64,
-) -> anyhow::Result<()> {
-    if send.trim().is_empty() {
-        return Ok(());
-    }
-    let mut _dummy_open_user_terminal = false;
-    let mut _dummy_memory_panel_open = false;
-    // 先允许处理斜杠命令（包含 /settings /quit 等）。
-    if handle_command(HandleCommandArgs {
-        core,
-        raw: send.trim_end(),
-        meta: metamemo,
-        context_usage,
-        mode,
-        active_kind,
-        chat_target,
-        dog_state,
-        main_state,
-        memory_state,
-        mind_ctx_idx_main,
-        mind_ctx_idx_dog,
-        mind_ctx_idx_memory,
-        screen,
-        help_ui,
-        should_exit,
-        sse_enabled,
-        enter_cmd_shell: pending_cmd_shell,
-        open_user_terminal: &mut _dummy_open_user_terminal,
-        memory_panel_open: &mut _dummy_memory_panel_open,
-        exit_code,
-        sys_cfg,
-        sys_cfg_path,
-        sys_log,
-        sys_log_limit: config.sys_log_limit,
-    })? {
-        let mut expanded_user_idxs = BTreeSet::new();
-        let mut collapsed_tool_idxs = BTreeSet::new();
-        let mut collapsed_user_idxs = BTreeSet::new();
-        let mut collapsed_thinking_idxs = BTreeSet::new();
-        reset_after_command(ResetAfterCommandArgs {
-            core,
-            render_cache,
-            config,
-            reveal_idx: &mut None,
-            expanded_tool_idxs,
-            collapsed_tool_idxs: &mut collapsed_tool_idxs,
-            expanded_user_idxs: &mut expanded_user_idxs,
-            collapsed_user_idxs: &mut collapsed_user_idxs,
-            expanded_thinking_idxs,
-            collapsed_thinking_idxs: &mut collapsed_thinking_idxs,
-            selected_msg_idx: &mut None,
-            tool_preview_chat_idx: &mut None,
-            brief_text: &mut String::new(),
-            brief_idx: &mut None,
-            brief_in_progress: &mut false,
-            brief_pending_idle: &mut false,
-            thinking_text,
-            thinking_idx,
-            thinking_in_progress,
-            thinking_pending_idle,
-            thinking_scroll: &mut 0,
-            thinking_scroll_cap: &mut 0,
-            thinking_full_text,
-            thinking_started_at,
-            tool_preview: &mut String::new(),
-            tool_preview_active: &mut false,
-            tool_preview_pending_idle: &mut false,
-            streaming_state: &mut StreamingState::default(),
-            active_tool_stream: &mut None,
-            screen: *screen,
-            settings: &mut SettingsState::new(),
-            scroll,
-            follow_bottom,
-        });
-        if *pending_cmd_shell && matches!(*screen, Screen::Chat) {
-            *pending_cmd_shell = false;
-            let _ = run_native_shell(terminal);
-        }
-        return Ok(());
-    }
-
-    let send_text = send.clone();
-    let _ = pending_mind_half.take();
-    core.push_user(send);
-    thinking_text.clear();
-    thinking_full_text.clear();
-    *thinking_started_at = None;
-    *thinking_pending_idle = false;
-	    if *sse_enabled {
-	        *thinking_in_progress = true;
-	        let stub = build_thinking_tool_message_stub(target, "running", "Thinking");
-	        core.push_tool_mind(stub, Some(target));
-	        *thinking_idx = Some(core.history.len().saturating_sub(1));
-	    } else {
-        *thinking_in_progress = false;
-        *thinking_idx = None;
-    }
-    let user_agent = if matches!(target, MindKind::Main) {
-        Some("main")
-    } else {
-        None
-    };
-    log_memos(metamemo, context_usage, "user", user_agent, &send_text);
-    if matches!(target, MindKind::Main) {
-        log_contextmemo(&config.contextmemo_path, context_usage, "user", &send_text);
-    }
-    let mind = match target {
-        MindKind::Main => "main",
-        MindKind::Sub => "dog",
-        MindKind::Memory => "memory",
-    };
-    let p = context_path_for_mind(config, mind);
-    log_dyncontext(p, mind, "user", &send_text, None, None);
-    defer_heartbeat(next_heartbeat_at, now);
-    // 保留用户展开状态：发送新消息不应强制把 Tab/Shift+Tab 的展开形态重置。
-    *scroll = u16::MAX;
-    *follow_bottom = true;
-
-    *active_kind = target;
-    if sys_cfg.fastmemo_inject_enabled {
-        let fastmemo = read_fastmemo_for_context();
-        match target {
-            MindKind::Main => main_state.refresh_fastmemo_system(&fastmemo),
-            MindKind::Sub => dog_state.refresh_fastmemo_system(&fastmemo),
-            MindKind::Memory => memory_state.refresh_fastmemo_system(&fastmemo),
-        }
-    }
-    let extra_system = None;
-    let started = if matches!(target, MindKind::Main) {
-        try_start_main_generation(TryStartMainGenerationArgs {
-            main_client,
-            main_state,
-            extra_system: extra_system.clone(),
-            tx,
-            config,
-            mode,
-            active_kind,
-            sending_until,
-            sys_log,
-            sys_log_limit: config.sys_log_limit,
-            streaming_state: &mut StreamingState::default(),
-            request_seq,
-            active_request_id,
-            active_cancel,
-            sse_enabled: *sse_enabled,
-        })
-    } else {
-        try_start_dog_generation(TryStartDogGenerationArgs {
-            kind: MindKind::Sub,
-            dog_client,
-            dog_state,
-            extra_system,
-            tx,
-            config,
-            mode,
-            active_kind,
-            sending_until,
-            sys_log,
-            sys_log_limit: config.sys_log_limit,
-            streaming_state: &mut StreamingState::default(),
-            request_seq,
-            active_request_id,
-            active_cancel,
-            sse_enabled: *sse_enabled,
-        })
-    };
-    if let Some(in_tokens) = started {
-        record_request_in_tokens(
-            core,
-            token_totals,
-            token_total_path_store,
             context_usage,
             active_request_in_tokens,
             in_tokens,
@@ -5414,9 +5177,9 @@ fn toggle_idx_expanded(
 }
 
 fn build_tool_stream_message(state: &ToolStreamState) -> String {
-    // 工具消息在聊天区“可观察/可收敛”：
-    // - 执行中：展示可读摘要（包含 explain/input），output 用占位符
-    // - 执行完：展示截断后的 output/meta（由 UI 决定是否展开/收敛）
+    //（1）工具消息在聊天区“可观察/可收敛”：
+    //（2）执行中：展示可读摘要（包含 explain/input），output 用占位符
+    //（3）执行完：展示截断后的 output/meta（由 UI 决定是否展开/收敛）
     let mut meta = state.meta.clone();
     if meta.is_empty() {
         meta.push("状态:running".to_string());
@@ -5429,7 +5192,6 @@ fn build_tool_stream_message(state: &ToolStreamState) -> String {
 }
 
 fn is_chat_message_selectable(
-    _core: &Core,
     msg_idx: usize,
     msg: &Message,
     thinking_idx: Option<usize>,
@@ -5462,7 +5224,8 @@ fn is_chat_message_selectable(
             }
         }
         if is_brief && msg.text.contains("provider:codex") {
-            // Codex：brief tool 仅用于状态栏（header），聊天区不渲染，也不应进入“可选中消息”。
+            //（1）Codex 的 brief 只用于顶栏状态。
+            //（2）聊天区不渲染，也不进入可选中消息。
             return false;
         }
     }
@@ -5492,7 +5255,8 @@ fn find_think_message_for_selection(core: &Core, selected_idx: usize) -> Option<
     if is_think_tool_message(selected) {
         return Some(selected_idx);
     }
-    // Codex：选中 brief 时，think 往往在其后（同轮内），需要向下关联。
+    //（1）Codex：选中 brief 时，think 常在其后。
+    //（2）同轮内允许向下关联一次。
     if is_brief_tool_message(selected) && selected.text.contains("provider:codex") {
         for idx in selected_idx.saturating_add(1)..core.history.len() {
             let msg = core.history.get(idx)?;
@@ -5505,24 +5269,24 @@ fn find_think_message_for_selection(core: &Core, selected_idx: usize) -> Option<
         }
         return None;
     }
-    // 仅 AI 相关消息才允许“向上关联思考块”：
-    // - Tool 回执需要跨过同轮 assistant（否则多工具调用时找不到 think）
-    // - User/System 不应触发“上一轮 think”误关联
+    //（1）仅 assistant/tool 允许向上关联 think。
+    //（2）tool 回执可跨过同轮 assistant。
+    //（3）user/system 不参与关联，避免跨轮误判。
     if !matches!(selected.role, Role::Assistant | Role::Tool) {
         return None;
     }
-    // 同轮内：优先向上找最近的 think（通常 think 出现在 tool 回执之前）。
+    //（1）同轮内：优先向上找最近的 think（通常 think 出现在 tool 回执之前）。
     for idx in (0..selected_idx).rev() {
         let msg = core.history.get(idx)?;
         if is_think_tool_message(msg) {
             return Some(idx);
         }
-        // 以“上一条 user”为同轮边界：assistant/tool/system 都可能穿插在同轮中。
+        //（1）以“上一条 user”为同轮边界：assistant/tool/system 都可能穿插在同轮中。
         if msg.role == Role::User {
             break;
         }
     }
-    // 兜底：若本轮 think 出现在其后（例如多工具回执先落盘、think 后到），向下关联一次。
+    //（1）兜底：若本轮 think 出现在其后（例如多工具回执先落盘、think 后到），向下关联一次。
     for idx in selected_idx.saturating_add(1)..core.history.len() {
         let msg = core.history.get(idx)?;
         if msg.role == Role::User {
@@ -5545,7 +5309,7 @@ fn find_assistant_for_think_message(core: &Core, think_idx: usize) -> Option<usi
     }
     for idx in think_idx.saturating_add(1)..core.history.len() {
         let msg = core.history.get(idx)?;
-        // 同一轮通常是：assistant 正文 + tool + assistant + tool...；think 位于正文前/中。
+        //（1）同轮：assistant/tool 交替；think 在正文前/中。
         if msg.role == Role::Assistant {
             return Some(idx);
         }
@@ -5585,14 +5349,14 @@ fn related_think_and_tool_for_selection(
         return (None, None);
     };
 
-    // think：选中 think 工具本身则为该条，否则按“同一轮向上找”。
+    //（1）think：选中 think 工具本身则为该条，否则按“同一轮向上找”。
     let think_idx = if is_think_tool_message(msg) {
         Some(selected_idx)
     } else {
         find_think_message_for_selection(core, selected_idx)
     };
 
-    // tool：选中 tool 回执本身则为该条；选中 assistant/think 时，找同一轮紧随其后的第一个工具回执。
+    //（1）tool：选中 assistant/think 时取同轮后续 tool 回执。
     let tool_idx =
         if msg.role == Role::Tool && !is_think_tool_message(msg) && !is_brief_tool_message(msg) {
             Some(selected_idx)
@@ -5623,7 +5387,6 @@ fn select_last_chat_message(
 ) -> Option<usize> {
     for (idx, msg) in core.history.iter().enumerate().rev() {
         if is_chat_message_selectable(
-            core,
             idx,
             msg,
             thinking_idx,
@@ -5651,7 +5414,6 @@ fn select_prev_chat_message(
     for idx in (0..start).rev() {
         if let Some(msg) = core.history.get(idx)
             && is_chat_message_selectable(
-                core,
                 idx,
                 msg,
                 thinking_idx,
@@ -5692,7 +5454,6 @@ fn select_next_chat_message(
     for idx in start..core.history.len() {
         if let Some(msg) = core.history.get(idx)
             && is_chat_message_selectable(
-                core,
                 idx,
                 msg,
                 thinking_idx,
@@ -5720,7 +5481,7 @@ fn select_next_chat_message(
 #[derive(Debug, Clone, Copy)]
 struct ScrollAnchor {
     msg_idx: usize,
-    // 期望保持 `scroll - msg_start` 不变（防止展开/收起导致视图漂移）。
+    //（1）期望保持 `scroll - msg_start` 不变（防止展开/收起导致视图漂移）。
     view_top_minus_msg_start: i32,
 }
 
@@ -5824,17 +5585,18 @@ fn try_termux_clipboard_set(text: &str) -> bool {
 #[derive(Debug, Default)]
 struct StreamingState {
     idx: Option<usize>,
-    // If we split "assistant prefix text" and a tool stub into two messages, this points to the
-    // assistant message that should receive the cleaned text at stream end.
+    //（1）若把 assistant 前缀与 tool stub 拆成两条消息。
+    //（2）此字段指向流式结束时写回清洗文本的 assistant 索引。
     assistant_idx_before_tool: Option<usize>,
     raw_text: String,
     text: String,
     has_content: bool,
     tool_start: Option<usize>,
-    // UI/解析提示：当前这轮流式是否来自 Codex provider。
-    // 用于启用/切换只针对 Codex 的展示策略（例如禁用流式动效、brief/think 元信息渲染等）。
+    //（1）标记当前流式是否来自 Codex。
+    //（2）用于启用 Codex 专属展示策略。
     codex_mode: bool,
-    // Codex summary(brief) 已出现，但尚未在 reasoning/正文前插入分隔换行。
+    //（1）Codex summary(brief) 已出现。
+    //（2）尚未在 reasoning/正文前插入分隔换行。
     codex_summary_pending_sep: bool,
 }
 
@@ -5982,8 +5744,8 @@ fn build_brief_tool_message(kind: MindKind, brief: &str, status: &str) -> String
 }
 
 fn extract_last_bold_md(text: &str) -> Option<String> {
-    // 提取最后一个 `**...**` 的第一行（用于 Codex brief/status header）。
-    // Codex 的 summary 可能包含多个粗体标题（brief 迭代更新），应以“最新”为准。
+    //（1）提取最后一个 `**...**` 的第一行（用于 Codex brief/status header）。
+    //（2）Codex 的 summary 可能包含多个粗体标题（brief 迭代更新），应以“最新”为准。
     let text = text.trim();
     if !text.contains("**") {
         return None;
@@ -6020,7 +5782,7 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 }
 
 fn status_header_from_brief_text(brief_text: &str) -> Option<String> {
-    // 状态栏只从粗体标题提取 brief header：避免把 thinking/正文误判为 brief。
+    //（1）状态栏只从粗体标题提取 brief header：避免把 thinking/正文误判为 brief。
     let raw = extract_last_bold_md(brief_text)?;
     let clean = compact_ws_inline(&raw.replace("**", ""));
     let header = truncate_with_suffix(clean.trim(), 160);
@@ -6068,7 +5830,7 @@ fn build_codex_brief_tool_message(kind: MindKind, full_text: &str, status: &str)
     let header_md = if header.trim().is_empty() {
         String::new()
     } else {
-        // 在 tool 文本中保留 markdown：UI 渲染时可把它当作“brief 标题”上色。
+        //（1）在 tool 文本中保留 markdown：UI 渲染时可把它当作“brief 标题”上色。
         format!("**{}**", truncate_with_suffix(header.trim(), 160))
     };
     if header_md.trim().is_empty() {
@@ -6089,13 +5851,13 @@ fn build_codex_brief_tool_message(kind: MindKind, full_text: &str, status: &str)
 }
 
 fn normalize_codex_summary_fragment(fragment: &str) -> String {
-    // Codex 的 summary 往往是相邻的粗体片段：`**A****B****C**`；
-    // 这里插入空格，避免状态栏/思考区变成一坨。
+    //（1）Codex 的 summary 往往是相邻的粗体片段：`**A****B****C**`；
+    //（2）这里插入空格，避免状态栏/思考区变成一坨。
     fragment.replace("****", "** **")
 }
 
 fn build_codex_thinking_tool_message_stub(kind: MindKind) -> String {
-    // input 留空：Codex 下不展示 “Thinking...” 占位，只在收到 reasoning 后再显示内容。
+    //（1）Codex：input 留空；收到 reasoning 后再显示。
     build_thinking_tool_message_stub(kind, "running\nprovider:codex", "")
 }
 
@@ -6104,7 +5866,7 @@ fn build_codex_thinking_tool_message_running(kind: MindKind, full_text: &str) ->
     if clean.is_empty() {
         return build_codex_thinking_tool_message_stub(kind);
     }
-    // 在 meta 区补一个 provider 标记，便于 UI 区分展示策略（不影响模型上下文）。
+    //（1）在 meta 区补一个 provider 标记，便于 UI 区分展示策略（不影响模型上下文）。
     let mut msg = build_thinking_tool_message_running(kind, clean);
     if let Some(pos) = msg.rfind("状态:running") {
         msg.insert_str(pos + "状态:running".len(), "\nprovider:codex");
@@ -6120,7 +5882,7 @@ fn build_codex_thinking_tool_message_done(
 ) -> String {
     let clean = full_text.trim();
     if clean.is_empty() {
-        // 空思考：返回一个带 provider 标记的空 stub，UI 会忽略它。
+        //（1）空思考：返回一个带 provider 标记的空 stub，UI 会忽略它。
         return build_thinking_tool_message_stub(kind, "0\nprovider:codex", "Thinking");
     }
     let mut msg = build_thinking_tool_message("", clean, secs, chars, kind);
@@ -6137,6 +5899,8 @@ fn build_thinking_tool_message_stub(kind: MindKind, status: &str, input: &str) -
     msg.push_str(&format!("input: {}\n", input.trim()));
     let mind = if matches!(kind, MindKind::Sub) {
         "dog"
+    } else if matches!(kind, MindKind::Memory) {
+        "memory"
     } else {
         "main"
     };
@@ -6182,14 +5946,6 @@ fn pick_thinking_word_dog(secs: u64) -> String {
 
 fn build_interrupt_prompt() -> String {
     "请求已被取消".to_string()
-}
-
-fn build_switch_prompt(target: MindKind) -> String {
-    match target {
-        MindKind::Main => "··· Switch to 萤·主意识".to_string(),
-        MindKind::Sub => "··· Switch to 萤·潜意识".to_string(),
-        MindKind::Memory => "··· Switch to 萤·记忆".to_string(),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6251,16 +6007,12 @@ fn build_main_diary_prompt(
     out
 }
 
-fn fill_contextmemo_to_kb_limit_for_test(
-    path: &str,
-    usage: &mut ContextUsage,
-    kb_limit: usize,
-) {
+fn fill_contextmemo_to_kb_limit_for_test(path: &str, usage: &mut ContextUsage, kb_limit: usize) {
     if kb_limit == 0 {
         return;
     }
-    // 开放但有上限：只用于测试把 Date 计数打满，不要把上下文写爆到不可控。
-    // 每次写入约 8KB 的 filler（包含明确标记，便于日记提示词忽略）。
+    //（1）开放但有上限：只用于测试把 Date 计数打满，不要把上下文写爆到不可控。
+    //（2）每次写入约 8KB 的 filler（包含明确标记，便于日记提示词忽略）。
     const CHUNK_BYTES: usize = 8 * 1024;
     const MAX_WRITES: usize = 64;
     let mut writes = 0usize;
@@ -6730,13 +6482,13 @@ enum AsyncEvent {
 }
 
 fn arm_parent_death_signal() {
-    // Android/Termux 同样是 Linux 内核，但 Rust 的 target_os 为 "android"。
-    // 若不设置 PDEATHSIG，父进程（zsh/login）退出后，TUI 可能变成孤儿进程并继续烧 CPU。
+    //（1）Android/Termux 是 Linux 内核；target_os 为 android。
+    //（2）若不设置 PDEATHSIG，父进程（zsh/login）退出后，TUI 可能变成孤儿进程并继续烧 CPU。
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
     }
-    // 竞态兜底：如果父进程已在 prctl 前退出，PDEATHSIG 不会再触发，这里主动退出。
+    //（1）竞态兜底：如果父进程已在 prctl 前退出，PDEATHSIG 不会再触发，这里主动退出。
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if unsafe { libc::getppid() } == 1 {
@@ -6766,7 +6518,7 @@ fn tty_is_alive() -> bool {
     {
         return true;
     }
-    // 兜底：某些环境 /dev/tty 可能不可用，但至少要确保 stdio 是终端。
+    //（1）兜底：某些环境 /dev/tty 可能不可用，但至少要确保 stdio 是终端。
     use std::io::IsTerminal;
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
@@ -7039,8 +6791,8 @@ fn handle_model_stream_start(args: ModelStreamStartArgs<'_>) {
     );
     *retry_status = None;
     *active_tool_stream = None;
-    // 在请求启动前由发起方设置（mind 协同/普通对话/心跳/写日记）；这里不改写标志。
-    // 以实际开始流式输出的 mind 为准，避免顶栏“亮错边”（例如主意识发起的工具/请求）。
+    //（1）在请求启动前由发起方设置（mind 协同/普通对话/心跳/写日记）；这里不改写标志。
+    //（2）以实际开始流式输出的 mind 为准，避免顶栏“亮错边”（例如主意识发起的工具/请求）。
     *active_kind = kind;
     tool_preview.clear();
     *tool_preview_active = false;
@@ -7050,9 +6802,9 @@ fn handle_model_stream_start(args: ModelStreamStartArgs<'_>) {
     *brief_idx = None;
     *brief_in_progress = false;
     *brief_pending_idle = false;
-    // 思考占位：用于把 think 工具块固定在正文上方，避免非 SSE 时“思考块跑到正文下方”。
-    // - SSE：running 阶段会在聊天区闪烁（降低首包延迟感）
-    // - 非 SSE：默认仍隐藏（除非用户 Shift+Tab 展开），但保留正确的时间线顺序
+    //（1）思考占位：用于把 think 工具块固定在正文上方，避免非 SSE 时“思考块跑到正文下方”。
+    //（2）SSE：running 阶段会在聊天区闪烁（降低首包延迟感）
+    //（3）非 SSE：默认仍隐藏（除非用户 Shift+Tab 展开），但保留正确的时间线顺序
     let codex_mode = expect_brief;
     if !is_heartbeat && thinking_idx.is_none() && !codex_mode {
         let stub = build_thinking_tool_message_stub(kind, "running", "Thinking");
@@ -7060,8 +6812,8 @@ fn handle_model_stream_start(args: ModelStreamStartArgs<'_>) {
         *thinking_idx = Some(core.history.len().saturating_sub(1));
     }
     if !is_heartbeat && codex_mode {
-        // Codex：把 brief/think 作为“可选元数据”放在正文前，但默认不显示占位。
-        // UI 会忽略 provider:codex 且内容为空的 stub，直到收到真实 brief/reasoning。
+        //（1）Codex：把 brief/think 作为“可选元数据”放在正文前，但默认不显示占位。
+        //（2）Codex：空 stub UI 忽略，直到收到真实 brief/reasoning。
         if brief_idx.is_none() {
             core.push_tool_mind(build_codex_brief_tool_message_stub(kind), Some(kind));
             *brief_idx = Some(core.history.len().saturating_sub(1));
@@ -7073,12 +6825,14 @@ fn handle_model_stream_start(args: ModelStreamStartArgs<'_>) {
     }
     let assistant_idx = core.history.len();
     streaming_state.start(assistant_idx);
-    // 目前 expect_brief 只用于 Codex：标记本轮为 Codex 模式（不再创建 brief 工具消息，只在状态栏显示 summary）。
+    //（1）expect_brief 仅用于 Codex。
+    //（2）标记本轮为 Codex 模式。
+    //（3）summary 只在顶栏展示。
     streaming_state.codex_mode = codex_mode;
     streaming_state.codex_summary_pending_sep = false;
     core.history.push(Message {
         role: Role::Assistant,
-        // Codex 下不再创建“思考工具占位”，避免出现两个闪烁点；在正文首包前给一个轻量提示。
+        //（1）Codex 下不再创建“思考工具占位”，避免出现两个闪烁点；在正文首包前给一个轻量提示。
         text: if codex_mode {
             "Working...".to_string()
         } else {
@@ -7156,7 +6910,7 @@ fn handle_tool_stream_start(args: ToolStreamStartArgs<'_>) {
         let dir = pulse_dir(owner, target);
         *mind_pulse = Some(MindPulse {
             dir,
-            // 迅速的一次性“乱码脉冲”，避免长时间持续动画造成干扰。
+            //（1）迅速的一次性“乱码脉冲”，避免长时间持续动画造成干扰。
             until: Instant::now() + Duration::from_millis(240),
         });
     }
@@ -7168,24 +6922,24 @@ fn handle_tool_stream_start(args: ToolStreamStartArgs<'_>) {
         meta: vec![],
         placeholder: true,
     };
-	    let tool_text = build_tool_stream_message(&state);
-	    if let Some(stub_idx) = tool_preview_chat_idx.take()
-	        && core
-	            .history
-	            .get(stub_idx)
-	            .is_some_and(|m| m.role == Role::Tool)
-	    {
-	        if let Some(entry) = core.history.get_mut(stub_idx) {
-	            entry.text.clone_from(&tool_text);
-	            entry.mind = Some(owner);
-	            render_cache.invalidate(stub_idx);
-	        }
-	        state.idx = stub_idx;
-	    } else {
-	        core.push_tool_mind(tool_text.clone(), Some(owner));
-	        state.idx = core.history.len().saturating_sub(1);
-	    }
-    // 默认只展示 brief：工具详情由用户手动展开（→）。
+    let tool_text = build_tool_stream_message(&state);
+    if let Some(stub_idx) = tool_preview_chat_idx.take()
+        && core
+            .history
+            .get(stub_idx)
+            .is_some_and(|m| m.role == Role::Tool)
+    {
+        if let Some(entry) = core.history.get_mut(stub_idx) {
+            entry.text.clone_from(&tool_text);
+            entry.mind = Some(owner);
+            render_cache.invalidate(stub_idx);
+        }
+        state.idx = stub_idx;
+    } else {
+        core.push_tool_mind(tool_text.clone(), Some(owner));
+        state.idx = core.history.len().saturating_sub(1);
+    }
+    //（1）默认只展示 brief：工具详情由用户手动展开（→）。
     expanded_tool_idxs.remove(&state.idx);
     *active_tool_stream = Some(state);
     *thinking_in_progress = false;
@@ -7194,27 +6948,7 @@ fn handle_tool_stream_start(args: ToolStreamStartArgs<'_>) {
     jump_to_bottom(scroll, follow_bottom);
 }
 
-#[allow(dead_code)]
-struct MindMsgToolArgs<'a> {
-    state: &'a ToolStreamState,
-    pending_mind_half: &'a mut Option<PendingMindHalf>,
-    main_state: &'a mut DogState,
-    dog_state: &'a mut DogState,
-    sys_cfg: &'a SystemConfig,
-    config: &'a AppConfig,
-    context_usage: &'a mut ContextUsage,
-}
-
-fn handle_mind_msg_tool(args: MindMsgToolArgs<'_>) -> Option<(MindKind, MindKind, String, String)> {
-    let MindMsgToolArgs {
-        state,
-        pending_mind_half,
-        main_state: _,
-        dog_state: _,
-        sys_cfg: _,
-        config: _config,
-        context_usage: _context_usage,
-    } = args;
+fn handle_mind_msg_tool(state: &ToolStreamState) -> Option<(MindKind, MindKind, String, String)> {
     let target = resolve_mind_target_kind(&state.call)?;
     let content = resolve_mind_message_text(&state.call);
     if content.trim().is_empty() {
@@ -7236,13 +6970,6 @@ fn handle_mind_msg_tool(args: MindMsgToolArgs<'_>) -> Option<(MindKind, MindKind
     let content_clean = content.trim().to_string();
     let brief_clean = brief.trim().to_string();
 
-    *pending_mind_half = Some(PendingMindHalf {
-        from: owner,
-        to: target,
-        brief: brief_clean.clone(),
-        content: content_clean.clone(),
-    });
-
     Some((owner, target, brief_clean, content_clean))
 }
 
@@ -7260,6 +6987,7 @@ fn context_path_for_mind<'a>(config: &'a AppConfig, mind: &str) -> &'a str {
     }
 }
 
+// ===== 主循环（启动加载配置，清空外置 context，进入事件循环）=====
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     exit_flag: Arc<AtomicBool>,
@@ -7292,8 +7020,8 @@ fn run_loop(
         let _ = std::env::set_current_dir(&root);
     }
     trace_startup("run_loop: root resolved");
-    // 会话上下文外置：每次启动清空 context JSONL（MAIN/DOG 与 MEMORY 分离）。
-    // 暂不做阈值/截断；文件增长仅影响本次会话。
+    //（1）会话上下文外置：每次启动清空 context JSONL（MAIN/DOG 与 MEMORY 分离）。
+    //（2）暂不做阈值/截断；文件增长仅影响本次会话。
     clear_dyncontext_file(&config.dyncontext_path);
     clear_dyncontext_file(&config.dog_context_path);
     clear_dyncontext_file(&config.memory_context_path);
@@ -7319,7 +7047,7 @@ fn run_loop(
         }),
     );
     trace_startup("run_loop: runlog_event ok");
-    // set_var 在当前 toolchain 中为 unsafe，集中处理并降低散落风险。
+    //（1）set_var 在当前 toolchain 中为 unsafe，集中处理并降低散落风险。
     unsafe {
         std::env::set_var("YING_MEMO_DB_PATH", &config.memo_db_path);
         std::env::set_var("YING_METAMEMO_PATH", &config.metamemo_path);
@@ -7409,7 +7137,8 @@ fn run_loop(
     );
     let mut memory_state = memory_state;
     memory_state.set_include_tool_context(true);
-    // MAIN 也可能发起工具调用（记忆/系统配置等）。若不回注工具结果，模型会反复重试同一工具。
+    //（1）MAIN 也会发起工具调用（记忆/系统配置等）。
+    //（2）需回注工具结果，避免重复请求。
     main_state.set_include_tool_context(true);
     dog_state.reset_context();
     main_state.reset_context();
@@ -7421,13 +7150,13 @@ fn run_loop(
     let mut mind_rate_window: VecDeque<Instant> = VecDeque::new();
     let mut active_request_is_mind: bool = false;
     let mut active_request_is_fastmemo_compact: bool = false;
-    // 仅用于“自动自愈”类内部消息：避免内部占位触发的请求再次触发自动自愈造成循环。
+    //（1）内部占位请求标记。
+    //（2）避免自愈占位触发二次自愈成环。
     let mut active_request_is_internal_placeholder: bool = false;
     let mut auto_fastmemo_compact: bool = false;
     let mut fastmemo_compact_inflight: bool = false;
     let mut fastmemo_compact_edit_mask: u8 = 0;
     let mut fastmemo_compact_retry_at: Option<Instant> = None;
-    let mut pending_mind_half: Option<PendingMindHalf> = None;
     let token_total_path = PathBuf::from(&dog_cfg.token_total_path);
     let mut token_totals = load_token_totals(&token_total_path);
     if token_totals.total_heartbeat_count == 0
@@ -7454,19 +7183,13 @@ fn run_loop(
     let _memory_client_err = memory_client_result.err().map(|e| e.to_string());
     let theme = ui::Theme::from_env();
     let mut render_cache = ui::ChatRenderCache::new();
-    // 欢迎语：折叠 system info（简约态只显示一行，详情态在工具详情展开）。
+    //（1）欢迎语：折叠 system info（简约态只显示一行，详情态在工具详情展开）。
     let welcome_header = "♡ · 系统信息 · 欢迎使用AItermux。";
-    let build_profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let build_detail = format!("build: {build_profile}");
     let welcome = if welcome_shortcuts_prompt_text.trim().is_empty() {
         welcome_header.to_string()
     } else {
         format!(
-            "{welcome_header}\n\n{build_detail}\n{}",
+            "{welcome_header}\n\n{}",
             welcome_shortcuts_prompt_text.trim_end()
         )
     };
@@ -7477,7 +7200,7 @@ fn run_loop(
     let mut input_chars: usize = 0;
     let mut scroll: u16 = 0;
     let mut follow_bottom = true;
-    // End/Ins：快速跳到底/回到之前位置（单向恢复，避免来回切换）。
+    //（1）End/Ins：快速跳到底/回到之前位置（单向恢复，避免来回切换）。
     let mut scroll_restore_before_end: Option<(u16, bool)> = None;
     let mut max_scroll_cache: usize = 0;
     let mut chat_width_cache: usize = 0;
@@ -7552,7 +7275,13 @@ fn run_loop(
             format!("MEM: 配置 {}", memory_cfg_path.display()),
         );
     }
-    if memory_cfg.api_key.as_deref().unwrap_or("").trim().is_empty() {
+    if memory_cfg
+        .api_key
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         push_sys_log(&mut sys_log, config.sys_log_limit, "MEM: API Key 为空");
     } else {
         push_sys_log(&mut sys_log, config.sys_log_limit, "MEM: API Key 已配置");
@@ -7828,18 +7557,10 @@ fn run_loop(
     let mut msg_line_ranges_cache: Vec<Option<(usize, usize)>> = Vec::new();
     let mut pending_scroll_anchor: Option<ScrollAnchor> = None;
     let mut chat_rect_cache: Option<ratatui::layout::Rect> = None;
+    let mut tabs_rect_cache: Option<ratatui::layout::Rect> = None;
     let mut input_rect_cache: Option<ratatui::layout::Rect> = None;
     let mut pty_rect_cache: Option<ratatui::layout::Rect> = None;
     let mut settings_rect_cache: Option<ratatui::layout::Rect> = None;
-    let mut memory_rect_cache: Option<ratatui::layout::Rect> = None;
-    let mut memory_focus = false;
-    let mut memory_scroll: u16 = u16::MAX; // u16::MAX 表示“跟随底部”
-    let mut memory_max_scroll_cache: u16 = 0;
-    let mut memory_panel_open: bool = false;
-    // Memory 面板高度缓存：键盘弹出/收回会触发窗口高度变化。
-    // 需求：Memory 属于“顶栏逻辑”，不随键盘折叠；只让聊天区域变小。
-    // 因此用缓存保持“期望高度”，仅在屏幕过小到无法容纳时才临时压缩（不回写缓存，便于恢复）。
-    let mut memory_panel_h_cache: Option<u16> = None;
 
     let mut settings_fields_scroll_cache: usize = 0;
     let mut chat_height_cache: usize = 0;
@@ -7851,7 +7572,8 @@ fn run_loop(
     let mut send_queue_internal: VecDeque<InternalUserMessage> = VecDeque::new();
     let mut send_queue_ui: SendQueueUiState = SendQueueUiState::Closed;
     let mut help_ui: HelpUiState = HelpUiState::Closed;
-    // 自动出队节流：避免“刚空闲就连发多条”让人类/模型都来不及反应。
+    //（1）自动出队节流。
+    //（2）避免空闲瞬间连发多条导致误读。
     let mut send_queue_dequeue_cooldown_until: Option<Instant> = None;
     let mut screen = Screen::Chat;
     let mut settings = SettingsState::new();
@@ -7860,11 +7582,14 @@ fn run_loop(
     let mut pty_handles: HashMap<u64, mpsc::Sender<PtyControl>> = HashMap::new();
     let mut pty_view = false;
     let mut pty_focus = PtyFocus::Terminal;
-    // 多 PTY 模式：允许同时存在多个后台终端任务；PgUp/PgDn 用于快速切换当前焦点 tab。
+    //（1）多 PTY：允许多个后台终端任务共存。
+    //（2）PgUp/PgDn 快速切换焦点 tab。
     let mut last_esc_at: Option<Instant> = None;
-    // Home 双击：快速回归简约模式（收敛全部展开/折叠）并退出消息选择。
+    //（1）Home 双击：回到简约模式。
+    //（2）收敛展开状态，并退出消息选择。
     let mut last_home_at: Option<Instant> = None;
-    // PTY DONE 聚合：避免每个 tab 结束都立刻回传/触发模型；等同一批结束后再统一交给模型处理。
+    //（1）PTY DONE 聚合：合并同批结束事件。
+    //（2）避免逐个回传触发多次续跑。
     let mut pty_done_batches = PtyDoneBatches::default();
     let mut pty_done_followups: VecDeque<PtyDoneFollowup> = VecDeque::new();
     let mut prev_pty_view = false;
@@ -7879,10 +7604,11 @@ fn run_loop(
     let mut burst_start_cursor: Option<usize> = None;
     let mut paste_capture: Option<PasteCapture> = None;
     let mut toast: Option<(Instant, String)> = None;
-    // 状态栏右侧动作提示（短暂显示）：仅用于人类观测，不影响上下文/协议层。
+    //（1）状态栏右侧动作提示（短暂显示）。
+    //（2）仅影响界面，不进入上下文与协议层。
     let mut action_hint: Option<(Instant, String)> = None;
-    // 大粘贴占位符缓存：当 pending_pastes 非空，说明输入框里存在“粘贴块”占位符，
-    // 为避免误触 Enter 提交，需要 Alt+Enter 才允许发送。
+    //（1）大粘贴占位符缓存：pending_pastes 非空表示存在占位符。
+    //（2）为避免误触 Enter 提交，仅 Alt+Enter 允许发送。
     let mut pending_pastes: Vec<(String, String)> = Vec::new();
     let max_input_chars = config.max_input_chars;
     let paste_capture_max_bytes = config.paste_capture_max_bytes;
@@ -7896,20 +7622,14 @@ fn run_loop(
     let mut last_term_size: Option<(u16, u16)> = None;
     let mut touch_drag_last_row: Option<u16> = None;
     let mut touch_drag_last_col: Option<u16> = None;
-    // 触控拖拽滚动：用“起点锚定”的方式把 scroll 绑定到手指位移，
-    // 避免 Termux 高频 Drag 事件导致滚动累计过快（跑得比手势快）。
+    //（1）触控拖拽滚动：用起点锚定绑定 scroll 与手指位移。
+    //（2）避免高频 Drag 事件导致滚动过快。
     let mut touch_drag_anchor_row: Option<u16> = None;
     let mut touch_drag_anchor_scroll: Option<u16> = None;
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum TouchDragTarget {
-        Chat,
-        Memory,
-    }
-    let mut touch_drag_target: Option<TouchDragTarget> = None;
 
     macro_rules! drain_events {
         () => {
-            drain_async_events(DrainAsyncEventsArgs {
+            drain_async_events(LoopCtx {
                 core: &mut core,
                 rx: &rx,
                 render_cache: &mut render_cache,
@@ -7947,7 +7667,6 @@ fn run_loop(
                 context_usage: &mut context_usage,
                 diary_state: &mut diary_state,
                 mind_rate_window: &mut mind_rate_window,
-                pending_mind_half: &mut pending_mind_half,
                 brief_text: &mut brief_text,
                 brief_idx: &mut brief_idx,
                 brief_in_progress: &mut brief_in_progress,
@@ -8018,7 +7737,7 @@ fn run_loop(
             if !tty_is_alive() {
                 break;
             }
-            // 兜底：若父进程已退出（PPID=1），立刻退出，避免极端情况下变成孤儿进程持续占用 CPU。
+            //（1）兜底：若父进程已退出（PPID=1），立刻退出，避免极端情况下变成孤儿进程持续占用 CPU。
             #[cfg(any(target_os = "linux", target_os = "android"))]
             {
                 if unsafe { libc::getppid() } == 1 {
@@ -8043,8 +7762,8 @@ fn run_loop(
             };
         }
 
-        // PTY DONE（批量）回传：当一批后台终端全部结束后，把聚合后的 Tool result 写入聊天并注入模型上下文。
-        // 可选：注入一条“内部提示”让模型简短汇报执行结果（由 pty_messages 配置控制）。
+        //（1）PTY 批量回传：聚合 tool result 写入聊天并入上下文。
+        //（2）可选：注入一条“内部提示”让模型简短汇报执行结果（由 pty_messages 配置控制）。
         if !pty_done_followups.is_empty()
             && pty_tabs.is_empty()
             && can_inject_heartbeat(
@@ -8054,28 +7773,21 @@ fn run_loop(
                 &pending_tool_confirm,
                 &active_tool_stream,
             )
-	        {
-	            let front = &mut pty_done_followups[0];
-	            if !front.pushed {
-	                core.push_tool_mind(front.tool_text.clone(), Some(front.owner));
-                    let mind = match front.owner {
-                        MindKind::Sub => "dog",
-                        MindKind::Main => "main",
-                        MindKind::Memory => "memory",
-                    };
-                    let p = context_path_for_mind(&config, mind);
-                    // 会话上下文外置：把 PTY 批量完成回执写入 context.jsonl，供后续请求回放到模型上下文。
-                    log_dyncontext(
-                        p,
-                        mind,
-                        "tool",
-                        &front.tool_text,
-                        Some("pty"),
-                        None,
-                    );
-	                render_cache.invalidate(core.history.len().saturating_sub(1));
-	                front.pushed = true;
-	                push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: batch ready");
+        {
+            let front = &mut pty_done_followups[0];
+            if !front.pushed {
+                core.push_tool_mind(front.tool_text.clone(), Some(front.owner));
+                let mind = match front.owner {
+                    MindKind::Sub => "dog",
+                    MindKind::Main => "main",
+                    MindKind::Memory => "memory",
+                };
+                let p = context_path_for_mind(&config, mind);
+                //（1）会话上下文外置：把 PTY 批量完成回执写入 context.jsonl，供后续请求回放到模型上下文。
+                log_dyncontext(p, mind, "tool", &front.tool_text, Some("pty"), None);
+                render_cache.invalidate(core.history.len().saturating_sub(1));
+                front.pushed = true;
+                push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: batch ready");
                 let mut auto_reply = false;
                 let tpl = pty_messages.pty_done_auto_report_prompt.trim();
                 if !tpl.is_empty() {
@@ -8089,8 +7801,8 @@ fn run_loop(
                     if !prompt.trim().is_empty() {
                         send_queue_internal.push_back(InternalUserMessage {
                             target: front.owner,
-                            // DeepSeek 要求最后一条为 user：这里只放“协议占位”文本；
-                            // 且 start_user_chat_request 会避免把它写入长期上下文。
+                            //（1）DeepSeek 要求最后一条为 user。
+                            //（2）这里只放协议占位文本，不写入长期上下文。
                             model_text: {
                                 let code = match front.owner {
                                     MindKind::Sub => dog_state.last_tool_output_code(),
@@ -8113,9 +7825,10 @@ fn run_loop(
             needs_redraw = true;
         }
 
-        // 内部队列：空闲时自动出队（不展示给用户）。
+        //（1）内部队列：空闲时自动出队（不展示给用户）。
+        //（2）约束：不与模型请求/工具并发；不抢占 diary/压缩流程；不与队列 UI 并发。
         if !send_queue_internal.is_empty()
-            && !send_queue_dequeue_cooldown_until.is_some_and(|t| now < t)
+            && send_queue_dequeue_cooldown_until.is_none_or(|t| now >= t)
             && matches!(send_queue_ui, SendQueueUiState::Closed)
             && !diary_state.active()
             && can_inject_heartbeat(
@@ -8125,70 +7838,67 @@ fn run_loop(
                 &pending_tool_confirm,
                 &active_tool_stream,
             )
+            && let Some(msg) = send_queue_internal.pop_front()
         {
-            if let Some(msg) = send_queue_internal.pop_front() {
-                send_queue_dequeue_cooldown_until = Some(now + Duration::from_millis(450));
-                clear_brief_state(ClearBriefStateArgs {
-                    brief_text: &mut brief_text,
-                    brief_idx: &mut brief_idx,
-                    brief_in_progress: &mut brief_in_progress,
-                    brief_pending_idle: &mut brief_pending_idle,
-                });
-                // 内部消息不写入聊天 UI：ui_text 为空即可（Core.push_user 会忽略空）。
-                start_user_chat_request(StartUserChatRequestArgs {
-                    now,
-                    ui_text: String::new(),
-                    model_text: msg.model_text,
-                    target: msg.target,
-                    extra_system_override: msg.extra_system,
-                    core: &mut core,
-                    metamemo: &mut metamemo,
-                    context_usage: &mut context_usage,
-                    pending_mind_half: &mut pending_mind_half,
-                    dog_state: &mut dog_state,
-                    main_state: &mut main_state,
-                    memory_state: &mut memory_state,
-                    sys_cfg: &sys_cfg,
-                    config: &config,
-                    tx: &tx,
-                    mode: &mut mode,
-                    active_kind: &mut active_kind,
-                    active_request_is_internal_placeholder:
-                        &mut active_request_is_internal_placeholder,
-                    sending_until: &mut sending_until,
-                    sys_log: &mut sys_log,
-                    streaming_state: &mut streaming_state,
-                    request_seq: &mut request_seq,
-                    active_request_id: &mut active_request_id,
-                    active_cancel: &mut active_cancel,
-                    sse_enabled,
-                    next_heartbeat_at: &mut next_heartbeat_at,
-                    thinking_text: &mut thinking_text,
-                    thinking_full_text: &mut thinking_full_text,
-                    thinking_idx: &mut thinking_idx,
-                    thinking_in_progress: &mut thinking_in_progress,
-                    thinking_pending_idle: &mut thinking_pending_idle,
-                    thinking_started_at: &mut thinking_started_at,
-                    expanded_tool_idxs: &mut expanded_tool_idxs,
-                    expanded_thinking_idxs: &mut expanded_thinking_idxs,
-                    scroll: &mut scroll,
-                    follow_bottom: &mut follow_bottom,
-                    token_totals: &mut token_totals,
-                    token_total_path: &token_total_path,
-                    active_request_in_tokens: &mut active_request_in_tokens,
-                    dog_client: &dog_client,
-                    main_client: &main_client,
-                    memory_client: &memory_client,
-                })?;
-                needs_redraw = true;
-                continue;
-            }
+            send_queue_dequeue_cooldown_until = Some(now + Duration::from_millis(450));
+            clear_brief_state(ClearBriefStateArgs {
+                brief_text: &mut brief_text,
+                brief_idx: &mut brief_idx,
+                brief_in_progress: &mut brief_in_progress,
+                brief_pending_idle: &mut brief_pending_idle,
+            });
+            //（1）内部消息不写入聊天区。
+            //（2）ui_text 为空即可（push_user 会忽略空）。
+            start_user_chat_request(StartUserChatRequestArgs {
+                now,
+                ui_text: String::new(),
+                model_text: msg.model_text,
+                target: msg.target,
+                extra_system_override: msg.extra_system,
+                core: &mut core,
+                metamemo: &mut metamemo,
+                context_usage: &mut context_usage,
+                dog_state: &mut dog_state,
+                main_state: &mut main_state,
+                memory_state: &mut memory_state,
+                sys_cfg: &sys_cfg,
+                config: &config,
+                tx: &tx,
+                mode: &mut mode,
+                active_kind: &mut active_kind,
+                active_request_is_internal_placeholder: &mut active_request_is_internal_placeholder,
+                sending_until: &mut sending_until,
+                sys_log: &mut sys_log,
+                streaming_state: &mut streaming_state,
+                request_seq: &mut request_seq,
+                active_request_id: &mut active_request_id,
+                active_cancel: &mut active_cancel,
+                sse_enabled,
+                next_heartbeat_at: &mut next_heartbeat_at,
+                thinking_text: &mut thinking_text,
+                thinking_full_text: &mut thinking_full_text,
+                thinking_idx: &mut thinking_idx,
+                thinking_in_progress: &mut thinking_in_progress,
+                thinking_pending_idle: &mut thinking_pending_idle,
+                thinking_started_at: &mut thinking_started_at,
+                expanded_tool_idxs: &mut expanded_tool_idxs,
+                expanded_thinking_idxs: &mut expanded_thinking_idxs,
+                scroll: &mut scroll,
+                follow_bottom: &mut follow_bottom,
+                token_totals: &mut token_totals,
+                token_total_path: &token_total_path,
+                active_request_in_tokens: &mut active_request_in_tokens,
+                dog_client: &dog_client,
+                main_client: &main_client,
+                memory_client: &memory_client,
+            })?;
+            needs_redraw = true;
+            continue;
         }
-
-        // 发送队列：空闲时自动出队（High 优先，Low 最低优先级）。
-        // 约束：不与模型请求/工具并发；不抢占 diary/压缩流程；不与队列 UI 并发。
+        //（1）发送队列：空闲时自动出队（High 优先，Low 最低优先级）。
+        //（2）约束：不与模型请求/工具并发；不抢占 diary/压缩流程；不与队列 UI 并发。
         if send_queue_len(&send_queue_high, &send_queue_low) > 0
-            && !send_queue_dequeue_cooldown_until.is_some_and(|t| now < t)
+            && send_queue_dequeue_cooldown_until.is_none_or(|t| now >= t)
             && matches!(send_queue_ui, SendQueueUiState::Closed)
             && !diary_state.active()
             && can_inject_heartbeat(
@@ -8209,28 +7919,20 @@ fn run_loop(
                     config.sys_log_limit,
                     format!("队列出队：#{} → {:?}", msg.id, msg.target),
                 );
-                // 队列里也允许斜杠命令：会在 idle 阶段依序执行。
+                //（1）队列允许斜杠命令。
+                //（2）在 idle 阶段依序执行。
                 if handle_command(HandleCommandArgs {
                     core: &mut core,
                     raw: msg.model_text.trim_end(),
                     meta: &mut metamemo,
                     context_usage: &mut context_usage,
                     mode: &mut mode,
-                    active_kind: &mut active_kind,
-                    chat_target: &mut chat_target,
-                    dog_state: &mut dog_state,
-                    main_state: &mut main_state,
-                    memory_state: &mut memory_state,
-                    mind_ctx_idx_main: &mut mind_ctx_idx_main,
-                    mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
-                    mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
                     screen: &mut screen,
                     help_ui: &mut help_ui,
                     should_exit: &mut should_exit,
                     sse_enabled: &mut sse_enabled,
                     enter_cmd_shell: &mut pending_cmd_shell,
                     open_user_terminal: &mut pending_user_terminal,
-                    memory_panel_open: &mut memory_panel_open,
                     exit_code: &mut exit_code,
                     sys_cfg: &mut sys_cfg,
                     sys_cfg_path: &sys_cfg_path,
@@ -8326,7 +8028,6 @@ fn run_loop(
                     core: &mut core,
                     metamemo: &mut metamemo,
                     context_usage: &mut context_usage,
-                    pending_mind_half: &mut pending_mind_half,
                     dog_state: &mut dog_state,
                     main_state: &mut main_state,
                     memory_state: &mut memory_state,
@@ -8386,18 +8087,12 @@ fn run_loop(
                 Some("main"),
                 &msg,
             );
-            // DeepSeek 对 system 消息位置/排序比较敏感（容易触发 400: Invalid consecutive assistant message）。
-            // 心跳作为一次“用户事件”，用 user 消息注入到对话上下文：assistant -> user(heartbeat) -> assistant(reply)。
+            //（1）DeepSeek 对 system 位置与排序较敏感。
+            //（2）心跳按 user 消息注入上下文。
+            //（3）顺序：assistant -> user(heartbeat) -> assistant(reply)。
             let hb_user = crate::messages::render_heartbeat_user(&mcp_messages, &stamp);
             let p = context_path_for_mind(&config, "main");
-            log_dyncontext(
-                p,
-                "main",
-                "user",
-                &hb_user,
-                None,
-                None,
-            );
+            log_dyncontext(p, "main", "user", &hb_user, None, None);
             if let Some(in_tokens) = try_start_main_heartbeat(TryStartMainHeartbeatArgs {
                 main_client: &main_client,
                 main_state: &main_state,
@@ -8434,13 +8129,13 @@ fn run_loop(
             }
         }
 
-        // PTY 自动审计（可选）：默认关闭，避免在用户未要求时触发额外的 BASH 调用造成资源浪费。
+        //（1）PTY 自动审计（可选）：默认关闭，避免在用户未要求时触发额外的 BASH 调用造成资源浪费。
         if sys_cfg.pty_audit_enabled {
-            // PTY 定时审计（每 10 分钟）：以“额外系统消息”注入，让模型按需读取 status/log。
-            // 说明：不与用户请求并发；若当前忙，则延后。
+            //（1）PTY 定时审计（每 10 分钟）：以“额外系统消息”注入，让模型按需读取 status/log。
+            //（2）说明：不与用户请求并发；若当前忙，则延后。
             let running_total_now = pty_tabs.len();
-            // 只要“PTY 总数增加”（新任务启动），就重置一次审计计时：确保“本次启动的 PTY”
-            // 至少运行满间隔才会触发首轮审计。
+            //（1）只要“PTY 总数增加”（新任务启动），就重置一次审计计时：确保“本次启动的 PTY”
+            //（2）至少运行满间隔才会触发首轮审计。
             if running_total_now > last_pty_running_total && running_total_now > 0 {
                 next_pty_audit_at = Some(now + Duration::from_secs(PTY_AUDIT_INTERVAL_SECS));
             }
@@ -8454,7 +8149,7 @@ fn run_loop(
             }
             if let (Some(target), Some(next_at)) = (pty_info, next_pty_audit_at)
                 && now >= next_at
-                // 若用户正在看终端或正在交互，则不打扰：只在“后台运行”时审计更符合预期。
+                //（1）若用户正在看终端或正在交互，则不打扰：只在“后台运行”时审计更符合预期。
                 && !pty_view
                 && send_queue_len(&send_queue_high, &send_queue_low) == 0
                 && can_inject_heartbeat(
@@ -8582,8 +8277,8 @@ fn run_loop(
                 || tool_preview_active
                 || tool_preview_pending_idle
                 || thinking_pending_idle);
-        // 聊天区相关动效（乱码/思考滚动/心跳脉冲）只在聊天页驱动 tick；
-        // 否则在 Settings 页会出现“无操作也在动”的错觉。
+        //（1）聊天区相关动效（乱码/思考滚动/心跳脉冲）只在聊天页驱动 tick；
+        //（2）否则在 Settings 页会出现“无操作也在动”的错觉。
         let in_chat = matches!(screen, Screen::Chat);
         let thinking_scroll_active = in_chat && thinking_scroll_active;
         let scramble_animating = in_chat && render_cache.has_scramble_pending();
@@ -8634,9 +8329,9 @@ fn run_loop(
                             main_client.as_ref().is_some_and(|c| c.is_codex_provider())
                         }
                         MindKind::Sub => dog_client.as_ref().is_some_and(|c| c.is_codex_provider()),
-                        MindKind::Memory => {
-                            memory_client.as_ref().is_some_and(|c| c.is_codex_provider())
-                        }
+                        MindKind::Memory => memory_client
+                            .as_ref()
+                            .is_some_and(|c| c.is_codex_provider()),
                     },
                 mode,
                 reveal_idx,
@@ -8733,7 +8428,7 @@ fn run_loop(
             }
         };
         let mut input_line = if screen == Screen::Chat {
-            // 压缩/写日记期间：输入框状态栏强制占用并屏蔽其它提示（toast/菜单/输入等），直到流程结束再解除。
+            //（1）压缩/写日记期间：输入框状态栏强制占用并屏蔽其它提示（toast/菜单/输入等），直到流程结束再解除。
             let locked = if diary_state.active() {
                 Some("Updating diary".to_string())
             } else {
@@ -8775,13 +8470,13 @@ fn run_loop(
             }
             SendQueueUiState::Closed => {}
         }
-        // 输入提示行（横杠上方）：文本变化时触发（●闪烁 → 乱码展开）。
-        // 需要把它并入 anim_enabled，否则 idle 时 poll_timeout 会很长导致动画不刷新。
+        //（1）输入提示行（横杠上方）：文本变化时触发（●闪烁 → 乱码展开）。
+        //（2）需要把它并入 anim_enabled，否则 idle 时 poll_timeout 会很长导致动画不刷新。
         const HINT_ANIM_MAX_FRAMES: usize = 16;
         if input_line != hint_last {
             hint_last = input_line.clone();
             hint_anim_start_tick = spinner_tick;
-            // 文本变化时触发一次“●闪烁→乱码收敛”，包括 Ready（更有生命感）。
+            //（1）文本变化时触发一次“●闪烁→乱码收敛”，包括 Ready（更有生命感）。
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -8794,8 +8489,8 @@ fn run_loop(
         if hint_animating {
             anim_enabled = true;
         }
-        // 状态栏右侧动作提示（短暂显示）。存在时也需要刷新 tick，
-        // 否则在 idle/poll_timeout 较长时会导致提示无法及时消失。
+        //（1）状态栏右侧动作提示（短暂显示）。存在时也需要刷新 tick，
+        //（2）否则在 idle/poll_timeout 较长时会导致提示无法及时消失。
         let mut action_hint_text = String::new();
         let mut action_hint_expired = false;
         if let Some((t0, text)) = action_hint.as_ref() {
@@ -8967,8 +8662,8 @@ fn run_loop(
             true
         };
 
-        // 若 PTY 视图从“显示”切回“聊天”，应把历史动画快速推进到尾部：
-        // - 避免因 PTY 占用导致聊天区未渲染，回到聊天后把一大段旧文本从头“重播乱码/打字机”。
+        //（1）若 PTY 视图从“显示”切回“聊天”，应把历史动画快速推进到尾部：
+        //（2）避免因 PTY 占用导致聊天区未渲染，回到聊天后把一大段旧文本从头“重播乱码/打字机”。
         if prev_pty_view && !pty_view {
             chat_anim_fast_forward = true;
             needs_redraw = true;
@@ -8977,9 +8672,8 @@ fn run_loop(
 
         if needs_redraw && allow_draw {
             let pulse_dir = mind_pulse.as_ref().map(|p| p.dir);
-            // 已移除弹窗/窗口栈：思考/工具/正文都在聊天流内以“动态层”呈现。
+            //（1）已移除弹窗/窗口栈：思考/工具/正文都在聊天流内以“动态层”呈现。
             let mut settings_draw = ui::SettingsDrawResult::default();
-            let mut memory_draw = ui::MemoryPanelDrawResult { max_scroll: 0 };
             terminal.draw(|f| {
                 let size = f.area();
                 ui::fill_background(f, &theme, size);
@@ -8995,33 +8689,13 @@ fn run_loop(
                 let pty_panel_active = is_pty_panel_active(screen, pty_view, pty_tabs.as_slice());
                 let input_inner_w = size.width.saturating_sub(2).max(1) as usize;
                 let input_lines = ui::wrapped_line_count(input_inner_w, input_text);
-                // PTY 展开时仍显示输入框：输入框固定较小高度，避免把终端窗口挤没。
-                let desired_input_h = if pty_panel_active { 2 } else { input_lines.clamp(4, 10) as u16 };
-                // Memory 面板高度：测试期在 /TestMemory 时常开（与 chat_target 解耦）。
-                // 该面板从顶部横杠下拉，占用“header-sep”区域的额外高度，避免干扰聊天滚动。
-                let memory_panel_active = matches!(screen, Screen::Chat) && memory_panel_open;
-                let memory_h: u16 = if memory_panel_active {
-                    let total_h = size.height.max(1) as usize;
-                    // 默认约 1/3 屏，高度比之前减少 3 行。
-                    let mut mh = (total_h / 3).saturating_sub(3);
-                    // 至少留出：状态栏 + 上横杠 + 内容1行 + 下横杠
-                    if mh > 0 && mh < 4 {
-                        mh = 4;
-                    }
-                    // 留足空间给聊天+底栏，避免挤爆布局。
-                    let fixed0 = 1usize + 1 + 1 + 1 + 1 + 1; // 原固定区
-                    let max_mh = total_h.saturating_sub(fixed0).saturating_sub(2);
-                    // 首次进入 Memory：记录期望高度；之后不随键盘弹出/收起波动。
-                    let desired = *memory_panel_h_cache.get_or_insert(mh.min(max_mh).min(u16::MAX as usize) as u16);
-                    // 仅当屏幕过小到无法容纳时临时压缩（不回写 cache，方便键盘收起后恢复）。
-                    let max_allow = max_mh.min(u16::MAX as usize) as u16;
-                    desired.min(max_allow)
+                //（1）PTY 展开时仍显示输入框：输入框固定较小高度，避免把终端窗口挤没。
+                let desired_input_h = if pty_panel_active {
+                    2
                 } else {
-                    memory_panel_h_cache = None;
-                    0
+                    input_lines.clamp(4, 10) as u16
                 };
-
-                let fixed = 1 + (1 + memory_h) + 1 + 1 + 1 + 1; // header + header-sep(+memory) + spacer + status + sep + ctx
+                let fixed = 1 + 1 + 1 + 1 + 1 + 1; // header + tabs + header-sep + status + sep + ctx
                 let avail = size.height.saturating_sub(fixed).max(2); // 至少给 chat+bottom 留 2 行
                 let max_input_h = avail.saturating_sub(1); // 给 chat 至少 1 行
                 let input_h = desired_input_h.min(max_input_h.max(1));
@@ -9030,9 +8704,9 @@ fn run_loop(
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(1),
-                        Constraint::Length(1 + memory_h),
-                        Constraint::Min(1),
-                        Constraint::Length(1),
+                        Constraint::Length(1), // tabs
+                        Constraint::Length(1), // header-sep
+                        Constraint::Min(1),    // body
                         Constraint::Length(1),
                         Constraint::Length(1),
                         Constraint::Length(bottom_h),
@@ -9040,76 +8714,97 @@ fn run_loop(
                     ])
                     .split(size);
 
-	                ui::draw_header(
-	                    f,
-	                    ui::DrawHeaderArgs {
-	                        theme: &theme,
-	                        area: chunks[0],
-	                        // 记忆面板的标题/状态不放在 Powered by 的中间提示里（避免抢占顶栏注意力）。
-	                        center: "",
-	                        main_mode: {
-	                            match mode {
-	                                Mode::Generating => match active_kind {
-	                                    MindKind::Main => mode,
-                                    MindKind::Sub => Mode::Idle,
-                                    MindKind::Memory => Mode::Idle,
-                                },
-                                Mode::ExecutingTool | Mode::ApprovingTool => {
-                                    if active_tool_stream
-                                        .as_ref()
-                                        .is_some_and(|s| matches!(s.owner, MindKind::Main))
-                                    {
-                                        mode
-                                    } else {
-                                        Mode::Idle
-                                    }
-                                }
-                                _ => Mode::Idle,
-                            }
-                        },
-                        dog_mode: {
-                            match mode {
-                                Mode::Generating => match active_kind {
-                                    MindKind::Sub => mode,
-                                    MindKind::Main => Mode::Idle,
-                                    MindKind::Memory => Mode::Idle,
-                                },
-                                Mode::ExecutingTool | Mode::ApprovingTool => {
-                                    if active_tool_stream
-                                        .as_ref()
-                                        .is_some_and(|s| matches!(s.owner, MindKind::Sub))
-                                    {
-                                        mode
-                                    } else {
-                                        Mode::Idle
-                                    }
-                                }
-                                _ => Mode::Idle,
-                            }
-                        },
+                let main_mode = match mode {
+                    Mode::Generating => match active_kind {
+                        MindKind::Main => mode,
+                        MindKind::Sub | MindKind::Memory => Mode::Idle,
+                    },
+                    Mode::ExecutingTool | Mode::ApprovingTool => {
+                        if active_tool_stream
+                            .as_ref()
+                            .is_some_and(|s| matches!(s.owner, MindKind::Main))
+                        {
+                            mode
+                        } else {
+                            Mode::Idle
+                        }
+                    }
+                    _ => Mode::Idle,
+                };
+                let dog_mode = match mode {
+                    Mode::Generating => match active_kind {
+                        MindKind::Sub => mode,
+                        MindKind::Main | MindKind::Memory => Mode::Idle,
+                    },
+                    Mode::ExecutingTool | Mode::ApprovingTool => {
+                        if active_tool_stream
+                            .as_ref()
+                            .is_some_and(|s| matches!(s.owner, MindKind::Sub))
+                        {
+                            mode
+                        } else {
+                            Mode::Idle
+                        }
+                    }
+                    _ => Mode::Idle,
+                };
+                let memory_mode = match mode {
+                    Mode::Generating => match active_kind {
+                        MindKind::Memory => mode,
+                        MindKind::Main | MindKind::Sub => Mode::Idle,
+                    },
+                    Mode::ExecutingTool | Mode::ApprovingTool => {
+                        if active_tool_stream
+                            .as_ref()
+                            .is_some_and(|s| matches!(s.owner, MindKind::Memory))
+                        {
+                            mode
+                        } else {
+                            Mode::Idle
+                        }
+                    }
+                    _ => Mode::Idle,
+                };
+
+                ui::draw_header(
+                    f,
+                    ui::DrawHeaderArgs {
+                        theme: &theme,
+                        area: chunks[0],
+                        center: "",
+                        main_mode,
+                        dog_mode,
+                        memory_mode,
                         user_active: input_active,
                         pulse_dir,
                         tick: spinner_tick,
                         run_secs,
                     },
                 );
-	                // 顶部横杠：用于把“标题栏”和主体隔离开。
-	                // Memory 面板展开时：横杠保持固定（不下移），面板从横杠下方开始展开。
-	                let header_sep_y = chunks[1].y;
-	                let header_sep_area = ratatui::layout::Rect {
-	                    x: chunks[1].x,
-	                    y: header_sep_y,
-	                    width: chunks[1].width,
-	                    height: 1,
-	                };
-	                ui::draw_separator(
-	                    f,
-	                    ui::DrawSeparatorArgs {
-	                        theme: &theme,
-                        area: header_sep_area,
+
+                tabs_rect_cache = Some(chunks[1]);
+                ui::draw_chat_tabs(
+                    f,
+                    ui::DrawChatTabsArgs {
+                        theme: &theme,
+                        area: chunks[1],
+                        active_tab: chat_target,
+                        main_busy: !is_idle_like(main_mode),
+                        dog_busy: !is_idle_like(dog_mode),
+                        memory_busy: !is_idle_like(memory_mode),
+                        tick: spinner_tick,
+                    },
+                );
+
+                //（1）顶部横杠：用于把“标题栏”和主体隔离开。
+                ui::draw_separator(
+                    f,
+                    ui::DrawSeparatorArgs {
+                        theme: &theme,
+                        area: chunks[2],
                         mode,
                         active_kind,
-                        // 顶栏横杠：只在 API 活跃时动画（避免“输入中也在动”造成噪声）。
+                        //（1）顶栏横杠：只在 API 活跃时动画（避免“输入中也在动”造成噪声）。
                         user_active: false,
                         highlight: if pty_panel_active {
                             matches!(screen, Screen::Chat) && matches!(pty_focus, PtyFocus::Chat)
@@ -9119,486 +8814,35 @@ fn run_loop(
                         tick: spinner_tick,
                         hint: "",
                     },
-	                );
-                memory_rect_cache = None;
-                if matches!(screen, Screen::Chat) && memory_panel_open && chunks[1].height > 1
-                {
-                    let memory_area = ratatui::layout::Rect {
-                        x: chunks[1].x,
-                        // chunks[1] 顶部一行是“顶栏横杠”；Memory 面板从下一行开始。
-                        y: chunks[1].y.saturating_add(1),
-                        width: chunks[1].width,
-                        height: chunks[1].height.saturating_sub(1),
-                    };
-                    memory_rect_cache = Some(memory_area);
-
-                    // Memory 面板结构：
-                    // 1 状态栏
-                    // 2 横杠
-                    // 3 内容（可滚动）
-                    // 4 横杠
-                    let status_h: u16 = 1;
-                    let sep_h: u16 = 1;
-                    let content_h = memory_area
-                        .height
-                        .saturating_sub(status_h)
-                        .saturating_sub(sep_h)
-                        .saturating_sub(sep_h)
-                        .max(1);
-                    let status_area = ratatui::layout::Rect {
-                        x: memory_area.x,
-                        y: memory_area.y,
-                        width: memory_area.width,
-                        height: status_h,
-                    };
-                    let mem_top_sep_area = ratatui::layout::Rect {
-                        x: memory_area.x,
-                        y: memory_area.y.saturating_add(status_h),
-                        width: memory_area.width,
-                        height: sep_h,
-                    };
-                    let mem_content_area = ratatui::layout::Rect {
-                        x: memory_area.x,
-                        y: memory_area.y.saturating_add(status_h).saturating_add(sep_h),
-                        width: memory_area.width,
-                        height: content_h,
-                    };
-                    let mem_bottom_sep_area = ratatui::layout::Rect {
-                        x: memory_area.x,
-                        y: mem_content_area.y.saturating_add(mem_content_area.height),
-                        width: memory_area.width,
-                        height: sep_h,
-                    };
-
-                    // 记忆状态栏文案：左侧固定 label；中间只显示状态（Thinking/Typing/MemoryAdd/.../Ready）。
-                    let (mem_status, mem_busy) = {
-                        let mut busy = false;
-                        let mut status = "Ready".to_string();
-                        if matches!(mode, Mode::Generating) && matches!(active_kind, MindKind::Memory) {
-                            busy = true;
-                            if matches!(diary_state.stage, DiaryStage::WaitingMain) {
-                                status = "MemoryAdd".to_string();
-                            } else {
-                                status = "Thinking".to_string();
-                            }
-                        } else if matches!(mode, Mode::ExecutingTool | Mode::ApprovingTool)
-                            && active_tool_stream
-                                .as_ref()
-                                .is_some_and(|s| matches!(s.owner, MindKind::Memory))
-                        {
-                            busy = true;
-                            let tool = active_tool_stream
-                                .as_ref()
-                                .map(|s| s.call.tool.trim().to_ascii_lowercase())
-                                .unwrap_or_default();
-                            if tool == "memory_read" {
-                                status = "MemoryRead".to_string();
-                            } else if tool == "memory_check" {
-                                status = "MemoryCheck".to_string();
-                            } else if tool == "memory_add" {
-                                status = "MemoryAdd".to_string();
-                            } else {
-                                status = "Tool".to_string();
-                            }
-                        } else if memory_focus && input_active {
-                            busy = true;
-                            status = "Typing".to_string();
-                        }
-                        (status, busy)
-                    };
-                    ui::draw_memory_status_line(
-                        f,
-                        &theme,
-                        status_area,
-                        mem_status.as_str(),
-                        mem_busy,
-                        spinner_tick,
-                    );
-                    ui::draw_separator(
-                        f,
-                        ui::DrawSeparatorArgs {
-                            theme: &theme,
-                            area: mem_top_sep_area,
-                            mode,
-                            active_kind,
-                            user_active: false,
-                            highlight: memory_focus,
-                            // Memory 区域横杠不做动画（仅顶栏横杠有动画）。
-                            tick: 0,
-                            hint: "",
-                        },
-                    );
-                    ui::draw_separator(
-                        f,
-                        ui::DrawSeparatorArgs {
-                            theme: &theme,
-                            area: mem_bottom_sep_area,
-                            mode,
-                            active_kind,
-                            user_active: false,
-                            highlight: memory_focus,
-                            tick: 0,
-                            hint: "",
-                        },
-                    );
-
-                    fn sanitize_memory_text(s: &str) -> String {
-                        // Memory 面板只展示“工具名+brief”，这里做最小去噪，避免 brief 里夹着 markdown 符号。
-                        let mut out = s.replace("```", "");
-                        out = out.replace("**", "");
-                        out = out.replace('`', "");
-                        out.trim().to_string()
+                );
+                if screen == Screen::Chat {
+                    //（1）Chat 始终可见：PTY 仅占用底部面板（半屏），不再“整块替换聊天区”。
+                    chat_rect_cache = Some(chunks[3]);
+                    if pty_panel_active {
+                        //（1）底部区域：上方终端 + 下方输入框
+                        let ih = input_h.min(chunks[6].height.saturating_sub(3).max(1));
+                        let input_area = ratatui::layout::Rect {
+                            x: chunks[6].x,
+                            y: chunks[6]
+                                .y
+                                .saturating_add(chunks[6].height.saturating_sub(ih)),
+                            width: chunks[6].width,
+                            height: ih,
+                        };
+                        let pty_area = ratatui::layout::Rect {
+                            x: chunks[6].x,
+                            y: chunks[6].y,
+                            width: chunks[6].width,
+                            height: chunks[6].height.saturating_sub(ih),
+                        };
+                        input_rect_cache = Some(input_area);
+                        pty_rect_cache = Some(pty_area);
+                    } else {
+                        input_rect_cache = Some(chunks[6]);
+                        pty_rect_cache = None;
                     }
-                    fn pretty_memory_tool_label(raw: &str) -> String {
-                        // 统一成紧凑标签：仅用于 Memory 面板显示。
-                        // 说明：工具回执里 TOOL: 往往是 display label（例如 "Memory Read"），不是底层工具 key。
-                        let t = raw.trim();
-                        if t.eq_ignore_ascii_case("MemoryCheck")
-                            || t.eq_ignore_ascii_case("Memory Check")
-                            || t.eq_ignore_ascii_case("MFIND")
-                        {
-                            return "MemoryCheck".to_string();
-                        }
-                        if t.eq_ignore_ascii_case("MemoryRead")
-                            || t.eq_ignore_ascii_case("Memory Read")
-                            || t.eq_ignore_ascii_case("MREAD")
-                        {
-                            return "MemoryRead".to_string();
-                        }
-                        if t.eq_ignore_ascii_case("MemoryAdd")
-                            || t.eq_ignore_ascii_case("Memory Add")
-                            || t.eq_ignore_ascii_case("MADD")
-                        {
-                            return "MemoryAdd".to_string();
-                        }
-                        if t.eq_ignore_ascii_case("BASH") || t.eq_ignore_ascii_case("Bash") {
-                            return "Bash".to_string();
-                        }
-                        if t.eq_ignore_ascii_case("ADB") || t.eq_ignore_ascii_case("ADB Shell") {
-                            return "Adb".to_string();
-                        }
-                        if t.eq_ignore_ascii_case("TERMUX") || t.eq_ignore_ascii_case("TERMUX API") {
-                            return "TermuxApi".to_string();
-                        }
-                        // fallback：去掉空格，尽量紧凑
-                        t.split_whitespace().collect::<String>()
-                    }
-                    fn extract_memory_tool_brief_one_line(tool_text: &str) -> Option<String> {
-                        // 只解析工具名与 brief；不展示 input/output/meta/status（避免刷屏）。
-                        let mut tool = None::<String>;
-                        let mut explain = None::<String>;
-                        for line in tool_text.lines().take(40) {
-                            let t = line.trim_end();
-                            if tool.is_none() {
-                                if let Some(rest) = t.strip_prefix("TOOL:") {
-                                    let v = rest.trim();
-                                    if !v.is_empty() {
-                                        tool = Some(v.to_string());
-                                    }
-                                }
-                            }
-                            if explain.is_none() {
-                                if let Some(rest) = t.strip_prefix("EXPLAIN:") {
-                                    let v = rest.trim();
-                                    if !v.is_empty() {
-                                        explain = Some(v.to_string());
-                                    }
-                                }
-                            }
-                            if tool.is_some() && explain.is_some() {
-                                break;
-                            }
-                        }
-                        let tool = tool?;
-                        let label = pretty_memory_tool_label(tool.as_str());
-                        let brief = sanitize_memory_text(explain.unwrap_or_default().as_str());
-                        if brief.is_empty() {
-                            Some(label)
-                        } else {
-                            Some(format!("{label} · {brief}"))
-                        }
-                    }
-                    fn compact_tool_call_json_for_ui(call: &ToolCall) -> String {
-                        // 仅用于 UI 临时展示：尽量短、单行、可读。
-                        // 注意：不要把 output/meta 等回执信息塞进来。
-                        let mut m = serde_json::Map::new();
-                        let tool = call.tool.trim();
-                        if !tool.is_empty() {
-                            m.insert("tool".to_string(), serde_json::Value::String(tool.to_string()));
-                        }
-                        if let Some(b) = call.brief.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("brief".to_string(), serde_json::Value::String(b.to_string()));
-                        }
-                        // 常用字段：只在非空时写入。
-                        if let Some(p) = call.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("path".to_string(), serde_json::Value::String(p.to_string()));
-                        }
-                        if let Some(p) = call.pattern.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("pattern".to_string(), serde_json::Value::String(p.to_string()));
-                        }
-                        if let Some(r) = call.root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("root".to_string(), serde_json::Value::String(r.to_string()));
-                        }
-                        if let Some(r) = call.region.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("region".to_string(), serde_json::Value::String(r.to_string()));
-                        }
-                        if let Some(d) = call.date_start.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("date_start".to_string(), serde_json::Value::String(d.to_string()));
-                        }
-                        if let Some(d) = call.date_end.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("date_end".to_string(), serde_json::Value::String(d.to_string()));
-                        }
-                        if let Some(dates) = call.dates.as_ref().filter(|v| !v.is_empty()) {
-                            let arr = dates
-                                .iter()
-                                .map(|s| serde_json::Value::String(s.trim().to_string()))
-                                .collect::<Vec<_>>();
-                            m.insert("dates".to_string(), serde_json::Value::Array(arr));
-                        }
-                        if let Some(s) = call.section.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("section".to_string(), serde_json::Value::String(s.to_string()));
-                        }
-                        if let Some(c) = call.category.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            m.insert("category".to_string(), serde_json::Value::String(c.to_string()));
-                        }
-                        if let Some(c) = call.content.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            // content 可能很长：这里只留短预览。
-                            let mut s = c.to_string();
-                            // 这里按 bytes 截断即可（UI 预览用），避免引入额外的“按字符截断”函数依赖。
-                            truncate_to_max_bytes(&mut s, 600);
-                            m.insert("content".to_string(), serde_json::Value::String(s));
-                        }
-                        serde_json::to_string(&serde_json::Value::Object(m)).unwrap_or_else(|_| "{}".to_string())
-                    }
-
-                    let mut mem_lines: Vec<String> = Vec::new();
-                    const MEMORY_PANEL_ENTRY_MAX_CHARS: usize = 800;
-                    let active_tool_idx = active_tool_stream
-                        .as_ref()
-                        .filter(|s| matches!(s.owner, MindKind::Memory))
-                        .map(|s| s.idx);
-                    for (idx, m) in core.history.iter().enumerate() {
-                        if m.mind != Some(MindKind::Memory) {
-                            continue;
-                        }
-                        let text = m.text.trim_end_matches('\r').trim_end();
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        match m.role {
-                            Role::User => {
-                                // Memory 面板：用户消息用 `▷` 前缀。避免 markdown/代码块符号刷屏，做轻量去噪。
-                                let mut t = sanitize_memory_text(text);
-                                t = compact_ws_inline(&t);
-                                t = truncate_with_ellipsis(&t, MEMORY_PANEL_ENTRY_MAX_CHARS);
-                                if !t.is_empty() {
-                                    mem_lines.push(format!("▷ · {t}"));
-                                }
-                            }
-                            Role::Assistant => {
-                                // Memory 面板：assistant 正文用 `▶` 前缀。
-                                // 若输出包含工具调用块，则仅显示“工具名+brief”，不回显 JSON（避免噪音）。
-                                // 说明：工具 JSON 会在聊天区被拆成独立 Tool 消息（并且本面板会显示工具摘要），
-                                // 因此这里仅展示“去除 tool 块后的正文”，避免重复/刷屏。
-                                let (_calls, cleaned) = crate::mcp::extract_tool_calls(text)
-                                    .unwrap_or_else(|_| (vec![], text.to_string()));
-                                let cleaned = cleaned.trim();
-                                if cleaned.is_empty() {
-                                    continue;
-                                }
-                                let mut t = sanitize_memory_text(cleaned);
-                                t = t.trim().to_string();
-                                t = truncate_with_ellipsis(&t, MEMORY_PANEL_ENTRY_MAX_CHARS);
-                                if !t.is_empty() {
-                                    mem_lines.push(format!("▶ · {t}"));
-                                }
-                            }
-                            Role::Tool => {
-                                // Memory 面板：工具回执只展示“工具名+brief”；思考用单行跑马灯展示。
-                                if text.starts_with(THINK_TOOL_MARKER) {
-	                                    fn extract_thinking_output_inline(tool_text: &str) -> String {
-                                        // 解析 THINK 工具回执的 output ```text ... ```，压成单行（用于跑马灯）。
-                                        let mut out = String::new();
-                                        let mut in_block = false;
-                                        for line in tool_text.lines() {
-                                            let t = line.trim_end();
-                                            if !in_block {
-                                                if t == "output:" {
-                                                    continue;
-                                                }
-                                                if t == "```text" {
-                                                    in_block = true;
-                                                }
-                                                continue;
-                                            }
-                                            if t == "```" {
-                                                break;
-                                            }
-                                            if !out.is_empty() {
-                                                out.push(' ');
-                                            }
-                                            out.push_str(t.trim());
-                                        }
-                                        compact_ws_inline(out.as_str())
-                                    }
-	                                    fn extract_thinking_secs(tool_text: &str) -> Option<u64> {
-                                        // 优先从 meta 的 `耗时:{secs}s` 提取；其次从 input 行里的 `... {secs}s.` 猜测。
-                                        for line in tool_text.lines().take(60) {
-                                            let t = line.trim();
-                                            if let Some(pos) = t.find("耗时:") {
-                                                let rest = &t[pos + "耗时:".len()..];
-                                                let digits: String = rest
-                                                    .chars()
-                                                    .take_while(|ch| ch.is_ascii_digit())
-                                                    .collect();
-                                                if let Ok(v) = digits.parse::<u64>() {
-                                                    return Some(v);
-                                                }
-                                            }
-                                        }
-                                        for line in tool_text.lines().take(40) {
-                                            let t = line.trim();
-                                            if let Some(rest) = t.strip_prefix("input:") {
-                                                let r = rest.trim();
-                                                if let Some(pos) = r.rfind(' ') {
-                                                    let tail = r[pos..].trim();
-                                                    let digits: String = tail
-                                                        .chars()
-                                                        .filter(|ch| ch.is_ascii_digit())
-                                                        .collect();
-                                                    if let Ok(v) = digits.parse::<u64>() {
-                                                        if v > 0 {
-                                                            return Some(v);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-	                                        None
-	                                    }
-	                                    fn extract_last_status(tool_text: &str) -> Option<String> {
-	                                        // 工具输出可能是“累积文本”：既包含旧的 `状态:running`，又包含最终 `状态:0`。
-	                                        // 这里取最后一次出现的状态值，避免 `contains("状态:running")` 误判导致跑马灯永远不结束。
-	                                        let mut last: Option<String> = None;
-	                                        for line in tool_text.lines() {
-	                                            let t = line.trim();
-	                                            // 常见格式：
-	                                            // - "状态:running"
-	                                            // - "状态:0 | 耗时:3s | chars:123"
-	                                            // - "... | 状态:running | ..."
-	                                            // 统一扫一遍该行内所有片段。
-	                                            for part in t.split('|') {
-	                                                let p = part.trim();
-	                                                let v = if let Some(rest) = p.strip_prefix("状态:") {
-	                                                    rest.trim()
-	                                                } else if let Some(rest) = p.strip_prefix("status:") {
-	                                                    rest.trim()
-	                                                } else {
-	                                                    continue;
-	                                                };
-	                                                if v.is_empty() {
-	                                                    continue;
-	                                                }
-	                                                let token = v
-	                                                    .split_whitespace()
-	                                                    .next()
-	                                                    .unwrap_or("")
-	                                                    .trim()
-	                                                    .to_ascii_lowercase();
-	                                                if !token.is_empty() {
-	                                                    last = Some(token);
-	                                                }
-	                                            }
-	                                        }
-	                                        last
-	                                    }
-		                                    // 多次 THINK 回执会在同一轮里反复出现：这里保持“只显示最后一条思考状态”，避免占多行刷屏。
-		                                    if mem_lines
-		                                        .last()
-		                                        .is_some_and(|s| s.starts_with("▶ · Thinking · ") || s.starts_with("▶ · Thought"))
-		                                    {
-		                                        mem_lines.pop();
-		                                    }
-		                                    // “是否仍在流式/执行中”以 UI 当前状态为准：流式一结束就应立即停止跑马灯。
-		                                    // 避免工具输出里残留旧的 running 文本导致“思考行”挂住。
-		                                    let last_status = extract_last_status(text);
-		                                    let running = mem_busy
-		                                        && last_status
-		                                            .as_deref()
-		                                            .is_some_and(|s| s.eq_ignore_ascii_case("running"));
-		                                    if running {
-		                                        let mut body = extract_thinking_output_inline(text);
-		                                        if body.is_empty() {
-		                                            // stub（无 output）：给一个最小占位，避免显示空前缀。
-	                                            body = "…".to_string();
-	                                        }
-	                                        // UI 侧会对该行做跑马灯横向滚动。
-	                                        mem_lines.push(format!("▶ · Thinking · {body}"));
-	                                    } else if let Some(secs) = extract_thinking_secs(text) {
-	                                        mem_lines.push(format!("▶ · Thought for {secs}s"));
-	                                    } else {
-	                                        mem_lines.push("▶ · Thought".to_string());
-	                                    }
-                                    continue;
-                                }
-                                if let Some(summary) = extract_memory_tool_brief_one_line(text) {
-                                    // 运行中的工具：额外展示“原 tool call（单行）”用于观察；执行完自动隐藏。
-                                    if mem_busy && active_tool_idx == Some(idx) {
-                                        mem_lines.push(format!("▶ · {summary}"));
-                                        if let Some(state) = active_tool_stream.as_ref() {
-                                            let json1 = compact_tool_call_json_for_ui(&state.call);
-                                            mem_lines.push(format!("// <tool>{json1}</tool>"));
-                                        }
-                                    } else {
-                                        mem_lines.push(format!("▶ · {summary}"));
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    let max_lines = (mem_content_area.height.max(1) as usize).saturating_mul(80);
-                    if mem_lines.len() > max_lines {
-                        mem_lines = mem_lines[mem_lines.len() - max_lines..].to_vec();
-                    }
-                    let mem_text = mem_lines.join("\n");
-                    memory_draw = ui::draw_memory_panel(
-                        f,
-                        &theme,
-                        mem_content_area,
-	                        mem_text.as_str(),
-	                        if memory_focus { memory_scroll } else { u16::MAX },
-	                        if mem_busy { spinner_tick } else { 0 },
-	                        memory_focus,
-	                    );
-	                }
-
-	                if screen == Screen::Chat {
-	                    // Chat 始终可见：PTY 仅占用底部面板（半屏），不再“整块替换聊天区”。
-	                    chat_rect_cache = Some(chunks[2]);
-	                    if pty_panel_active {
-	                        // 底部区域：上方终端 + 下方输入框
-	                        let ih = input_h.min(chunks[6].height.saturating_sub(3).max(1));
-	                        let input_area = ratatui::layout::Rect {
-	                            x: chunks[6].x,
-	                            y: chunks[6].y.saturating_add(chunks[6].height.saturating_sub(ih)),
-	                            width: chunks[6].width,
-	                            height: ih,
-	                        };
-	                        let pty_area = ratatui::layout::Rect {
-	                            x: chunks[6].x,
-	                            y: chunks[6].y,
-	                            width: chunks[6].width,
-	                            height: chunks[6].height.saturating_sub(ih),
-	                        };
-	                        input_rect_cache = Some(input_area);
-	                        pty_rect_cache = Some(pty_area);
-	                    } else {
-	                        input_rect_cache = Some(chunks[6]);
-	                        pty_rect_cache = None;
-	                    }
-	                    settings_rect_cache = None;
-                    let chat_width = chunks[2].width.max(1) as usize;
+                    settings_rect_cache = None;
+                    let chat_width = chunks[3].width.max(1) as usize;
                     if chat_anim_fast_forward {
                         render_cache.prepare(chat_width, core.history.len());
                         render_cache.fast_forward_all_animations_to_tail(&core);
@@ -9609,27 +8853,43 @@ fn run_loop(
                         core: &core,
                         render_cache: &mut render_cache,
                         width: chat_width,
+                        active_tab: chat_target,
                         streaming_idx: streaming_state.idx,
                         reveal_idx,
                         reveal_len,
                         tick: spinner_tick,
                         selected_msg_idx,
                         tool_global_expanded: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
+                            if chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            ) {
                                 codex_tool_global_expanded
                             } else {
                                 tool_global_expanded
                             }
                         },
                         expanded_tool_idxs: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
+                            if chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            ) {
                                 &codex_expanded_tool_idxs
                             } else {
                                 &expanded_tool_idxs
                             }
                         },
                         collapsed_tool_idxs: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
+                            if chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            ) {
                                 &codex_collapsed_tool_idxs
                             } else {
                                 &collapsed_tool_idxs
@@ -9640,38 +8900,58 @@ fn run_loop(
                         collapsed_user_idxs: &collapsed_user_idxs,
                         thinking_idx,
                         thinking_global_expanded: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
+                            if chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            ) {
                                 codex_thinking_global_expanded
                             } else {
                                 thinking_global_expanded
                             }
                         },
                         expanded_thinking_idxs: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
+                            if chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            ) {
                                 &codex_expanded_thinking_idxs
                             } else {
                                 &expanded_thinking_idxs
                             }
                         },
                         collapsed_thinking_idxs: {
-                            if chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client) {
+                            if chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            ) {
                                 &codex_collapsed_thinking_idxs
                             } else {
                                 &collapsed_thinking_idxs
                             }
                         },
                         details_mode,
-                        // Codex：虽然 transport 仍用 SSE（responses 要求 stream=true），但很多中转商是“伪流式”。
-                        // UI 侧禁用流式动效，避免出现乱码/逐行刷屏的错觉与状态错乱。
+                        //（1）Codex：transport 用 SSE，但中转商常是伪流式。
+                        //（2）UI 侧禁用流式动效，避免出现乱码/逐行刷屏的错觉与状态错乱。
                         streaming_enabled: sse_enabled
-                            && !chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client),
+                            && !chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            ),
                         pulse_idx,
                         pulse_style,
                     });
                     msg_line_ranges_cache = layout.msg_line_ranges;
                     let chat_lines = layout.lines;
                     chat_width_cache = chat_width;
-                    let chat_height = chunks[2].height.max(1) as usize;
+                    let chat_height = chunks[3].height.max(1) as usize;
                     chat_height_cache = chat_height;
                     let total_lines = chat_lines.len();
                     let max_scroll = total_lines.saturating_sub(chat_height) as u16;
@@ -9688,7 +8968,7 @@ fn run_loop(
                     if follow_bottom || scroll > max_scroll {
                         scroll = max_scroll;
                     }
-                    ui::draw_chat(f, &theme, chunks[2], chat_lines, scroll);
+                    ui::draw_chat(f, &theme, chunks[3], chat_lines, scroll);
 
                     ui::draw_hint_line(
                         f,
@@ -9705,21 +8985,23 @@ fn run_loop(
                             anim_seed: hint_anim_seed,
                         },
                     );
-                    //（已移除弹窗/窗口栈：不在此处绘制“思考窗”）
+                    //（1）（已移除弹窗/窗口栈：不在此处绘制“思考窗”）
 
-                    //（已移除弹窗/窗口栈：不在此处绘制“工具/正文弹窗”与“思考置顶窗”）
+                    //（1）（已移除弹窗/窗口栈：不在此处绘制“工具/正文弹窗”与“思考置顶窗”）
                 } else {
                     chat_rect_cache = None;
                     input_rect_cache = None;
                     pty_rect_cache = None;
-                    settings_rect_cache = Some(chunks[2]);
+                    settings_rect_cache = Some(chunks[3]);
                     let menu_items = settings_menu_items();
-                    let settings_area = chunks[2];
+                    let settings_area = chunks[3];
                     let max_fields = settings_area.height.saturating_sub(5).max(1) as usize;
                     let total = settings_fields.len();
                     let scroll = if total > max_fields {
                         let max_scroll = total.saturating_sub(max_fields);
-                        let s = settings.field_index.saturating_sub(max_fields.saturating_sub(1));
+                        let s = settings
+                            .field_index
+                            .saturating_sub(max_fields.saturating_sub(1));
                         s.min(max_scroll)
                     } else {
                         0
@@ -9753,7 +9035,7 @@ fn run_loop(
                         f,
                         ui::DrawSettingsArgs {
                             theme: &theme,
-                            area: chunks[2],
+                            area: chunks[3],
                             title: settings_section_title(settings_section),
                             menu_items: &menu_items,
                             menu_selected: settings.menu_index,
@@ -9797,7 +9079,9 @@ fn run_loop(
                     let ih = input_h.min(chunks[6].height.saturating_sub(3).max(1));
                     let input_area = ratatui::layout::Rect {
                         x: chunks[6].x,
-                        y: chunks[6].y.saturating_add(chunks[6].height.saturating_sub(ih)),
+                        y: chunks[6]
+                            .y
+                            .saturating_add(chunks[6].height.saturating_sub(ih)),
                         width: chunks[6].width,
                         height: ih,
                     };
@@ -9824,8 +9108,9 @@ fn run_loop(
                             area: input_area,
                             input: input_text,
                             cursor: input_cursor,
-                            // PTY 展开时：输入框仅在“聊天焦点”下可编辑（点击输入框会切到 PtyFocus::Chat）。
-                            focused: matches!(screen, Screen::Chat) && matches!(pty_focus, PtyFocus::Chat),
+                            //（1）PTY 展开时：输入框仅在“聊天焦点”下可编辑（点击输入框会切到 PtyFocus::Chat）。
+                            focused: matches!(screen, Screen::Chat)
+                                && matches!(pty_focus, PtyFocus::Chat),
                         },
                     );
                 } else {
@@ -9843,16 +9128,16 @@ fn run_loop(
                 if let Some(pos) = settings_draw.cursor {
                     f.set_cursor_position(pos);
                 }
-                // 底部菜单（与聊天区域互斥覆盖）：Help > “/”命令 > 发送队列。
+                //（1）底部菜单（与聊天区域互斥覆盖）：Help > “/”命令 > 发送队列。
                 let help_open = matches!(help_ui, HelpUiState::Selecting { .. });
                 if help_open && matches!(screen, Screen::Chat) {
                     let items = help_menu_items();
-                    let available = chunks[2].height.max(1) as usize;
+                    let available = chunks[3].height.max(1) as usize;
                     let menu_h = items.len().min(available).max(1) as u16;
                     let menu_area = ratatui::layout::Rect {
-                        x: chunks[2].x,
+                        x: chunks[3].x,
                         y: chunks[4].y.saturating_sub(menu_h),
-                        width: chunks[2].width,
+                        width: chunks[3].width,
                         height: menu_h,
                     };
                     let sel = match help_ui {
@@ -9861,21 +9146,21 @@ fn run_loop(
                     };
                     ui::draw_owned_menu(f, &theme, menu_area, &items, sel);
                 } else if menu_open && matches!(screen, Screen::Chat) {
-                    // “/”命令菜单：以横杠为基准向上展开（占用聊天区域底部），避免遮挡提示/解释行。
-                    let available = chunks[2].height.max(1) as usize;
+                    //（1）“/”命令菜单：以横杠为基准向上展开（占用聊天区域底部），避免遮挡提示/解释行。
+                    let available = chunks[3].height.max(1) as usize;
                     let menu_h = menu_items.len().min(available).max(1) as u16;
                     let menu_area = ratatui::layout::Rect {
-                        x: chunks[2].x,
+                        x: chunks[3].x,
                         y: chunks[4].y.saturating_sub(menu_h),
-                        width: chunks[2].width,
+                        width: chunks[3].width,
                         height: menu_h,
                     };
                     ui::draw_command_menu(f, &theme, menu_area, &menu_items, command_menu_selected);
                 } else if matches!(screen, Screen::Chat)
                     && matches!(send_queue_ui, SendQueueUiState::Selecting { .. })
                 {
-                    // 发送队列菜单（Alt+↑ 打开）：与 “/” 菜单互斥，避免同时覆盖同一块区域。
-                    let available = chunks[2].height.max(1) as usize;
+                    //（1）发送队列菜单（Alt+↑ 打开）：与 “/” 菜单互斥，避免同时覆盖同一块区域。
+                    let available = chunks[3].height.max(1) as usize;
                     let mut items: Vec<ui::OwnedMenuItem> = Vec::new();
                     for m in send_queue_high.iter() {
                         let mut right = m.model_text.trim().replace('\n', " ⏎ ");
@@ -9902,9 +9187,9 @@ fn run_loop(
                     if !items.is_empty() {
                         let menu_h = items.len().min(available).max(1) as u16;
                         let menu_area = ratatui::layout::Rect {
-                            x: chunks[2].x,
+                            x: chunks[3].x,
                             y: chunks[4].y.saturating_sub(menu_h),
-                            width: chunks[2].width,
+                            width: chunks[3].width,
                             height: menu_h,
                         };
                         let sel = match send_queue_ui {
@@ -9950,13 +9235,12 @@ fn run_loop(
                 .map(|r| r.width.max(1) as usize)
                 .unwrap_or(0);
             settings_editor_rect_cache = settings_draw.editor_rect;
-            memory_max_scroll_cache = memory_draw.max_scroll;
             needs_redraw = false;
             last_draw_at = now;
         }
 
-        // Termux 下某些“软键盘弹出/收回”不稳定触发 Event::Resize。
-        // 为保证 UI/PTY 能及时重绘并同步尺寸，这里每轮做一次 size 探测。
+        //（1）Termux 下某些“软键盘弹出/收回”不稳定触发 Event::Resize。
+        //（2）为保证 UI/PTY 能及时重绘并同步尺寸，这里每轮做一次 size 探测。
         if let Ok(rect) = terminal.size() {
             let cur = (rect.width, rect.height);
             if last_term_size != Some(cur) {
@@ -9992,34 +9276,12 @@ fn run_loop(
                         touch_drag_last_row = None;
                         touch_drag_last_col = None;
                         let up = matches!(me.kind, MouseEventKind::ScrollUp);
-                        // Termux 触控滚动会高频触发 ScrollUp/Down；步长过大会显得“跑得比手势快”。
+                        //（1）Termux 触控滚动会高频触发 ScrollUp/Down。
+                        //（2）步长过大会显得跑得比手势快。
                         let delta: u16 = 2;
-                        let col = me.column;
-                        let row = me.row;
-                        let contains = |r: ratatui::layout::Rect| {
-                            col >= r.x
-                                && col < r.x.saturating_add(r.width)
-                                && row >= r.y
-                                && row < r.y.saturating_add(r.height)
-                        };
-                        // 已移除弹窗/窗口栈：鼠标滚轮只滚动聊天区；交互 PTY 视图下则滚动 PTY 回看。
+                        //（1）已移除弹窗/窗口栈。
+                        //（2）滚轮滚聊天；交互 PTY 视图滚 PTY 回看。
                         if matches!(screen, Screen::Chat)
-                            && memory_rect_cache.is_some_and(|r| contains(r))
-                        {
-                            // Memory 面板滚动（独立于主聊天滚动）。
-                            memory_focus = true;
-                            let max = memory_max_scroll_cache;
-                            let cur = if memory_scroll == u16::MAX {
-                                max
-                            } else {
-                                memory_scroll.min(max)
-                            };
-                            if up {
-                                memory_scroll = cur.saturating_sub(delta);
-                            } else {
-                                memory_scroll = (cur + delta).min(max);
-                            }
-                        } else if matches!(screen, Screen::Chat)
                             && apply_mouse_wheel_to_pty_view(
                                 pty_view && matches!(pty_focus, PtyFocus::Terminal),
                                 pty_tabs.as_mut_slice(),
@@ -10031,7 +9293,8 @@ fn run_loop(
                         } else if matches!(screen, Screen::Chat)
                             && matches!(chat_focus, ChatFocus::Input)
                         {
-                            // 输入焦点：滚轮/触控滚动用于移动输入光标（不滚动聊天）。
+                            //（1）输入焦点：滚轮用于移动输入光标。
+                            //（2）不滚动聊天。
                             if !input.is_empty() {
                                 let width = input_width_cache.max(1);
                                 let dir = if up { -1 } else { 1 };
@@ -10061,12 +9324,11 @@ fn run_loop(
                         changed = true;
                     }
                     MouseEventKind::Down(_) => {
-                        // 触摸/拖拽起点（Termux 下触摸常映射为 Down+Drag）。
+                        //（1）触摸/拖拽起点（Termux 下触摸常映射为 Down+Drag）。
                         touch_drag_last_row = Some(me.row);
                         touch_drag_last_col = Some(me.column);
                         touch_drag_anchor_row = Some(me.row);
                         touch_drag_anchor_scroll = Some(scroll);
-                        touch_drag_target = None;
                         if matches!(screen, Screen::Settings) {
                             let col = me.column;
                             let row = me.row;
@@ -10077,7 +9339,7 @@ fn run_loop(
                                     && row < r.y.saturating_add(r.height)
                             };
                             if let Some(area) = settings_rect_cache.filter(|r| contains(*r)) {
-                                if settings_editor_rect_cache.is_some_and(|r| contains(r)) {
+                                if settings_editor_rect_cache.is_some_and(contains) {
                                     settings.focus = SettingsFocus::Prompt;
                                     changed = true;
                                 } else if row >= area.y && row < area.y.saturating_add(2) {
@@ -10113,8 +9375,10 @@ fn run_loop(
                                         if contains(inner) {
                                             let rel_row = row.saturating_sub(inner.y) as usize;
                                             if !settings_fields.is_empty() {
-                                                let idx = settings_fields_scroll_cache.saturating_add(rel_row);
-                                                settings.field_index = idx.min(settings_fields.len().saturating_sub(1));
+                                                let idx = settings_fields_scroll_cache
+                                                    .saturating_add(rel_row);
+                                                settings.field_index = idx
+                                                    .min(settings_fields.len().saturating_sub(1));
                                             }
                                             settings.focus = SettingsFocus::Fields;
                                             changed = true;
@@ -10131,28 +9395,40 @@ fn run_loop(
                                     && row >= r.y
                                     && row < r.y.saturating_add(r.height)
                             };
-                            let prev_mem_focus = memory_focus;
-                            // Memory 面板：点击后聚焦，支持滚动查看（不影响主聊天）。
-                            if memory_rect_cache.is_some_and(|r| contains(r)) {
-                                memory_focus = true;
-                                selected_msg_idx = None;
-                                action_hint = Some((now, "焦点: 记忆".to_string()));
-                                let base = if memory_scroll == u16::MAX {
-                                    memory_max_scroll_cache
+                            //（1）标签页：单击切换发送目标（Matrix/WatchDog/Memory）。
+                            if let Some(tabs_area) = tabs_rect_cache.filter(|r| contains(*r)) {
+                                let rel_col = col.saturating_sub(tabs_area.x);
+                                let w = tabs_area.width.max(1);
+                                let seg = (w / 3).max(1);
+                                let new_target = if rel_col < seg {
+                                    MindKind::Main
+                                } else if rel_col < seg.saturating_mul(2) {
+                                    MindKind::Sub
                                 } else {
-                                    memory_scroll.min(memory_max_scroll_cache)
+                                    MindKind::Memory
                                 };
-                                touch_drag_anchor_scroll = Some(base);
-                                touch_drag_target = Some(TouchDragTarget::Memory);
-                                changed = true;
-                            } else {
-                                memory_focus = false;
-                                touch_drag_target = Some(TouchDragTarget::Chat);
+                                if chat_target != new_target {
+                                    chat_target = new_target;
+                                    sys_cfg.chat_target = match new_target {
+                                        MindKind::Main => "main",
+                                        MindKind::Sub => "dog",
+                                        MindKind::Memory => "memory",
+                                    }
+                                    .to_string();
+                                    let _ = store_config_file(sys_cfg_path.as_path(), &sys_cfg);
+                                    //（1）切 tab：不改变 active_kind，不重置上下文；只影响“下一条用户消息”发给谁。
+                                    selected_msg_idx = None;
+                                    follow_bottom = true;
+                                    scroll = u16::MAX;
+                                    action_hint =
+                                        Some((now, format!("Tab: {}", mind_label(new_target))));
+                                    changed = true;
+                                }
                             }
-                            // PTY 面板：单击切换焦点到终端（用于终端滚动/交互）。
+                            //（1）PTY 面板：单击切换焦点到终端（用于终端滚动/交互）。
                             if pty_view
                                 && !pty_tabs.is_empty()
-                                && pty_rect_cache.is_some_and(|r| contains(r))
+                                && pty_rect_cache.is_some_and(contains)
                             {
                                 pty_focus = PtyFocus::Terminal;
                                 chat_focus = ChatFocus::Chat;
@@ -10170,7 +9446,7 @@ fn run_loop(
                                 selected_msg_idx = None;
                                 action_hint = Some((now, "焦点: 输入".to_string()));
 
-                                // 单击输入框：把光标跳到点击位置（不依赖 Termux 是否上报水平拖拽列变化）。
+                                //（1）单击输入框：把光标跳到点击位置（不依赖 Termux 是否上报水平拖拽列变化）。
                                 let inner_x = area.x.saturating_add(1);
                                 let inner_y = area.y;
                                 let inner_w = area.width.saturating_sub(2).max(1) as usize;
@@ -10191,7 +9467,7 @@ fn run_loop(
                                     changed = true;
                                 }
                             } else if let Some(area) = chat_rect_cache.filter(|r| contains(*r)) {
-                                // 点击聊天区：切焦点 + 支持“点哪条选哪条，再点取消选中”。
+                                //（1）点击聊天区：切焦点 + 支持“点哪条选哪条，再点取消选中”。
                                 let prev_focus = chat_focus;
                                 let prev_selected = selected_msg_idx;
                                 let prev_pty_focus = pty_focus;
@@ -10205,14 +9481,11 @@ fn run_loop(
                                         && !matches!(prev_pty_focus, PtyFocus::Chat))
                                 {
                                     action_hint = Some((now, "焦点: 聊天".to_string()));
-                                } else if prev_mem_focus {
-                                    // 从 Memory 焦点切回聊天：给一个明确提示，避免“看起来没切换成功”。
-                                    action_hint = Some((now, "焦点: 聊天".to_string()));
                                 }
 
-                                // 避免“切焦点 + 选中”同时触发：
-                                // - 先用一次点击把焦点切到聊天区
-                                // - 已在聊天区焦点时，再点击消息才会选中/取消选中
+                                //（1）避免“切焦点 + 选中”同时触发：
+                                //（2）先用一次点击把焦点切到聊天区
+                                //（3）已在聊天区焦点时，再点击消息才会选中/取消选中
                                 let pty_panel_active = pty_view && !pty_tabs.is_empty();
                                 let allow_select = matches!(prev_focus, ChatFocus::Chat)
                                     && (!pty_panel_active
@@ -10222,11 +9495,12 @@ fn run_loop(
                                     let line = (scroll as usize).saturating_add(rel_row);
                                     let mut clicked: Option<usize> = None;
                                     for (idx, range) in msg_line_ranges_cache.iter().enumerate() {
-                                        if let Some((start, end)) = range {
-                                            if *start <= line && line < *end {
-                                                clicked = Some(idx);
-                                                break;
-                                            }
+                                        if let Some((start, end)) = range
+                                            && *start <= line
+                                            && line < *end
+                                        {
+                                            clicked = Some(idx);
+                                            break;
                                         }
                                     }
                                     if let Some(idx) = clicked {
@@ -10243,13 +9517,11 @@ fn run_loop(
                                     {
                                         changed = true;
                                     }
-                                } else {
-                                    if !matches!(prev_focus, ChatFocus::Chat)
-                                        || (pty_panel_active
-                                            && !matches!(prev_pty_focus, PtyFocus::Chat))
-                                    {
-                                        changed = true;
-                                    }
+                                } else if !matches!(prev_focus, ChatFocus::Chat)
+                                    || (pty_panel_active
+                                        && !matches!(prev_pty_focus, PtyFocus::Chat))
+                                {
+                                    changed = true;
                                 }
                             }
                         }
@@ -10263,7 +9535,7 @@ fn run_loop(
                         touch_drag_last_col = Some(me.column);
                         if matches!(screen, Screen::Chat) && matches!(chat_focus, ChatFocus::Input)
                         {
-                            // 输入焦点：手势滑动用于移动输入光标（↑↓←→）。
+                            //（1）输入焦点：手势滑动用于移动输入光标（↑↓←→）。
                             let step_x = dx.unsigned_abs().min(8) as usize;
                             if step_x > 0 && !input.is_empty() {
                                 for _ in 0..step_x {
@@ -10282,7 +9554,7 @@ fn run_loop(
                             let step_y = dy.unsigned_abs().min(6) as usize;
                             if step_y > 0 && !input.is_empty() {
                                 let width = input_width_cache.max(1);
-                                // 以体感为准：手指下滑 => 光标下移；手指上滑 => 光标上移。
+                                //（1）以体感为准：手指下滑 => 光标下移；手指上滑 => 光标上移。
                                 let dir = if dy > 0 { 1 } else { -1 };
                                 for _ in 0..step_y {
                                     cursor =
@@ -10293,7 +9565,8 @@ fn run_loop(
                                 changed = true;
                             }
                         } else if dy != 0 {
-                            // 触控拖拽滚动：优先用“锚定起点”计算绝对偏移，避免高频 Drag 累计过快。
+                            //（1）触控拖拽：用锚定起点计算绝对偏移。
+                            //（2）避免高频 Drag 造成累计过快。
                             let (dy_total, base_scroll) = if let Some(anchor_row) =
                                 touch_drag_anchor_row
                                 && let Some(anchor_scroll) = touch_drag_anchor_scroll
@@ -10302,18 +9575,11 @@ fn run_loop(
                             } else {
                                 (dy, scroll)
                             };
-                            // Termux 的触摸拖拽事件行坐标是“格子级”，容易出现 dy 跳变；
-                            // 用温和的步长映射让滚动更跟手：约 2 行手势移动 -> 1 行内容滚动。
+                            //（1）Termux 拖拽行坐标是格子级，dy 容易跳变。
+                            //（2）用温和步长映射：约 2 行手势 -> 1 行内容。
                             let abs = dy_total.unsigned_abs().min(128) as u16;
-                            let delta = ((abs + 1) / 2).max(1);
-                            if matches!(touch_drag_target, Some(TouchDragTarget::Memory)) {
-                                let max = memory_max_scroll_cache;
-                                if dy_total > 0 {
-                                    memory_scroll = (base_scroll + delta).min(max);
-                                } else {
-                                    memory_scroll = base_scroll.saturating_sub(delta);
-                                }
-                            } else if matches!(screen, Screen::Chat)
+                            let delta = abs.div_ceil(2).max(1);
+                            if matches!(screen, Screen::Chat)
                                 && apply_touch_drag_to_pty_view(
                                     pty_view && matches!(pty_focus, PtyFocus::Terminal),
                                     pty_tabs.as_mut_slice(),
@@ -10338,7 +9604,6 @@ fn run_loop(
                         touch_drag_last_col = None;
                         touch_drag_anchor_row = None;
                         touch_drag_anchor_scroll = None;
-                        touch_drag_target = None;
                     }
                     _ => {}
                 }
@@ -10353,6 +9618,37 @@ fn run_loop(
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                //（1）标签页切换：Shift+←/→（Matrix/WatchDog/Memory）。
+                if matches!(screen, Screen::Chat)
+                    && shift
+                    && !alt
+                    && matches!(key.code, KeyCode::Left | KeyCode::Right)
+                {
+                    let forward = matches!(key.code, KeyCode::Right);
+                    let next = match (chat_target, forward) {
+                        (MindKind::Main, true) => MindKind::Sub,
+                        (MindKind::Sub, true) => MindKind::Memory,
+                        (MindKind::Memory, true) => MindKind::Main,
+                        (MindKind::Main, false) => MindKind::Memory,
+                        (MindKind::Memory, false) => MindKind::Sub,
+                        (MindKind::Sub, false) => MindKind::Main,
+                    };
+                    if next != chat_target {
+                        chat_target = next;
+                        sys_cfg.chat_target = match next {
+                            MindKind::Main => "main",
+                            MindKind::Sub => "dog",
+                            MindKind::Memory => "memory",
+                        }
+                        .to_string();
+                        let _ = store_config_file(sys_cfg_path.as_path(), &sys_cfg);
+                        selected_msg_idx = None;
+                        follow_bottom = true;
+                        scroll = u16::MAX;
+                        action_hint = Some((now, format!("Tab: {}", mind_label(next))));
+                    }
+                    continue;
+                }
                 if screen == Screen::Settings {
                     let section = settings_section;
                     if ctrl && matches!(key.code, KeyCode::Char('c')) {
@@ -10408,18 +9704,23 @@ fn run_loop(
                             }
                             KeyCode::Enter => {
                                 if let Some(spec) = settings_fields.get(settings.field_index) {
-                                        let api_kind = spec.api_kind.unwrap_or(settings.api_kind);
-                                        if matches!(spec.kind, SettingsFieldKind::Static) {
-                                            continue;
-                                        }
+                                    let api_kind = spec.api_kind.unwrap_or(settings.api_kind);
+                                    if matches!(spec.kind, SettingsFieldKind::Static) {
+                                        continue;
+                                    }
                                     if matches!(spec.kind, SettingsFieldKind::Provider) {
-                                        let current =
-                                            selected_provider(api_kind, &dog_cfg, &main_cfg, &memory_cfg);
+                                        let current = selected_provider(
+                                            api_kind,
+                                            &dog_cfg,
+                                            &main_cfg,
+                                            &memory_cfg,
+                                        );
                                         let next = next_provider(&current);
                                         apply_settings_with_notice(ApplySettingsWithNoticeArgs {
                                             kind: spec.kind,
                                             section,
-                                            api_kind,                                            value: &next,
+                                            api_kind,
+                                            value: &next,
                                             settings: &mut settings,
                                             now,
                                             dog_cfg: &mut dog_cfg,
@@ -10448,14 +9749,24 @@ fn run_loop(
                                         continue;
                                     }
                                     if matches!(spec.kind, SettingsFieldKind::Model) {
-                                        let provider =
-                                            selected_provider(api_kind, &dog_cfg, &main_cfg, &memory_cfg);
-                                        let current = selected_model(api_kind, &dog_cfg, &main_cfg, &memory_cfg);
+                                        let provider = selected_provider(
+                                            api_kind,
+                                            &dog_cfg,
+                                            &main_cfg,
+                                            &memory_cfg,
+                                        );
+                                        let current = selected_model(
+                                            api_kind,
+                                            &dog_cfg,
+                                            &main_cfg,
+                                            &memory_cfg,
+                                        );
                                         let next = next_model(&current, &provider);
                                         apply_settings_with_notice(ApplySettingsWithNoticeArgs {
                                             kind: spec.kind,
                                             section,
-                                            api_kind,                                            value: &next,
+                                            api_kind,
+                                            value: &next,
                                             settings: &mut settings,
                                             now,
                                             dog_cfg: &mut dog_cfg,
@@ -10484,8 +9795,12 @@ fn run_loop(
                                         continue;
                                     }
                                     if matches!(spec.kind, SettingsFieldKind::ReasoningEffort) {
-                                        let provider =
-                                            selected_provider(api_kind, &dog_cfg, &main_cfg, &memory_cfg);
+                                        let provider = selected_provider(
+                                            api_kind,
+                                            &dog_cfg,
+                                            &main_cfg,
+                                            &memory_cfg,
+                                        );
                                         if !api::capabilities(&provider).supports_reasoning_effort {
                                             set_settings_notice(
                                                 &mut settings,
@@ -10494,13 +9809,18 @@ fn run_loop(
                                             );
                                             continue;
                                         }
-                                        let current =
-                                            selected_reasoning_effort(api_kind, &dog_cfg, &main_cfg, &memory_cfg);
+                                        let current = selected_reasoning_effort(
+                                            api_kind,
+                                            &dog_cfg,
+                                            &main_cfg,
+                                            &memory_cfg,
+                                        );
                                         let next = next_reasoning_effort(&current);
                                         apply_settings_with_notice(ApplySettingsWithNoticeArgs {
                                             kind: spec.kind,
                                             section,
-                                            api_kind,                                            value: &next,
+                                            api_kind,
+                                            value: &next,
                                             settings: &mut settings,
                                             now,
                                             dog_cfg: &mut dog_cfg,
@@ -10559,7 +9879,8 @@ fn run_loop(
                                         apply_settings_with_notice(ApplySettingsWithNoticeArgs {
                                             kind: spec.kind,
                                             section,
-                                            api_kind,                                            value,
+                                            api_kind,
+                                            value,
                                             settings: &mut settings,
                                             now,
                                             dog_cfg: &mut dog_cfg,
@@ -10597,12 +9918,13 @@ fn run_loop(
                                         }
                                         continue;
                                     }
-                                    
+
                                     settings.edit_api_kind = spec.api_kind;
                                     settings.edit_buffer = field_raw_value(FieldRawValueArgs {
                                         kind: spec.kind,
                                         section,
-                                        api_kind,                                        dog_cfg: &dog_cfg,
+                                        api_kind,
+                                        dog_cfg: &dog_cfg,
                                         main_cfg: &main_cfg,
                                         memory_cfg: &memory_cfg,
                                         sys_cfg: &sys_cfg,
@@ -10645,7 +9967,8 @@ fn run_loop(
                                     commit_settings_input(CommitSettingsInputArgs {
                                         kind,
                                         section,
-                                        api_kind,                                        buffer: &buffer,
+                                        api_kind,
+                                        buffer: &buffer,
                                         settings: &mut settings,
                                         now,
                                         dog_cfg: &mut dog_cfg,
@@ -10679,7 +10002,8 @@ fn run_loop(
                                     commit_settings_input(CommitSettingsInputArgs {
                                         kind,
                                         section,
-                                        api_kind,                                        buffer: &buffer,
+                                        api_kind,
+                                        buffer: &buffer,
                                         settings: &mut settings,
                                         now,
                                         dog_cfg: &mut dog_cfg,
@@ -10775,7 +10099,8 @@ fn run_loop(
                                     apply_settings_with_notice(ApplySettingsWithNoticeArgs {
                                         kind,
                                         section,
-                                        api_kind: settings.api_kind,                                        value: &buffer,
+                                        api_kind: settings.api_kind,
+                                        value: &buffer,
                                         settings: &mut settings,
                                         now,
                                         dog_cfg: &mut dog_cfg,
@@ -10874,13 +10199,13 @@ fn run_loop(
                     continue;
                 }
 
-                // 交互 PTY 视图：优先处理（避免被命令菜单/选择模式等逻辑吃掉）。
-                // 但 Home 在“消息已选中”时优先用于退出选择（避免 Home 被 PTY 先吃掉导致逻辑冲突）。
+                //（1）交互 PTY 视图：优先处理（避免被命令菜单/选择模式等逻辑吃掉）。
+                //（2）但 Home 在“消息已选中”时优先用于退出选择（避免 Home 被 PTY 先吃掉导致逻辑冲突）。
                 if matches!(screen, Screen::Chat)
-                    && !(matches!(key.code, KeyCode::Home)
-                        && selected_msg_idx.is_some()
-                        && !ctrl
-                        && !alt)
+                    && (!matches!(key.code, KeyCode::Home)
+                        || selected_msg_idx.is_none()
+                        || ctrl
+                        || alt)
                     && handle_pty_view_key(HandlePtyViewKeyArgs {
                         now,
                         key,
@@ -10904,19 +10229,19 @@ fn run_loop(
                 {
                     continue;
                 }
-                // 交互 PTY 存在但未显示：Home 快速切回终端视图。
+                //（1）交互 PTY 存在但未显示：Home 快速切回终端视图。
                 if matches!(screen, Screen::Chat)
-                    && try_show_pty_view_on_home(
+                    && try_show_pty_view_on_home(TryShowPtyViewOnHomeArgs {
                         key,
                         ctrl,
                         alt,
-                        &mut pty_view,
-                        pty_tabs.as_slice(),
-                        &mut pty_focus,
+                        pty_view: &mut pty_view,
+                        pty_tabs: pty_tabs.as_slice(),
+                        pty_focus: &mut pty_focus,
                         selected_msg_idx,
-                        matches!(send_queue_ui, SendQueueUiState::Closed),
+                        send_queue_closed: matches!(send_queue_ui, SendQueueUiState::Closed),
                         menu_open,
-                    )
+                    })
                 {
                     action_hint = Some((now, "Home: 打开终端".to_string()));
                     continue;
@@ -10928,7 +10253,7 @@ fn run_loop(
                     continue;
                 }
 
-                // Help 菜单（/Help）：↑↓选择；Enter 注入系统消息；Esc/Home 关闭。
+                //（1）Help 菜单（/Help）：↑↓选择；Enter 注入系统消息；Esc/Home 关闭。
                 if matches!(screen, Screen::Chat)
                     && matches!(help_ui, HelpUiState::Selecting { .. })
                     && !menu_open
@@ -10958,7 +10283,7 @@ fn run_loop(
                             continue;
                         }
                         KeyCode::Enter => {
-                            // 目前仅一个条目：快捷键（keymap.txt）
+                            //（1）目前仅一个条目：快捷键（keymap.txt）
                             let path = resolve_config_path(HELP_KEYMAP_PATH, true);
                             match std::fs::read_to_string(&path) {
                                 Ok(text) => {
@@ -10994,7 +10319,7 @@ fn run_loop(
                     }
                 }
 
-                // 发送队列 UI（Alt+↑ 打开；↑↓选择；Enter 编辑；Home 退出；编辑态 Alt+↓ 保存 / Alt+Enter 置底）。
+                //（1）发送队列 UI：Alt+↑ 打开；↑↓选择；Enter 编辑。
                 if matches!(screen, Screen::Chat)
                     && !menu_open
                     && matches!(help_ui, HelpUiState::Closed)
@@ -11149,7 +10474,7 @@ fn run_loop(
                         continue;
                     }
                 }
-                // Alt+↓：复制选中消息（避免占用 Enter；兼容用户单手操作）。
+                //（1）Alt+↓：复制选中消息（避免占用 Enter；兼容用户单手操作）。
                 if alt
                     && matches!(key.code, KeyCode::Down)
                     && input.trim().is_empty()
@@ -11175,15 +10500,20 @@ fn run_loop(
                     continue;
                 }
 
-                // 输入焦点快捷键：允许在输入框里一键切到聊天区进行“浏览/展开/置底”。
-                // 目的：提升单手/触控操作效率，同时不破坏“按键按焦点区域生效”的主规则。
+                //（1）输入焦点快捷键：允许在输入框里一键切到聊天区进行“浏览/展开/置底”。
+                //（2）目的：提升单手/触控操作效率，同时不破坏“按键按焦点区域生效”的主规则。
                 if matches!(screen, Screen::Chat)
                     && matches!(chat_focus, ChatFocus::Input)
                     && matches!(send_queue_ui, SendQueueUiState::Closed)
                     && !ctrl
-                    && !(matches!(screen, Screen::Chat) && pty_view)
+                    && !pty_view
                 {
-                    let codex_mode = chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
+                    let codex_mode = chat_target_is_codex(
+                        chat_target,
+                        &dog_client,
+                        &main_client,
+                        &memory_client,
+                    );
                     let (thinking_global, expanded_thinking_ref, collapsed_thinking_ref) =
                         if codex_mode {
                             (
@@ -11226,8 +10556,8 @@ fn run_loop(
                         KeyCode::PageDown => {
                             chat_focus = ChatFocus::Chat;
                             command_menu_suppress = true;
-                            // PgDn 首次触发也进入选择：从最后一条消息开始选中（符合 PgUp 行为），
-                            // 之后再 PgDn 才是“向下选”（通常会停在最后一条）。
+                            //（1）PgDn 首次触发也进入选择：从最后一条消息开始选中（符合 PgUp 行为），
+                            //（2）之后再 PgDn 才是“向下选”（通常会停在最后一条）。
                             if selected_msg_idx.is_some() {
                                 selected_msg_idx = select_next_chat_message(
                                     &core,
@@ -11270,7 +10600,7 @@ fn run_loop(
                             continue;
                         }
                         KeyCode::BackTab => {
-                            // Shift+Tab：形态切换（简约 -> 工具 -> 思考 -> 简约）
+                            //（1）Shift+Tab：形态切换（简约 -> 工具 -> 思考 -> 简约）
                             chat_focus = ChatFocus::Chat;
                             command_menu_suppress = true;
                             render_cache.fast_forward_all_animations_to_tail(&core);
@@ -11329,7 +10659,7 @@ fn run_loop(
                             continue;
                         }
                         KeyCode::Tab => {
-                            // Tab：全局显示切换
+                            //（1）Tab：全局显示切换
                             chat_focus = ChatFocus::Chat;
                             command_menu_suppress = true;
                             render_cache.fast_forward_all_animations_to_tail(&core);
@@ -11347,7 +10677,7 @@ fn run_loop(
                                 );
                             }
                             if codex_mode {
-                                // Codex：Tab 切换“工具详情 + 思维链”全局展开/全局收起（与聊天区 Tab 一致）。
+                                //（1）Codex：Tab 切换“工具详情 + 思维链”全局展开/全局收起（与聊天区 Tab 一致）。
                                 let next =
                                     !(codex_tool_global_expanded && codex_thinking_global_expanded);
                                 codex_tool_global_expanded = next;
@@ -11357,7 +10687,7 @@ fn run_loop(
                                 codex_expanded_thinking_idxs.clear();
                                 codex_collapsed_thinking_idxs.clear();
                             } else {
-                                // DeepSeek：Tab 只切换“工具详情 + 思考块”，不强制改动用户折叠。
+                                //（1）DeepSeek：Tab 只切换“工具详情 + 思考块”，不强制改动用户折叠。
                                 let next_expanded =
                                     !(tool_global_expanded && thinking_global_expanded);
                                 tool_global_expanded = next_expanded;
@@ -11425,8 +10755,6 @@ fn run_loop(
                                     } else {
                                         "/SSE Open".to_string()
                                     }
-                                } else if cmd.eq_ignore_ascii_case("/switch to") {
-                                    format!("/Switch {}", sel.desc)
                                 } else {
                                     cmd.to_string()
                                 };
@@ -11435,9 +10763,7 @@ fn run_loop(
                                     || cmd.eq_ignore_ascii_case("/cmd")
                                     || cmd.eq_ignore_ascii_case("/settings")
                                     || cmd.eq_ignore_ascii_case("/help")
-                                    || cmd.eq_ignore_ascii_case("/testmemory")
                                     || cmd.eq_ignore_ascii_case("/sse")
-                                    || cmd.eq_ignore_ascii_case("/switch to")
                                 {
                                     reset_input_buffer(
                                         &mut input,
@@ -11446,33 +10772,24 @@ fn run_loop(
                                         &mut last_input_at,
                                     );
                                     command_menu_suppress = true;
-	                                    if handle_command(HandleCommandArgs {
-	                                        core: &mut core,
-	                                        raw: &raw,
-	                                        meta: &mut metamemo,
-	                                        context_usage: &mut context_usage,
-	                                        mode: &mut mode,
-	                                        active_kind: &mut active_kind,
-	                                        chat_target: &mut chat_target,
-	                                        dog_state: &mut dog_state,
-	                                        main_state: &mut main_state,
-	                                        memory_state: &mut memory_state,
-	                                        mind_ctx_idx_main: &mut mind_ctx_idx_main,
-	                                        mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
-	                                        mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
-	                                        screen: &mut screen,
-	                                        help_ui: &mut help_ui,
-	                                        should_exit: &mut should_exit,
-	                                        sse_enabled: &mut sse_enabled,
-	                                        enter_cmd_shell: &mut pending_cmd_shell,
-	                                        open_user_terminal: &mut pending_user_terminal,
-	                                        memory_panel_open: &mut memory_panel_open,
-	                                        exit_code: &mut exit_code,
-	                                        sys_cfg: &mut sys_cfg,
-	                                        sys_cfg_path: &sys_cfg_path,
-	                                        sys_log: &mut sys_log,
-	                                        sys_log_limit: config.sys_log_limit,
-	                                    })? {
+                                    if handle_command(HandleCommandArgs {
+                                        core: &mut core,
+                                        raw: &raw,
+                                        meta: &mut metamemo,
+                                        context_usage: &mut context_usage,
+                                        mode: &mut mode,
+                                        screen: &mut screen,
+                                        help_ui: &mut help_ui,
+                                        should_exit: &mut should_exit,
+                                        sse_enabled: &mut sse_enabled,
+                                        enter_cmd_shell: &mut pending_cmd_shell,
+                                        open_user_terminal: &mut pending_user_terminal,
+                                        exit_code: &mut exit_code,
+                                        sys_cfg: &mut sys_cfg,
+                                        sys_cfg_path: &sys_cfg_path,
+                                        sys_log: &mut sys_log,
+                                        sys_log_limit: config.sys_log_limit,
+                                    })? {
                                         reset_after_command(ResetAfterCommandArgs {
                                             core: &mut core,
                                             render_cache: &mut render_cache,
@@ -11529,7 +10846,11 @@ fn run_loop(
                                                 &mut last_input_at,
                                             );
                                             core.push_system("··· Terminal 已打开（用户手动）\n- 该窗口中的命令由用户自己执行\n- 退出/关闭请在 Terminal 内自行完成\n- 这不是 AI 启动的自动化任务");
-                                            push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: user session");
+                                            push_sys_log(
+                                                &mut sys_log,
+                                                config.sys_log_limit,
+                                                "Terminal: user session",
+                                            );
                                             let call = ToolCall {
                                                 tool: "bash".to_string(),
                                                 input: "exec bash -li".to_string(),
@@ -11699,9 +11020,9 @@ fn run_loop(
                         }
                         command_menu_suppress = true;
                     }
-                    // Shift+Tab：
-                    // - 未选中消息：形态切换（简约 -> 工具 -> 思考 -> 简约）
-                    // - 选中消息：对该条消息做同样的形态切换（工具/思考/简约）
+                    //（1）Shift+Tab：
+                    //（2）未选中消息：形态切换（简约 -> 工具 -> 思考 -> 简约）
+                    //（3）选中消息：对该条消息做同样的形态切换（工具/思考/简约）
                     KeyCode::BackTab
                         if !alt && !ctrl && matches!(chat_focus, ChatFocus::Chat) && !menu_open =>
                     {
@@ -11719,10 +11040,15 @@ fn run_loop(
                                 &msg_line_ranges_cache,
                             );
                         }
-                        let codex_mode =
-                            chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
+                        let codex_mode = chat_target_is_codex(
+                            chat_target,
+                            &dog_client,
+                            &main_client,
+                            &memory_client,
+                        );
 
-                        // cycle helper: compact -> tool -> thinking -> compact (both=true treated as tool-only)
+                        //（1）形态循环：简约 -> 工具 -> 思考 -> 简约。
+                        //（2）tool+think 同时为 true 时按 tool 优先。
                         let next_cycle = |tool: bool, thinking: bool| -> (bool, bool) {
                             match (tool, thinking) {
                                 (false, false) => (true, false),
@@ -11734,7 +11060,7 @@ fn run_loop(
 
                         if let Some(sel) = selected_msg_idx {
                             follow_bottom = false;
-                            // system 折叠条目也走工具路线
+                            //（1）system 折叠条目也走工具路线
                             let is_folded_system = core.history.get(sel).is_some_and(|m| {
                                 m.role == Role::System
                                     && m.text.trim_start().starts_with("♡ · 系统信息 · ")
@@ -11791,48 +11117,47 @@ fn run_loop(
                                 want_think = false;
                             }
 
-                            if let Some(ti) = tool_idx {
-                                if want_tool != tool_cur {
-                                    let _ = if codex_mode {
-                                        toggle_idx_expanded(
-                                            codex_tool_global_expanded,
-                                            &mut codex_expanded_tool_idxs,
-                                            &mut codex_collapsed_tool_idxs,
-                                            ti,
-                                        )
-                                    } else {
-                                        toggle_idx_expanded(
-                                            tool_global_expanded,
-                                            &mut expanded_tool_idxs,
-                                            &mut collapsed_tool_idxs,
-                                            ti,
-                                        )
-                                    };
-                                }
+                            if let Some(ti) = tool_idx
+                                && want_tool != tool_cur
+                            {
+                                let _ = if codex_mode {
+                                    toggle_idx_expanded(
+                                        codex_tool_global_expanded,
+                                        &mut codex_expanded_tool_idxs,
+                                        &mut codex_collapsed_tool_idxs,
+                                        ti,
+                                    )
+                                } else {
+                                    toggle_idx_expanded(
+                                        tool_global_expanded,
+                                        &mut expanded_tool_idxs,
+                                        &mut collapsed_tool_idxs,
+                                        ti,
+                                    )
+                                };
                             }
-                            if let Some(ti) = think_idx {
-                                if want_think != think_cur {
-                                    let expanded_now = if codex_mode {
-                                        toggle_idx_expanded(
-                                            codex_thinking_global_expanded,
-                                            &mut codex_expanded_thinking_idxs,
-                                            &mut codex_collapsed_thinking_idxs,
-                                            ti,
-                                        )
-                                    } else {
-                                        toggle_idx_expanded(
-                                            thinking_global_expanded,
-                                            &mut expanded_thinking_idxs,
-                                            &mut collapsed_thinking_idxs,
-                                            ti,
-                                        )
-                                    };
-                                    // 若用户把“思考消息”折叠掉，它会立即从 UI 消失；此时 selected 不能悬空。
-                                    if !expanded_now && selected_msg_idx == Some(ti) {
-                                        selected_msg_idx =
-                                            find_assistant_for_think_message(&core, ti)
-                                                .or(Some(sel));
-                                    }
+                            if let Some(ti) = think_idx
+                                && want_think != think_cur
+                            {
+                                let expanded_now = if codex_mode {
+                                    toggle_idx_expanded(
+                                        codex_thinking_global_expanded,
+                                        &mut codex_expanded_thinking_idxs,
+                                        &mut codex_collapsed_thinking_idxs,
+                                        ti,
+                                    )
+                                } else {
+                                    toggle_idx_expanded(
+                                        thinking_global_expanded,
+                                        &mut expanded_thinking_idxs,
+                                        &mut collapsed_thinking_idxs,
+                                        ti,
+                                    )
+                                };
+                                //（1）若用户把“思考消息”折叠掉，它会立即从 UI 消失；此时 selected 不能悬空。
+                                if !expanded_now && selected_msg_idx == Some(ti) {
+                                    selected_msg_idx =
+                                        find_assistant_for_think_message(&core, ti).or(Some(sel));
                                 }
                             }
                             render_cache.invalidate_all();
@@ -11848,7 +11173,7 @@ fn run_loop(
                             continue;
                         }
 
-                        // 未选中：全局形态切换（互斥）
+                        //（1）未选中：全局形态切换（互斥）
                         let (tool_cur, think_cur) = if codex_mode {
                             (codex_tool_global_expanded, codex_thinking_global_expanded)
                         } else {
@@ -11882,9 +11207,9 @@ fn run_loop(
                         action_hint = Some((now, hint.to_string()));
                         continue;
                     }
-                    // Tab：
-                    // - 未选中消息：切换“全部展开/全部收起”（工具详情 + 思考块 + 用户折叠）
-                    // - 选中消息：切换该条“全部详情”（工具/思考/用户三者择一，按消息类型决定）
+                    //（1）Tab：
+                    //（2）未选中消息：切换“全部展开/全部收起”（工具详情 + 思考块 + 用户折叠）
+                    //（3）选中消息：切换该条“全部详情”（工具/思考/用户三者择一，按消息类型决定）
                     KeyCode::Tab
                         if !alt && !ctrl && matches!(chat_focus, ChatFocus::Chat) && !menu_open =>
                     {
@@ -11906,8 +11231,12 @@ fn run_loop(
                         if let Some(sel) = selected_msg_idx {
                             follow_bottom = false;
                             if let Some(msg) = core.history.get(sel) {
-                                let codex_mode =
-                                    chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
+                                let codex_mode = chat_target_is_codex(
+                                    chat_target,
+                                    &dog_client,
+                                    &main_client,
+                                    &memory_client,
+                                );
                                 let mut handled = false;
                                 match msg.role {
                                     Role::User => {
@@ -11934,7 +11263,7 @@ fn run_loop(
                                         handled = true;
                                     }
                                     Role::System => {
-                                        // 折叠 system info（欢迎语/PTY 已启动等）：按 Tab 展开/收起该条详情。
+                                        //（1）折叠 system info（欢迎语/PTY 已启动等）：按 Tab 展开/收起该条详情。
                                         let expanded_now = if codex_mode {
                                             toggle_idx_expanded(
                                                 codex_tool_global_expanded,
@@ -11970,9 +11299,9 @@ fn run_loop(
                                         let (think_idx, tool_idx) =
                                             related_think_and_tool_for_selection(&core, sel);
                                         if think_idx.is_none() && tool_idx.is_none() {
-                                            // 该条没有可展开的“详情”组件（例如纯文本 assistant 且无 think/tool）。
+                                            //（1）该条没有可展开的“详情”组件（例如纯文本 assistant 且无 think/tool）。
                                         } else if codex_mode {
-                                            // Codex：Tab 一键实现“该条全展开/全收起”（工具详情 + 思维链）。
+                                            //（1）Codex：Tab 一键实现“该条全展开/全收起”（工具详情 + 思维链）。
                                             let tool_cur = tool_idx
                                                 .map(|ti| {
                                                     is_idx_expanded(
@@ -11994,27 +11323,27 @@ fn run_loop(
                                                 })
                                                 .unwrap_or(true);
                                             let want_expand = !(tool_cur && think_cur);
-                                            if let Some(ti) = tool_idx {
-                                                if want_expand != tool_cur {
-                                                    let _ = toggle_idx_expanded(
-                                                        codex_tool_global_expanded,
-                                                        &mut codex_expanded_tool_idxs,
-                                                        &mut codex_collapsed_tool_idxs,
-                                                        ti,
-                                                    );
-                                                }
+                                            if let Some(ti) = tool_idx
+                                                && want_expand != tool_cur
+                                            {
+                                                let _ = toggle_idx_expanded(
+                                                    codex_tool_global_expanded,
+                                                    &mut codex_expanded_tool_idxs,
+                                                    &mut codex_collapsed_tool_idxs,
+                                                    ti,
+                                                );
                                             }
-                                            if let Some(ti) = think_idx {
-                                                if want_expand != think_cur {
-                                                    let _ = toggle_idx_expanded(
-                                                        codex_thinking_global_expanded,
-                                                        &mut codex_expanded_thinking_idxs,
-                                                        &mut codex_collapsed_thinking_idxs,
-                                                        ti,
-                                                    );
-                                                }
+                                            if let Some(ti) = think_idx
+                                                && want_expand != think_cur
+                                            {
+                                                let _ = toggle_idx_expanded(
+                                                    codex_thinking_global_expanded,
+                                                    &mut codex_expanded_thinking_idxs,
+                                                    &mut codex_collapsed_thinking_idxs,
+                                                    ti,
+                                                );
                                             }
-                                            // 若 Tab 把“思考消息”收起掉（从 UI 消失），selected 不能悬空。
+                                            //（1）若 Tab 把“思考消息”收起掉（从 UI 消失），selected 不能悬空。
                                             if !want_expand
                                                 && let Some(ti) = think_idx
                                                 && selected_msg_idx == Some(ti)
@@ -12039,7 +11368,7 @@ fn run_loop(
                                             ));
                                             handled = true;
                                         } else {
-                                            // DeepSeek：Tab 一键实现“该条全展开/全收起”（工具详情 + 思考块）。
+                                            //（1）DeepSeek：Tab 一键实现“该条全展开/全收起”（工具详情 + 思考块）。
                                             let tool_cur = tool_idx
                                                 .map(|ti| {
                                                     is_idx_expanded(
@@ -12061,27 +11390,27 @@ fn run_loop(
                                                 })
                                                 .unwrap_or(true);
                                             let want_expand = !(tool_cur && think_cur);
-                                            if let Some(ti) = tool_idx {
-                                                if want_expand != tool_cur {
-                                                    let _ = toggle_idx_expanded(
-                                                        tool_global_expanded,
-                                                        &mut expanded_tool_idxs,
-                                                        &mut collapsed_tool_idxs,
-                                                        ti,
-                                                    );
-                                                }
+                                            if let Some(ti) = tool_idx
+                                                && want_expand != tool_cur
+                                            {
+                                                let _ = toggle_idx_expanded(
+                                                    tool_global_expanded,
+                                                    &mut expanded_tool_idxs,
+                                                    &mut collapsed_tool_idxs,
+                                                    ti,
+                                                );
                                             }
-                                            if let Some(ti) = think_idx {
-                                                if want_expand != think_cur {
-                                                    let _ = toggle_idx_expanded(
-                                                        thinking_global_expanded,
-                                                        &mut expanded_thinking_idxs,
-                                                        &mut collapsed_thinking_idxs,
-                                                        ti,
-                                                    );
-                                                }
+                                            if let Some(ti) = think_idx
+                                                && want_expand != think_cur
+                                            {
+                                                let _ = toggle_idx_expanded(
+                                                    thinking_global_expanded,
+                                                    &mut expanded_thinking_idxs,
+                                                    &mut collapsed_thinking_idxs,
+                                                    ti,
+                                                );
                                             }
-                                            // 若 Tab 把“思考消息”收起掉（从 UI 消失），selected 不能悬空。
+                                            //（1）若 Tab 把“思考消息”收起掉（从 UI 消失），selected 不能悬空。
                                             if !want_expand
                                                 && let Some(ti) = think_idx
                                                 && selected_msg_idx == Some(ti)
@@ -12121,10 +11450,14 @@ fn run_loop(
                             continue;
                         }
 
-                        let codex_mode =
-                            chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
+                        let codex_mode = chat_target_is_codex(
+                            chat_target,
+                            &dog_client,
+                            &main_client,
+                            &memory_client,
+                        );
                         if codex_mode {
-                            // Codex：Tab 切换“工具详情 + 思维链”全局展开/全局折叠（折叠态仅显示 brief）。
+                            //（1）Codex：Tab 切换“工具详情 + 思维链”全局展开/全局折叠（折叠态仅显示 brief）。
                             let next =
                                 !(codex_tool_global_expanded && codex_thinking_global_expanded);
                             codex_tool_global_expanded = next;
@@ -12134,7 +11467,7 @@ fn run_loop(
                             codex_expanded_thinking_idxs.clear();
                             codex_collapsed_thinking_idxs.clear();
                         } else {
-                            // DeepSeek：沿用原逻辑（工具 + 思考 + 用户）。
+                            //（1）DeepSeek：沿用原逻辑（工具 + 思考 + 用户）。
                             let next_expanded = !(tool_global_expanded && thinking_global_expanded);
                             tool_global_expanded = next_expanded;
                             thinking_global_expanded = next_expanded;
@@ -12187,17 +11520,21 @@ fn run_loop(
                                 &msg_line_ranges_cache,
                             );
                         }
-                        let codex_mode =
-                            chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
+                        let codex_mode = chat_target_is_codex(
+                            chat_target,
+                            &dog_client,
+                            &main_client,
+                            &memory_client,
+                        );
 
                         let double_home = last_home_at.is_some_and(|t| {
                             now.saturating_duration_since(t) <= Duration::from_millis(350)
                         });
                         last_home_at = Some(now);
 
-                        // Home 规则（避免与 Tab/Shift+Tab 的全局形态冲突）：
-                        // - 单击：仅收敛“当前选中消息”的展开/折叠（不触碰全局展开形态）
-                        // - 双击：强制回归简约模式（收敛任何展开形态）并退出选择
+                        //（1）Home 规则（避免与 Tab/Shift+Tab 的全局形态冲突）：
+                        //（2）单击：仅收敛“当前选中消息”的展开/折叠（不触碰全局展开形态）
+                        //（3）双击：强制回归简约模式（收敛任何展开形态）并退出选择
                         if double_home {
                             user_global_expanded = false;
                             expanded_user_idxs.clear();
@@ -12270,16 +11607,16 @@ fn run_loop(
                             action_hint = Some((now, "Home: 退出选择".to_string()));
                         }
                     }
-                    // ↑/↓：
-                    // - 输入框焦点且有内容：移动输入光标（多行）
-                    // - 非输入焦点：滚动聊天
+                    //（1）↑/↓：
+                    //（2）输入框焦点且有内容：移动输入光标（多行）
+                    //（3）非输入焦点：滚动聊天
                     KeyCode::Up => {
                         let input_focused = matches!(chat_focus, ChatFocus::Input)
                             && !menu_open
                             && matches!(send_queue_ui, SendQueueUiState::Closed)
                             && !(matches!(screen, Screen::Chat) && pty_view);
                         if input_focused {
-                            // 输入焦点：↑↓一律用于光标移动（即使输入为空也不滚动聊天）。
+                            //（1）输入焦点：↑↓一律用于光标移动（即使输入为空也不滚动聊天）。
                             if !input.is_empty() {
                                 let width = input_width_cache.max(1);
                                 cursor = move_prompt_cursor_vertical(&input, width, cursor, -1);
@@ -12289,7 +11626,7 @@ fn run_loop(
                         } else if matches!(chat_focus, ChatFocus::Chat)
                             && selected_msg_idx.is_some()
                         {
-                            // 选择态：↑↓用于切换选中消息。
+                            //（1）选择态：↑↓用于切换选中消息。
                             selected_msg_idx = select_prev_chat_message(
                                 &core,
                                 selected_msg_idx,
@@ -12319,7 +11656,7 @@ fn run_loop(
                             && matches!(send_queue_ui, SendQueueUiState::Closed)
                             && !(matches!(screen, Screen::Chat) && pty_view);
                         if input_focused {
-                            // 输入焦点：↑↓一律用于光标移动（即使输入为空也不滚动聊天）。
+                            //（1）输入焦点：↑↓一律用于光标移动（即使输入为空也不滚动聊天）。
                             if !input.is_empty() {
                                 let width = input_width_cache.max(1);
                                 cursor = move_prompt_cursor_vertical(&input, width, cursor, 1);
@@ -12358,8 +11695,12 @@ fn run_loop(
                     {
                         let sel = selected_msg_idx.unwrap_or(0);
                         if let Some(ti) = find_think_message_for_selection(&core, sel) {
-                            let codex_mode =
-                                chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
+                            let codex_mode = chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            );
                             let at_bottom = (scroll as usize) >= max_scroll_cache.saturating_sub(1);
                             if !at_bottom {
                                 pending_scroll_anchor = capture_scroll_anchor(
@@ -12395,7 +11736,7 @@ fn run_loop(
                                 },
                             ));
 
-                            // 若用户把“思考消息”折叠掉，它会立即从 UI 消失；此时 selected 不能悬空。
+                            //（1）若用户把“思考消息”折叠掉，它会立即从 UI 消失；此时 selected 不能悬空。
                             if !expanded_now && selected_msg_idx == Some(ti) {
                                 selected_msg_idx =
                                     find_assistant_for_think_message(&core, ti).or(Some(sel));
@@ -12440,9 +11781,13 @@ fn run_loop(
                                 },
                             ));
                         } else {
-                            let codex_mode =
-                                chat_target_is_codex(chat_target, &dog_client, &main_client, &memory_client);
-                            // system 折叠条目（如欢迎语/PTY已启动）：走“工具详情”折叠路线。
+                            let codex_mode = chat_target_is_codex(
+                                chat_target,
+                                &dog_client,
+                                &main_client,
+                                &memory_client,
+                            );
+                            //（1）system 折叠条目（如欢迎语/PTY已启动）：走“工具详情”折叠路线。
                             if core.history.get(sel).is_some_and(|m| {
                                 m.role == Role::System
                                     && m.text.trim_start().starts_with("♡ · 系统信息 · ")
@@ -12534,9 +11879,9 @@ fn run_loop(
                             command_menu_suppress = false;
                         }
                     }
-                    // PgUp/PgDn：消息选择（聊天区焦点时生效）
-                    // - PgUp：进入/上移选择
-                    // - PgDn：下移选择
+                    //（1）PgUp/PgDn：消息选择（聊天区焦点时生效）
+                    //（2）PgUp：进入/上移选择
+                    //（3）PgDn：下移选择
                     KeyCode::PageUp => {
                         if matches!(chat_focus, ChatFocus::Chat) {
                             selected_msg_idx = select_prev_chat_message(
@@ -12615,7 +11960,7 @@ fn run_loop(
                     }
                     KeyCode::Insert => {
                         if matches!(chat_focus, ChatFocus::Input) {
-                            // Insert 在输入框不做特殊行为（避免影响输入法/键盘习惯）。
+                            //（1）Insert 在输入框不做特殊行为（避免影响输入法/键盘习惯）。
                         } else if let Some((prev_scroll, prev_follow)) =
                             scroll_restore_before_end.take()
                         {
@@ -12729,13 +12074,12 @@ fn run_loop(
                         prune_pending_pty_snapshot(&input, &mut pending_pty_snapshot);
                     }
                     KeyCode::Enter => {
-                        // 输入框快捷键：
-                        // - Enter：发送（空闲）/ 换行（API活跃或粘贴防护）
-                        // - Shift+Enter：强制换行
-                        // - Ctrl+Enter：强制入队（最低优先级，空闲时自动出队发送）
-                        // 备注：Alt+Enter 仍保留为兼容的“强制入队”。
-                        let force_newline = shift && !ctrl;
-                        let force_enqueue = ctrl && !shift;
+                        //（1）输入框快捷键：
+                        //（2）Enter：发送（空闲）/ 换行（API活跃或粘贴防护）
+                        //（3）Shift+Enter：换行
+                        //（4）Ctrl+Enter：换行
+                        //（5）Alt+Enter：强制入队（最低优先级，空闲时自动出队发送）
+                        let force_newline = (shift || ctrl) && !alt;
 
                         if !ctrl
                             && !shift
@@ -12761,10 +12105,10 @@ fn run_loop(
                             }
                             continue;
                         }
-	                        if force_newline {
-	                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-	                                force: true,
-	                                now,
+                        if force_newline {
+                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+                                force: true,
+                                now,
                                 config: &config,
                                 paste_capture: &mut paste_capture,
                                 input: &mut input,
@@ -12792,67 +12136,18 @@ fn run_loop(
                                 command_menu_suppress: Some(&mut command_menu_suppress),
                             }) {
                                 continue;
-	                            }
-	                            continue;
-	                        }
+                            }
+                            continue;
+                        }
 
-	                        // PTY 展开且焦点在聊天输入框：Enter 作为“发送到终端”（用于测试/快速执行）。
-	                        // - Shift+Enter 仍然强制换行（上面已处理）
-	                        // - Ctrl+Enter 仍然走“入队发送给 AI”的语义（下面会处理）
-	                        if !force_enqueue
-	                            && matches!(screen, Screen::Chat)
-	                            && is_pty_panel_active(screen, pty_view, pty_tabs.as_slice())
-	                            && matches!(pty_focus, PtyFocus::Chat)
-	                        {
-	                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-	                                force: true,
-	                                now,
-	                                config: &config,
-	                                paste_capture: &mut paste_capture,
-	                                input: &mut input,
-	                                cursor: &mut cursor,
-	                                input_chars: &mut input_chars,
-	                                pending_pastes: &mut pending_pastes,
-	                                toast: &mut toast,
-	                                max_input_chars,
-	                                burst_count: &mut burst_count,
-	                                burst_last_at: &mut burst_last_at,
-	                                burst_started_at: &mut burst_started_at,
-	                                burst_start_cursor: &mut burst_start_cursor,
-	                                paste_drop_until: &mut paste_drop_until,
-	                                paste_guard_until: &mut paste_guard_until,
-	                            });
-	                            let send = drain_input_for_send(
-	                                &mut input,
-	                                &mut cursor,
-	                                &mut input_chars,
-	                                &mut last_input_at,
-	                                &mut pending_pastes,
-	                                &mut paste_capture,
-	                                &mut command_menu_suppress,
-	                                &mut pending_pty_snapshot,
-	                            );
-	                            let text = send.model_text;
-	                            if text.trim().is_empty() {
-	                                continue;
-	                            }
-	                            let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
-	                            if let Some(state) = pty_tabs.get_mut(active) {
-	                                let mut bytes = text.into_bytes();
-	                                bytes.push(b'\r');
-	                                state.record_input_bytes(&bytes);
-	                                if let Some(tx_in) = pty_handles.get(&state.job_id) {
-	                                    let _ = tx_in.send(PtyControl::Input(bytes));
-	                                }
-	                                action_hint = Some((now, "已发送到终端".to_string()));
-	                            }
-	                            continue;
-	                        }
-
-	                        if force_enqueue
-	                            && (is_idle_like(mode)
-	                                || matches!(mode, Mode::Generating | Mode::ExecutingTool))
-	                        {
+                        //（1）PTY 展开且焦点在聊天输入框：Enter 作为“发送到终端”（用于测试/快速执行）。
+                        //（2）Shift+Enter 仍然强制换行（上面已处理）
+                        //（3）Alt+Enter 仍然走“入队发送给 AI”的语义（下面会处理）
+                        if !alt
+                            && matches!(screen, Screen::Chat)
+                            && is_pty_panel_active(screen, pty_view, pty_tabs.as_slice())
+                            && matches!(pty_focus, PtyFocus::Chat)
+                        {
                             finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
                                 force: true,
                                 now,
@@ -12871,105 +12166,44 @@ fn run_loop(
                                 paste_drop_until: &mut paste_drop_until,
                                 paste_guard_until: &mut paste_guard_until,
                             });
-                            let send = drain_input_for_send(
-                                &mut input,
-                                &mut cursor,
-                                &mut input_chars,
-                                &mut last_input_at,
-                                &mut pending_pastes,
-                                &mut paste_capture,
-                                &mut command_menu_suppress,
-                                &mut pending_pty_snapshot,
-                            );
-                            if send.model_text.trim().is_empty() {
+                            let send = drain_input_for_send(DrainInputForSendArgs {
+                                input: &mut input,
+                                cursor: &mut cursor,
+                                input_chars: &mut input_chars,
+                                last_input_at: &mut last_input_at,
+                                pending_pastes: &mut pending_pastes,
+                                paste_capture: &mut paste_capture,
+                                command_menu_suppress: &mut command_menu_suppress,
+                                pending_pty_snapshot: &mut pending_pty_snapshot,
+                            });
+                            let text = send.model_text;
+                            if text.trim().is_empty() {
                                 continue;
                             }
-                            let effective_target = if memory_panel_open && memory_focus {
-                                MindKind::Memory
-                            } else {
-                                chat_target
-                            };
-                            let id = next_send_queue_id();
-                            send_queue_low.push_back(QueuedUserMessage {
-                                id,
-                                target: effective_target,
-                                ui_text: send.ui_text,
-                                model_text: send.model_text,
-                            });
-                            push_sys_log(
-                                &mut sys_log,
-                                config.sys_log_limit,
-                                format!("已入队（最低优先级）：#{id} → {:?}", effective_target),
-                            );
-                            action_hint = Some((now, "已入队".to_string()));
+                            let active = pty_active_idx.min(pty_tabs.len().saturating_sub(1));
+                            if let Some(state) = pty_tabs.get_mut(active) {
+                                let mut bytes = text.into_bytes();
+                                bytes.push(b'\r');
+                                state.record_input_bytes(&bytes);
+                                if let Some(tx_in) = pty_handles.get(&state.job_id) {
+                                    let _ = tx_in.send(PtyControl::Input(bytes));
+                                }
+                                action_hint = Some((now, "已发送到终端".to_string()));
+                            }
                             continue;
                         }
 
-	                        if matches!(mode, Mode::Generating | Mode::ExecutingTool) {
-	                            // API 活跃：
-	                            // - 默认 Enter 仅换行（避免打断当前请求）
-	                            // - 但在 Memory 面板内，更符合预期的是“Enter 直接入队等待发送”，用于不打断主流程的独立测试。
-	                            // - Shift+Enter 强制换行（上面已处理）
-	                            // - Alt+Enter 仍保留为兼容的“强制入队”
-	                            if !alt
-	                                && !ctrl
-	                                && !shift
-	                                && memory_panel_open
-	                                && memory_focus
-	                                && matches!(screen, Screen::Chat)
-	                            {
-	                                finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-	                                    force: true,
-	                                    now,
-	                                    config: &config,
-	                                    paste_capture: &mut paste_capture,
-	                                    input: &mut input,
-	                                    cursor: &mut cursor,
-	                                    input_chars: &mut input_chars,
-	                                    pending_pastes: &mut pending_pastes,
-	                                    toast: &mut toast,
-	                                    max_input_chars,
-	                                    burst_count: &mut burst_count,
-	                                    burst_last_at: &mut burst_last_at,
-	                                    burst_started_at: &mut burst_started_at,
-	                                    burst_start_cursor: &mut burst_start_cursor,
-	                                    paste_drop_until: &mut paste_drop_until,
-	                                    paste_guard_until: &mut paste_guard_until,
-	                                });
-	                                let send = drain_input_for_send(
-	                                    &mut input,
-	                                    &mut cursor,
-	                                    &mut input_chars,
-	                                    &mut last_input_at,
-	                                    &mut pending_pastes,
-	                                    &mut paste_capture,
-	                                    &mut command_menu_suppress,
-	                                    &mut pending_pty_snapshot,
-	                                );
-	                                if send.model_text.trim().is_empty() {
-	                                    continue;
-	                                }
-	                                let id = next_send_queue_id();
-	                                send_queue_low.push_back(QueuedUserMessage {
-	                                    id,
-	                                    target: MindKind::Memory,
-	                                    ui_text: send.ui_text,
-	                                    model_text: send.model_text,
-	                                });
-	                                push_sys_log(
-	                                    &mut sys_log,
-	                                    config.sys_log_limit,
-	                                    format!("已入队：#{id} → Memory"),
-	                                );
-	                                action_hint = Some((now, "已入队".to_string()));
-	                                continue;
-	                            }
+                        if matches!(mode, Mode::Generating | Mode::ExecutingTool) {
+                            //（1）API 活跃：
+                            //（2）默认 Enter 仅换行（避免打断当前请求）
+                            //（3）Shift/Ctrl+Enter：换行（上面已处理）
+                            //（4）Alt+Enter：入队
 
-	                            // 其它情况：Enter 换行；Alt+Enter 入队。
-	                            if alt && !ctrl {
-	                                finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-	                                    force: true,
-	                                    now,
+                            //（1）其它情况：Enter 换行；Alt+Enter 入队。
+                            if alt {
+                                finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+                                    force: true,
+                                    now,
                                     config: &config,
                                     paste_capture: &mut paste_capture,
                                     input: &mut input,
@@ -12985,24 +12219,20 @@ fn run_loop(
                                     paste_drop_until: &mut paste_drop_until,
                                     paste_guard_until: &mut paste_guard_until,
                                 });
-                                let send = drain_input_for_send(
-                                    &mut input,
-                                    &mut cursor,
-                                    &mut input_chars,
-                                    &mut last_input_at,
-                                    &mut pending_pastes,
-                                    &mut paste_capture,
-                                    &mut command_menu_suppress,
-                                    &mut pending_pty_snapshot,
-                                );
+                                let send = drain_input_for_send(DrainInputForSendArgs {
+                                    input: &mut input,
+                                    cursor: &mut cursor,
+                                    input_chars: &mut input_chars,
+                                    last_input_at: &mut last_input_at,
+                                    pending_pastes: &mut pending_pastes,
+                                    paste_capture: &mut paste_capture,
+                                    command_menu_suppress: &mut command_menu_suppress,
+                                    pending_pty_snapshot: &mut pending_pty_snapshot,
+                                });
                                 if send.model_text.trim().is_empty() {
                                     continue;
                                 }
-                                let effective_target = if memory_panel_open && memory_focus {
-                                    MindKind::Memory
-                                } else {
-                                    chat_target
-                                };
+                                let effective_target = chat_target;
                                 let id = next_send_queue_id();
                                 send_queue_low.push_back(QueuedUserMessage {
                                     id,
@@ -13048,16 +12278,16 @@ fn run_loop(
                                 paste_drop_until: &mut paste_drop_until,
                                 paste_guard_until: &mut paste_guard_until,
                             });
-                            let send = drain_input_for_send(
-                                &mut input,
-                                &mut cursor,
-                                &mut input_chars,
-                                &mut last_input_at,
-                                &mut pending_pastes,
-                                &mut paste_capture,
-                                &mut command_menu_suppress,
-                                &mut pending_pty_snapshot,
-                            );
+                            let send = drain_input_for_send(DrainInputForSendArgs {
+                                input: &mut input,
+                                cursor: &mut cursor,
+                                input_chars: &mut input_chars,
+                                last_input_at: &mut last_input_at,
+                                pending_pastes: &mut pending_pastes,
+                                paste_capture: &mut paste_capture,
+                                command_menu_suppress: &mut command_menu_suppress,
+                                pending_pty_snapshot: &mut pending_pty_snapshot,
+                            });
 
                             if let Some(decision) = normalize_confirm_input(&send.model_text) {
                                 if let Some((call, _reason, msg_idx)) = pending_tool_confirm.take()
@@ -13108,7 +12338,7 @@ fn run_loop(
                                             config.sys_log_limit,
                                             mcp_messages.tool_confirm_user_denied.clone(),
                                         );
-                                        // 会话上下文外置：将“用户拒绝执行”作为 tool 回执写入 context.jsonl，供模型下轮自愈。
+                                        //（1）会话上下文外置：将“用户拒绝执行”作为 tool 回执写入 context.jsonl，供模型下轮自愈。
                                         let denied_note = "用户拒绝执行该工具调用，本轮未执行。\n请立即向用户说明：你正准备做什么/为什么需要这一步；并询问用户是否有担忧（安全/隐私/副作用/资源占用）。\n然后给出替代方案（更安全的只读命令、或先解释再请求确认）。";
                                         let denied_meta = vec![
                                             "ok:false | result:confirmation_denied | exit:0 | elapsed_ms:0 | 状态:fail"
@@ -13128,7 +12358,7 @@ fn run_loop(
                                             Some(call.tool.as_str()),
                                             Some(denied_meta.as_slice()),
                                         );
-                                        // 用户拒绝工具执行：停止后续工具链，交由模型在后续对话中解释并礼貌询问原因。
+                                        //（1）用户拒绝工具执行：停止后续工具链，交由模型在后续对话中解释并礼貌询问原因。
                                         pending_tools.clear();
                                         mode = Mode::Idle;
                                         push_sys_log(
@@ -13268,10 +12498,10 @@ fn run_loop(
                                 || looks_like_paste
                                 || multi_line_guard
                                 || guard_active;
-                            // 强制发送快捷键：Alt+Enter
-                            let force_send = alt && !ctrl;
+                            //（1）强制发送快捷键：Alt+Enter
+                            let force_send = alt;
                             if paste_context && !force_send {
-                                // 粘贴期间：Enter 一律视为换行（不发送），避免把注入的 Enter 误当作“提交”。
+                                //（1）粘贴期间：Enter 一律视为换行（不发送），避免把注入的 Enter 误当作“提交”。
                                 last_input_at = Some(now);
                                 paste_guard_until =
                                     Some(now + Duration::from_millis(config.paste_send_inhibit_ms));
@@ -13319,47 +12549,38 @@ fn run_loop(
                                 paste_drop_until: &mut paste_drop_until,
                                 paste_guard_until: &mut paste_guard_until,
                             });
-                            let send = drain_input_for_send(
-                                &mut input,
-                                &mut cursor,
-                                &mut input_chars,
-                                &mut last_input_at,
-                                &mut pending_pastes,
-                                &mut paste_capture,
-                                &mut command_menu_suppress,
-                                &mut pending_pty_snapshot,
-                            );
+                            let send = drain_input_for_send(DrainInputForSendArgs {
+                                input: &mut input,
+                                cursor: &mut cursor,
+                                input_chars: &mut input_chars,
+                                last_input_at: &mut last_input_at,
+                                pending_pastes: &mut pending_pastes,
+                                paste_capture: &mut paste_capture,
+                                command_menu_suppress: &mut command_menu_suppress,
+                                pending_pty_snapshot: &mut pending_pty_snapshot,
+                            });
                             if send.model_text.trim().is_empty() {
                                 continue;
                             }
-                            // 已移除弹窗/窗口栈：不需要“清屏关闭弹窗”的额外处理。
-                                    if handle_command(HandleCommandArgs {
-                                        core: &mut core,
-                                        raw: send.model_text.trim_end(),
-                                        meta: &mut metamemo,
-                                        context_usage: &mut context_usage,
-                                        mode: &mut mode,
-                                        active_kind: &mut active_kind,
-                                        chat_target: &mut chat_target,
-                                        dog_state: &mut dog_state,
-                                        main_state: &mut main_state,
-                                        memory_state: &mut memory_state,
-                                        mind_ctx_idx_main: &mut mind_ctx_idx_main,
-                                        mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
-                                        mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
-                                        screen: &mut screen,
-                                        help_ui: &mut help_ui,
-                                        should_exit: &mut should_exit,
-                                        sse_enabled: &mut sse_enabled,
-                                        enter_cmd_shell: &mut pending_cmd_shell,
-                                        open_user_terminal: &mut pending_user_terminal,
-                                        memory_panel_open: &mut memory_panel_open,
-                                        exit_code: &mut exit_code,
-                                        sys_cfg: &mut sys_cfg,
-                                        sys_cfg_path: &sys_cfg_path,
-                                        sys_log: &mut sys_log,
-                                        sys_log_limit: config.sys_log_limit,
-                                    })? {
+                            //（1）已移除弹窗/窗口栈：不需要“清屏关闭弹窗”的额外处理。
+                            if handle_command(HandleCommandArgs {
+                                core: &mut core,
+                                raw: send.model_text.trim_end(),
+                                meta: &mut metamemo,
+                                context_usage: &mut context_usage,
+                                mode: &mut mode,
+                                screen: &mut screen,
+                                help_ui: &mut help_ui,
+                                should_exit: &mut should_exit,
+                                sse_enabled: &mut sse_enabled,
+                                enter_cmd_shell: &mut pending_cmd_shell,
+                                open_user_terminal: &mut pending_user_terminal,
+                                exit_code: &mut exit_code,
+                                sys_cfg: &mut sys_cfg,
+                                sys_cfg_path: &sys_cfg_path,
+                                sys_log: &mut sys_log,
+                                sys_log_limit: config.sys_log_limit,
+                            })? {
                                 reset_after_command(ResetAfterCommandArgs {
                                     core: &mut core,
                                     render_cache: &mut render_cache,
@@ -13415,7 +12636,11 @@ fn run_loop(
                                         &mut last_input_at,
                                     );
                                     core.push_system("··· Terminal 已打开（用户手动）\n- 该窗口中的命令由用户自己执行\n- 退出/关闭请在 Terminal 内自行完成\n- 这不是 AI 启动的自动化任务");
-                                    push_sys_log(&mut sys_log, config.sys_log_limit, "Terminal: user session");
+                                    push_sys_log(
+                                        &mut sys_log,
+                                        config.sys_log_limit,
+                                        "Terminal: user session",
+                                    );
                                     let call = ToolCall {
                                         tool: "bash".to_string(),
                                         input: "exec bash -li".to_string(),
@@ -13441,12 +12666,8 @@ fn run_loop(
                                 continue;
                             }
 
-                            // 发送目标：默认按 chat_target（Main/Dog），但若 Memory 面板聚焦，则发送给 Memory。
-                            let target = if memory_panel_open && memory_focus {
-                                MindKind::Memory
-                            } else {
-                                chat_target
-                            };
+                            //（1）发送目标：由当前标签页决定。
+                            let target = chat_target;
                             clear_brief_state(ClearBriefStateArgs {
                                 brief_text: &mut brief_text,
                                 brief_idx: &mut brief_idx,
@@ -13462,7 +12683,6 @@ fn run_loop(
                                 core: &mut core,
                                 metamemo: &mut metamemo,
                                 context_usage: &mut context_usage,
-                                pending_mind_half: &mut pending_mind_half,
                                 dog_state: &mut dog_state,
                                 main_state: &mut main_state,
                                 memory_state: &mut memory_state,
@@ -13502,8 +12722,10 @@ fn run_loop(
                     }
                     KeyCode::Char(ch) => {
                         last_input_at = Some(now);
-                        // 体验优化：用户输入 `/` 期望立即弹出命令菜单。
-                        // 若当前处于 paste_capture（粘贴捕获）阶段，直接 force flush，避免 `/` 被吞在 capture 缓冲里导致“要点一下屏幕才出现菜单”。
+                        //（1）体验：输入 `/` 需立即弹出菜单。
+                        //（2）若处于粘贴捕获，先强制 flush。
+                        //（3）避免 `/` 被捕获缓冲吞掉。
+                        //（4）避免必须点屏幕后才出菜单。
                         if ch == '/' && input.is_empty() && paste_capture.is_some() {
                             finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
                                 force: true,
@@ -13690,16 +12912,23 @@ fn run_loop(
     Ok(exit_code)
 }
 
-struct DrainAsyncEventsArgs<'a> {
+struct LoopCtx<'a> {
+    //（1）Core + async event input
     core: &'a mut Core,
     rx: &'a Receiver<AsyncEvent>,
+
+    //（1）UI render state
     render_cache: &'a mut ui::ChatRenderCache,
+
+    //（1）PTY UI + background jobs
     pty_tabs: &'a mut Vec<PtyUiState>,
     pty_active_idx: &'a mut usize,
     pty_handles: &'a mut HashMap<u64, mpsc::Sender<PtyControl>>,
     pty_view: &'a mut bool,
     pty_done_batches: &'a mut PtyDoneBatches,
     pty_done_followups: &'a mut VecDeque<PtyDoneFollowup>,
+
+    //（1）Chat loop state
     send_queue_internal: &'a mut VecDeque<InternalUserMessage>,
     mode: &'a mut Mode,
     scroll: &'a mut u16,
@@ -13712,6 +12941,8 @@ struct DrainAsyncEventsArgs<'a> {
     expanded_user_idxs: &'a mut BTreeSet<usize>,
     collapsed_user_idxs: &'a mut BTreeSet<usize>,
     active_tool_stream: &'a mut Option<ToolStreamState>,
+
+    //（1）Agents + model clients
     dog_state: &'a mut DogState,
     #[allow(dead_code)]
     dog_client: &'a Option<DogClient>,
@@ -13723,13 +12954,16 @@ struct DrainAsyncEventsArgs<'a> {
     _mind_ctx_idx_main: &'a mut Option<usize>,
     _mind_ctx_idx_dog: &'a mut Option<usize>,
     sending_until: &'a mut Option<Instant>,
+
+    //（1）Usage + diary/memory
     token_totals: &'a mut TokenTotals,
     token_total_path: &'a Path,
     meta: &'a mut Option<MetaMemo>,
     context_usage: &'a mut ContextUsage,
     diary_state: &'a mut DiaryState,
     mind_rate_window: &'a mut VecDeque<Instant>,
-    pending_mind_half: &'a mut Option<PendingMindHalf>,
+
+    //（1）Streaming UI overlays (brief / thinking / tool preview)
     brief_text: &'a mut String,
     brief_idx: &'a mut Option<usize>,
     brief_in_progress: &'a mut bool,
@@ -13747,10 +12981,14 @@ struct DrainAsyncEventsArgs<'a> {
     tool_preview_active: &'a mut bool,
     tool_preview_pending_idle: &'a mut bool,
     tool_preview_chat_idx: &'a mut Option<usize>,
+
+    //（1）Input editor
     input: &'a mut String,
     cursor: &'a mut usize,
     input_chars: &'a mut usize,
     last_input_at: &'a mut Option<Instant>,
+
+    //（1）Request lifecycle / retry / cancellation
     pending_pty_snapshot: &'a mut Option<PendingPtySnapshot>,
     active_request_is_mind: &'a mut bool,
     active_request_is_fastmemo_compact: &'a mut bool,
@@ -13758,6 +12996,8 @@ struct DrainAsyncEventsArgs<'a> {
     streaming_state: &'a mut StreamingState,
     mind_pulse: &'a mut Option<MindPulse>,
     retry_status: &'a mut Option<String>,
+
+    //（1）System log + config/prompts
     sys_log: &'a mut VecDeque<String>,
     sys_log_limit: usize,
     config: &'a AppConfig,
@@ -13766,16 +13006,22 @@ struct DrainAsyncEventsArgs<'a> {
     pty_started_notice_prompt_text: &'a str,
     mcp_messages: &'a McpMessages,
     pty_messages: &'a PtyMessages,
+
+    //（1）Fastmemo compact state
     auto_fastmemo_compact: &'a mut bool,
     fastmemo_compact_inflight: &'a mut bool,
     fastmemo_compact_edit_mask: &'a mut u8,
     fastmemo_compact_retry_at: &'a mut Option<Instant>,
+
+    //（1）Heartbeat + system config
     sys_cfg: &'a mut SystemConfig,
     heartbeat_minutes_cache: &'a mut usize,
     next_heartbeat_at: &'a mut Instant,
     heartbeat_request_id: &'a mut Option<u64>,
     response_count: &'a mut u64,
     _pulse_notice: &'a mut Option<PulseNotice>,
+
+    //（1）Toolchain scheduling + async event output
     tx: &'a mpsc::Sender<AsyncEvent>,
     pending_tools: &'a mut VecDeque<ToolCall>,
     pending_tool_confirm: &'a mut Option<(ToolCall, String, usize)>,
@@ -13837,35 +13083,35 @@ fn handle_model_stream_chunk(
         sse_enabled,
     } = args;
 
-    // Codex 的 summary/reasoning 可能在正文开始后仍继续分段到达（中转/实现差异较大）。
-    // 为避免 brief/think 丢失：Codex 模式下允许在 has_content=true 后继续接收 meta 片段。
+    //（1）Codex 的 summary/reasoning 可能在正文开始后仍继续分段到达（中转/实现差异较大）。
+    //（2）Codex：has_content=true 后仍允许接收 meta。
     let allow_meta_after_content = streaming_state.codex_mode;
     if !brief.is_empty() && (!streaming_state.has_content || allow_meta_after_content) {
         if streaming_state.codex_mode {
-            // Codex：brief 只作为可选元数据展示（聊天区 + 状态栏），不强制存在。
-            // - 不并入 thinking（避免混淆）
-            // - preserve markdown（例如 **标题**）
+            //（1）Codex：brief 只作为可选元数据展示（聊天区 + 状态栏），不强制存在。
+            //（2）不并入 thinking（避免混淆）
+            //（3）preserve markdown（例如 **标题**）
             let frag = normalize_codex_summary_fragment(brief);
             brief_text.push_str(&frag);
             *brief_in_progress = true;
             *brief_pending_idle = false;
-            if let Some(idx) = *brief_idx {
-                if let Some(entry) = core.history.get_mut(idx) {
-                    entry.text = build_codex_brief_tool_message_running(owner, brief_text);
-                    render_cache.invalidate(idx);
-                }
+            if let Some(idx) = *brief_idx
+                && let Some(entry) = core.history.get_mut(idx)
+            {
+                entry.text = build_codex_brief_tool_message_running(owner, brief_text);
+                render_cache.invalidate(idx);
             }
-            // 某些中转/实现不会发 `response.reasoning.delta`，只会发 summary。
-            // 此时把 summary 当作“可折叠的思考内容”，写入 think tool（供 Shift+Tab/Tab 展开）。
+            //（1）某些中转/实现不会发 `response.reasoning.delta`，只会发 summary。
+            //（2）Codex：summary 写入 think tool，供 Shift+Tab/Tab 展开。
             if thinking_full_text.trim().is_empty() {
                 if thinking_started_at.is_none() {
                     *thinking_started_at = Some(Instant::now());
                 }
-                if let Some(ti) = *thinking_idx {
-                    if let Some(entry) = core.history.get_mut(ti) {
-                        entry.text = build_codex_thinking_tool_message_running(owner, brief_text);
-                        render_cache.invalidate(ti);
-                    }
+                if let Some(ti) = *thinking_idx
+                    && let Some(entry) = core.history.get_mut(ti)
+                {
+                    entry.text = build_codex_thinking_tool_message_running(owner, brief_text);
+                    render_cache.invalidate(ti);
                 }
             }
         } else {
@@ -13877,11 +13123,11 @@ fn handle_model_stream_chunk(
             brief_text.push_str(brief);
             *brief_in_progress = true;
             *brief_pending_idle = false;
-            if let Some(idx) = *brief_idx {
-                if let Some(entry) = core.history.get_mut(idx) {
-                    entry.text = build_brief_tool_message_running(owner, brief_text);
-                    render_cache.invalidate(idx);
-                }
+            if let Some(idx) = *brief_idx
+                && let Some(entry) = core.history.get_mut(idx)
+            {
+                entry.text = build_brief_tool_message_running(owner, brief_text);
+                render_cache.invalidate(idx);
             }
         }
     }
@@ -13918,21 +13164,22 @@ fn handle_model_stream_chunk(
     }
 
     let first_chunk = streaming_state.append_content(content);
-    if sse_enabled && !*tool_preview_active {
-        if let Some(tail) = open_thinking_tail(&streaming_state.raw_text) {
-            if thinking_started_at.is_none() {
-                *thinking_started_at = Some(Instant::now());
-            }
-            thinking_text.clear();
-            thinking_text.push_str(&tail);
-            *thinking_in_progress = true;
-            *thinking_pending_idle = false;
-            if let Some(idx) = *thinking_idx {
-                let preview = thinking_text.as_str();
-                if let Some(entry) = core.history.get_mut(idx) {
-                    entry.text = build_thinking_tool_message_running(owner, preview);
-                    render_cache.invalidate(idx);
-                }
+    if sse_enabled
+        && !*tool_preview_active
+        && let Some(tail) = open_thinking_tail(&streaming_state.raw_text)
+    {
+        if thinking_started_at.is_none() {
+            *thinking_started_at = Some(Instant::now());
+        }
+        thinking_text.clear();
+        thinking_text.push_str(&tail);
+        *thinking_in_progress = true;
+        *thinking_pending_idle = false;
+        if let Some(idx) = *thinking_idx {
+            let preview = thinking_text.as_str();
+            if let Some(entry) = core.history.get_mut(idx) {
+                entry.text = build_thinking_tool_message_running(owner, preview);
+                render_cache.invalidate(idx);
             }
         }
     }
@@ -13944,13 +13191,13 @@ fn handle_model_stream_chunk(
     }
 
     if sse_enabled {
-        // 流式阶段：不要仅凭看到 `<tool>` 就进入 tool stub。
-        // 否则会在模型输出“示例/协议说明/半包 `<tool>`”时误判为工具调用，导致 UI 卡顿/乱码动画。
+        //（1）流式阶段：不要仅凭看到 `<tool>` 就进入 tool stub。
+        //（2）否则会在模型输出“示例/协议说明/半包 `<tool>`”时误判为工具调用，导致 UI 卡顿/乱码动画。
         //
-        // 这里改为：确认出现完整 `</tool>` 且能解析出至少 1 个合法工具 JSON 后才进入 stub。
-        // 更快的兜底：如果回复从 `<tool>` 开始（真实工具调用的典型形态），则一旦看到 `<tool>`
-        // 就立刻切换成 tool stub，避免在流式阶段把大段 JSON 原文刷到屏幕上。
-        // 最终解析/执行仍在 stream_end 进行（需要完整 `</tool>` 才会执行）。
+        //（1）这里改为：确认出现完整 `</tool>` 且能解析出至少 1 个合法工具 JSON 后才进入 stub。
+        //（2）更快的兜底：如果回复从 `<tool>` 开始（真实工具调用的典型形态），则一旦看到 `<tool>`
+        //（3）就立刻切换成 tool stub，避免在流式阶段把大段 JSON 原文刷到屏幕上。
+        //（4）最终解析/执行仍在 stream_end 进行（需要完整 `</tool>` 才会执行）。
         if streaming_state.tool_start.is_none() {
             let trimmed = streaming_state.text.trim_start();
             let start = streaming_state.text.len().saturating_sub(trimmed.len());
@@ -14008,7 +13255,7 @@ fn handle_model_stream_chunk(
             && let Some(start) = streaming_state.text.find("<tool>")
             && streaming_state.text[start..].contains("</tool>")
         {
-            // 只接受“行首（可有空白）”的 tool 块，避免把行内示例误判。
+            //（1）只接受“行首（可有空白）”的 tool 块，避免把行内示例误判。
             let line_prefix = streaming_state.text[..start]
                 .rsplit('\n')
                 .next()
@@ -14020,7 +13267,9 @@ fn handle_model_stream_chunk(
                 if !parsed.is_empty() {
                     let prefix = safe_prefix(&streaming_state.text, start);
                     streaming_state.tool_start = Some(start);
-                    // 不在“思考窗”展示工具预览，不展示工具 JSON，只在聊天区放一个极简 WORK 占位。
+                    //（1）工具预览不进入思考窗。
+                    //（2）不展示工具 JSON。
+                    //（3）聊天区只放极简 WORK 占位。
                     tool_preview.clear();
                     *tool_preview_active = false;
                     *tool_preview_pending_idle = false;
@@ -14028,7 +13277,8 @@ fn handle_model_stream_chunk(
                     *thinking_in_progress = false;
                     *thinking_pending_idle = false;
                     if let Some(idx) = streaming_state.idx {
-                        // Keep any prefix as assistant text, then show tool as a separate tool entry.
+                        //（1）保留前置正文为 assistant。
+                        //（2）工具 stub 作为独立 tool 条目。
                         let has_prefix = !prefix.trim().is_empty();
                         if has_prefix {
                             streaming_state.assistant_idx_before_tool = Some(idx);
@@ -14040,12 +13290,13 @@ fn handle_model_stream_chunk(
                             let tool_name = extract_tool_name_hint(&streaming_state.text[start..])
                                 .unwrap_or_else(|| "tool".to_string());
                             let label = crate::mcp::tool_display_label(tool_name.trim());
-	                            let stub = build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
-	                            core.push_tool_mind(stub, Some(owner));
-	                            let tool_idx = core.history.len().saturating_sub(1);
-	                            render_cache.invalidate(tool_idx);
-	                            streaming_state.idx = Some(tool_idx);
-	                            *tool_preview_chat_idx = Some(tool_idx);
+                            let stub =
+                                build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
+                            core.push_tool_mind(stub, Some(owner));
+                            let tool_idx = core.history.len().saturating_sub(1);
+                            render_cache.invalidate(tool_idx);
+                            streaming_state.idx = Some(tool_idx);
+                            *tool_preview_chat_idx = Some(tool_idx);
                         } else {
                             if let Some(entry) = core.history.get_mut(idx) {
                                 entry.role = Role::Tool;
@@ -14053,8 +13304,10 @@ fn handle_model_stream_chunk(
                                     extract_tool_name_hint(&streaming_state.text[start..])
                                         .unwrap_or_else(|| "tool".to_string());
                                 let label = crate::mcp::tool_display_label(tool_name.trim());
-                                entry.text =
-                                    build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
+                                entry.text = build_tool_stream_stub_text(
+                                    &label,
+                                    &streaming_state.text[start..],
+                                );
                                 render_cache.invalidate(idx);
                             }
                             *tool_preview_chat_idx = Some(idx);
@@ -14064,23 +13317,23 @@ fn handle_model_stream_chunk(
             }
         }
 
-        // 一旦进入 tool stub 阶段，就不再把 raw tool JSON 刷进聊天区（仅在 stream_end 时解析+执行）。
+        //（1）进入 tool stub 后不再刷 tool JSON；stream_end 解析执行。
         if let Some(start) = streaming_state.tool_start {
-            if let Some(idx) = streaming_state.idx {
-                if let Some(entry) = core.history.get_mut(idx) {
-                    let tool_name = extract_tool_name_hint(&streaming_state.text[start..])
-                        .unwrap_or_else(|| "tool".to_string());
-                    let label = crate::mcp::tool_display_label(tool_name.trim());
-                    entry.text = build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
-                    render_cache.invalidate(idx);
-                }
+            if let Some(idx) = streaming_state.idx
+                && let Some(entry) = core.history.get_mut(idx)
+            {
+                let tool_name = extract_tool_name_hint(&streaming_state.text[start..])
+                    .unwrap_or_else(|| "tool".to_string());
+                let label = crate::mcp::tool_display_label(tool_name.trim());
+                entry.text = build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
+                render_cache.invalidate(idx);
             }
             return;
         }
 
         if first_chunk {
-            // 统一规则：思考一结束（正文开始）就立刻隐藏，不做“5 秒停留/折叠动画”。
-            // 但仍把完整思考写回 Tool 消息，方便 Tab 切换到详情模式回看。
+            //（1）统一规则：思考一结束（正文开始）就立刻隐藏，不做“5 秒停留/折叠动画”。
+            //（2）但仍把完整思考写回 Tool 消息，方便 Tab 切换到详情模式回看。
             if let Some(idx) = *thinking_idx {
                 let effective_thinking =
                     if streaming_state.codex_mode && thinking_full_text.trim().is_empty() {
@@ -14119,7 +13372,7 @@ fn handle_model_stream_chunk(
                         render_cache.invalidate(idx);
                     }
                 } else if let Some(entry) = core.history.get_mut(idx) {
-                    // 没有可展示思考：立刻标记为 done（详情模式也不刷屏）。
+                    //（1）没有可展示思考：立刻标记为 done（详情模式也不刷屏）。
                     entry.text = if streaming_state.codex_mode {
                         build_codex_thinking_tool_message_done(owner, "", 0, 0)
                     } else {
@@ -14131,15 +13384,15 @@ fn handle_model_stream_chunk(
             thinking_text.clear();
             *thinking_in_progress = false;
             *thinking_pending_idle = false;
-            if let Some(idx) = *brief_idx {
-                if let Some(entry) = core.history.get_mut(idx) {
-                    entry.text = if streaming_state.codex_mode {
-                        build_codex_brief_tool_message_done(owner, brief_text)
-                    } else {
-                        build_brief_tool_message_done(owner, brief_text)
-                    };
-                    render_cache.invalidate(idx);
-                }
+            if let Some(idx) = *brief_idx
+                && let Some(entry) = core.history.get_mut(idx)
+            {
+                entry.text = if streaming_state.codex_mode {
+                    build_codex_brief_tool_message_done(owner, brief_text)
+                } else {
+                    build_brief_tool_message_done(owner, brief_text)
+                };
+                render_cache.invalidate(idx);
             }
             *brief_in_progress = false;
             *brief_pending_idle = false;
@@ -14239,6 +13492,7 @@ struct ModelStreamEndArgs<'a> {
     run_log_path: &'a str,
 }
 
+// ===== 模型回复收尾（工具提取、外置 context 落盘、工具链启动）=====
 fn handle_model_stream_end(
     args: ModelStreamEndArgs<'_>,
     kind: MindKind,
@@ -14335,7 +13589,7 @@ fn handle_model_stream_end(
             *tool_preview_pending_idle = true;
         }
         *brief_pending_idle = false;
-        // 思考结束即隐藏：不保留 pending_idle（避免“卡住/被旧状态遮挡”的显示问题）。
+        //（1）思考结束即隐藏：不保留 pending_idle（避免“卡住/被旧状态遮挡”的显示问题）。
         *thinking_pending_idle = false;
         thinking_text.clear();
     } else {
@@ -14348,16 +13602,16 @@ fn handle_model_stream_end(
         tool_preview.clear();
     }
     if let Some(msg) = error {
-        crate::test::contexttest_log_response_end(
-            kind,
+        crate::test::contexttest_log_response_end(crate::test::ContextTestResponseEndArgs {
+            mind: kind,
             request_id,
-            usage,
-            Some(msg.as_str()),
-            Some(brief_text.as_str()),
-            Some(thinking_full_text.as_str()),
-            Some(streaming_state.raw_text.as_str()),
-            None,
-        );
+            usage_total_tokens: usage,
+            error: Some(msg.as_str()),
+            brief: Some(brief_text.as_str()),
+            thinking_full: Some(thinking_full_text.as_str()),
+            raw_text: Some(streaming_state.raw_text.as_str()),
+            assistant_text: None,
+        });
 
         *active_request_is_mind = false;
         *active_request_is_fastmemo_compact = false;
@@ -14454,16 +13708,16 @@ fn handle_model_stream_end(
         }
     } else if !is_heartbeat {
         let raw_assistant = streaming_state.raw_text.trim_end().to_string();
-        // Codex：如果全程没收到正文首包，placeholder "Working..." 不应残留在聊天记录里。
-        if streaming_state.codex_mode && raw_assistant.trim().is_empty() {
-            if let Some(idx) = streaming_state.idx
-                && let Some(entry) = core.history.get_mut(idx)
-                && entry.role == Role::Assistant
-                && entry.text.trim() == "Working..."
-            {
-                entry.text.clear();
-                render_cache.invalidate(idx);
-            }
+        //（1）Codex：如果全程没收到正文首包，placeholder "Working..." 不应残留在聊天记录里。
+        if streaming_state.codex_mode
+            && raw_assistant.trim().is_empty()
+            && let Some(idx) = streaming_state.idx
+            && let Some(entry) = core.history.get_mut(idx)
+            && entry.role == Role::Assistant
+            && entry.text.trim() == "Working..."
+        {
+            entry.text.clear();
+            render_cache.invalidate(idx);
         }
         let mut assistant_text = raw_assistant.clone();
         if raw_assistant.contains("<thinking>") {
@@ -14476,7 +13730,7 @@ fn handle_model_stream_end(
             }
             assistant_text = cleaned.trim().to_string();
         }
-        // 兜底：若模型把历史 `[t:HHMMSS]` 时间戳样式复读到正文里，清掉它，避免污染显示与工具解析。
+        //（1）兜底：若模型把历史 `[t:HHMMSS]` 时间戳样式复读到正文里，清掉它，避免污染显示与工具解析。
         assistant_text = crate::context::strip_stamp_footer(&assistant_text)
             .trim()
             .to_string();
@@ -14486,8 +13740,8 @@ fn handle_model_stream_end(
             .map(|start| assistant_text[start..].trim().to_string())
             .filter(|s| !s.is_empty());
         let mut extracted: Vec<ToolCall> = Vec::new();
-        // “工具意图”判定：只有当回复从 <tool> 开始时，才认为模型在尝试发起真实工具调用。
-        // 否则正文里出现的 `<tool>{...}</tool>` 说明/示例（含 markdown 行内代码/代码块）不应触发解析失败弹窗。
+        //（1）“工具意图”判定：只有当回复从 <tool> 开始时，才认为模型在尝试发起真实工具调用。
+        //（2）正文里的 <tool> 示例不应触发解析失败弹窗。
         let tool_intent = assistant_text.trim_start().starts_with("<tool>");
         let has_tool_markers = assistant_text.contains("<tool>")
             && assistant_text.to_ascii_lowercase().contains("</tool>");
@@ -14497,12 +13751,12 @@ fn handle_model_stream_end(
                 extracted_from_assistant = true;
                 assistant_text = cleaned;
             } else if tool_intent && (has_tool_markers || streaming_state.tool_start.is_some()) {
-                // 看到 <tool> 但没能解析出任何调用：通常是 JSON 字符串未正确转义（例如 input 内含未转义的 "）。
-                // 也可能是流式阶段进入了 tool stub，但最终缺失 `</tool>` 或 JSON 不完整。
-                // 给出明确提示，便于用户定位是“模型格式错误”而非前端/Tab 导致。
+                //（1）看到 <tool> 但解析失败：多因 JSON 未正确转义。
+                //（2）也可能是流式阶段进入了 tool stub，但最终缺失 `</tool>` 或 JSON 不完整。
+                //（3）给出明确提示，便于用户定位是“模型格式错误”而非前端/Tab 导致。
                 malformed_tool_call = true;
-                // 解析失败：要写入“模型上下文”，用于自愈重试。
-                // 这里用统一的 [MCP:工具输出code...] 头部格式（状态=失败 + 原因预览），便于 DeepSeek 的 role 占位关联。
+                //（1）解析失败：要写入“模型上下文”，用于自愈重试。
+                //（2）统一用 [MCP:工具输出code...] 头，便于 role 占位关联。
                 let model_note = "工具调用未执行：检测到 <tool> 块但解析失败（格式错误）。\n请确保：\n- `<tool>{...}</tool>` 独立成行\n- JSON 合法且字段齐全（至少包含 tool + 该工具所需字段）\n- `</tool>` 后不要追加任何文字/占位/伪造回执"
                     .to_string();
                 let meta_lines =
@@ -14550,8 +13804,8 @@ fn handle_model_stream_end(
         }
         if extracted_from_assistant && extracted.len() > TOOL_CALLS_MAX_PER_ASSISTANT_MSG {
             let n = extracted.len();
-            // 写入“模型上下文”：让模型知道自己这一轮被拒绝，可自愈重试（下轮拆分为 <=3）。
-            // 同样用 [MCP:工具输出code...] 统一格式，便于占位关联。
+            //（1）写入“模型上下文”：让模型知道自己这一轮被拒绝，可自愈重试（下轮拆分为 <=3）。
+            //（2）同样用 [MCP:工具输出code...] 统一格式，便于占位关联。
             let model_note = format!(
                 "工具调用未执行：工具调用过多。\n本轮检测到 {n} 个（上限 {TOOL_CALLS_MAX_PER_ASSISTANT_MSG}），已拒绝执行。\n请拆分多轮，每轮最多 {TOOL_CALLS_MAX_PER_ASSISTANT_MSG} 个 <tool> JSON 调用。"
             );
@@ -14589,7 +13843,7 @@ fn handle_model_stream_end(
             );
             push_sys_log(sys_log, sys_log_limit, "工具调用过多：已拒绝执行");
 
-            // 将该错误“主动回送给模型”以自愈：仅对用户消息触发的请求生效（避免内部占位/自动续写造成死循环）。
+            //（1）将该错误“主动回送给模型”以自愈：仅对用户消息触发的请求生效（避免内部占位/自动续写造成死循环）。
             if !*active_request_is_internal_placeholder {
                 let prompt = format!(
                     "[sys:工具自愈]上轮输出的 <tool> 调用数量超限：检测到 {n} 个，上限 {TOOL_CALLS_MAX_PER_ASSISTANT_MSG}，系统已拒绝执行。\n请立刻改为重新输出 1~{TOOL_CALLS_MAX_PER_ASSISTANT_MSG} 个 <tool>{{...}}</tool>（必须独立成行）；若需要更多操作，请拆分到后续轮次。\n要求：不要解释，不要复述上下文；只输出新的 <tool> 块（或 1 行说明无需工具并等待用户）。"
@@ -14619,7 +13873,7 @@ fn handle_model_stream_end(
             *tool_preview_active = false;
             *tool_preview_pending_idle = true;
         }
-        // 已移除弹窗/窗口栈：正文只保留在聊天区（必要时由“动态层/回看”机制提供可观测性）。
+        //（1）已移除弹窗/窗口栈：正文只保留在聊天区（必要时由“动态层/回看”机制提供可观测性）。
         let tool_calls_log: Vec<serde_json::Value> =
             extracted.iter().map(tool_call_log_fields).collect();
         runlog_event(
@@ -14640,16 +13894,16 @@ fn handle_model_stream_end(
                 "sse_enabled": sse_enabled,
             }),
         );
-        crate::test::contexttest_log_response_end(
-            kind,
+        crate::test::contexttest_log_response_end(crate::test::ContextTestResponseEndArgs {
+            mind: kind,
             request_id,
-            usage,
-            None,
-            Some(brief_text.as_str()),
-            Some(thinking_full_text.as_str()),
-            Some(raw_assistant.as_str()),
-            Some(assistant_text.as_str()),
-        );
+            usage_total_tokens: usage,
+            error: None,
+            brief: Some(brief_text.as_str()),
+            thinking_full: Some(thinking_full_text.as_str()),
+            raw_text: Some(raw_assistant.as_str()),
+            assistant_text: Some(assistant_text.as_str()),
+        });
         if extracted_from_assistant {
             extracted.retain(|c| c.tool != "mind_msg");
         }
@@ -14662,7 +13916,7 @@ fn handle_model_stream_end(
         if matches!(diary_state.stage, DiaryStage::WaitingMain) {
             extracted.retain(is_datememo_add);
         }
-            // 工具调用：按解析顺序依次执行（受每轮最多 3 个工具调用上限约束）。
+        //（1）工具调用：按解析顺序依次执行（受每轮最多 3 个工具调用上限约束）。
         if malformed_tool_call
             && let Some(stub_idx) = tool_preview_chat_idx.take()
             && streaming_state.idx == Some(stub_idx)
@@ -14696,7 +13950,7 @@ fn handle_model_stream_end(
             render_cache.invalidate(stub_idx);
         }
         if *active_request_is_fastmemo_compact && extracted.is_empty() {
-            // fastmemo 压缩必须通过工具链落地；若未收到任何工具调用，则视为失败并允许后续重试。
+            //（1）fastmemo 压缩必须通过工具链落地；若未收到任何工具调用，则视为失败并允许后续重试。
             if *fastmemo_compact_inflight {
                 *fastmemo_compact_inflight = false;
             }
@@ -14747,18 +14001,11 @@ fn handle_model_stream_end(
                 MindKind::Main => "main",
                 MindKind::Memory => "memory",
             };
-            // 会话上下文外置：若本轮包含工具调用，外置 context 会在下方按“前置正文 + tool原文 + 后置正文”
-            // 拆分写入；这里避免重复落盘（否则会把前/后正文写两遍）。
+            //（1）会话上下文外置：若本轮包含工具调用，外置 context 会在下方按“前置正文 + tool原文 + 后置正文”
+            //（2）拆分写入；这里避免重复落盘（否则会把前/后正文写两遍）。
             if extracted.is_empty() {
                 let p = context_path_for_mind(config, mind);
-                log_dyncontext(
-                    p,
-                    mind,
-                    "assistant",
-                    &assistant_text,
-                    None,
-                    None,
-                );
+                log_dyncontext(p, mind, "assistant", &assistant_text, None, None);
             }
             if matches!(kind, MindKind::Main) && !is_pass_message(&assistant_text) {
                 log_contextmemo(
@@ -14774,7 +14021,7 @@ fn handle_model_stream_end(
                 sys_log_limit,
                 format!("现在[萤]{}响应完成", mind_label(kind)),
             );
-            // 动态上下文压缩链路已移除：这里只做常规落盘/统计即可。
+            //（1）动态上下文压缩链路已移除：这里只做常规落盘/统计即可。
         } else if extracted.is_empty() && !*active_request_is_mind && !is_heartbeat {
             append_run_log(
                 run_log_path,
@@ -14783,83 +14030,91 @@ fn handle_model_stream_end(
             );
         }
         *active_request_is_mind = false;
-	        if !extracted.is_empty() {
-            // SSE tool stub 模式下，模型可能输出：
-            // - 前置正文 + <tool>... + 后置正文
-            // 我们希望 UI 能稳定呈现：
-            // - 上方：前置正文（assistant）
-            // - 中间：工具占位/回执（tool）
-            // - 下方：后置正文（assistant）
+        if !extracted.is_empty() {
+            //（1）SSE tool stub 模式下，模型可能输出：
+            //（2）前置正文 + <tool>... + 后置正文
+            //（3）我们希望 UI 能稳定呈现：
+            //（4）上方：前置正文（assistant）
+            //（5）中间：工具占位/回执（tool）
+            //（6）下方：后置正文（assistant）
             //
-            // 之前的逻辑会把“清理后的全文（去掉 tool blocks）”覆盖到前置正文，导致前/后正文混成一条。
-            // 这里改为：尽量保留前置正文不动，把“剩余正文”作为一条新的 assistant 消息追加到 tool stub 之后。
-	            let cleaned_ui_text = assistant_text.trim().to_string();
-	            let mut prefix_for_ctx: Option<String> = None;
-	            let mut suffix_for_ctx: Option<String> = None;
-	            let mut suffix_to_push: Option<String> = None;
-	            if let Some(ai) = streaming_state.assistant_idx_before_tool.take() {
-	                if let Some(entry) = core.history.get_mut(ai) {
-	                    entry.role = Role::Assistant;
-	                    entry.mind = Some(kind);
-	                    let prefix = entry.text.trim().to_string();
-	                    if !prefix.is_empty()
-	                        && !cleaned_ui_text.is_empty()
-	                        && cleaned_ui_text.starts_with(&prefix)
-	                    {
-	                        // suffix = cleaned - prefix
-	                        let rest = cleaned_ui_text[prefix.len()..].trim().to_string();
-	                        entry.text = prefix;
-	                        if !entry.text.trim().is_empty() {
-	                            prefix_for_ctx = Some(entry.text.trim().to_string());
-	                        }
-	                        if !rest.is_empty() {
-	                            suffix_to_push = Some(rest);
-	                            suffix_for_ctx = suffix_to_push.clone();
-	                        }
-	                    } else if !cleaned_ui_text.is_empty() {
-	                        // Fallback：无法可靠切分时，至少保证“清理后的正文”可见。
-	                        entry.text.clone_from(&cleaned_ui_text);
-	                        prefix_for_ctx = Some(cleaned_ui_text.clone());
-	                    }
-	                    render_cache.invalidate(ai);
-	                }
-	            } else if tool_preview_chat_idx.is_some() && !cleaned_ui_text.is_empty() {
-	                // tool stub 里没有前置正文（回复直接从 <tool> 开始），但可能存在后置正文（例如 </tool> 后还有解释）。
-	                // 追加一条 assistant，避免“后置正文消失”。
-	                suffix_to_push = Some(cleaned_ui_text);
-	                suffix_for_ctx = suffix_to_push.clone();
-	            }
-	            if let Some(t) = suffix_to_push
-	                .as_deref()
-	                .map(str::trim)
-	                .filter(|s| !s.is_empty())
-	            {
-	                core.history.push(Message {
-	                    role: Role::Assistant,
-	                    text: t.to_string(),
-	                    mind: Some(kind),
-	                });
-	                render_cache.invalidate(core.history.len().saturating_sub(1));
-	            }
-	            // 外置上下文：当回复中存在“工具调用块”时，也要把前/后正文写入 context（否则下一轮会丢失）。
-	            let mind = match kind {
-	                MindKind::Sub => "dog",
-	                MindKind::Main => "main",
-	                MindKind::Memory => "memory",
-	            };
-	            let p = context_path_for_mind(config, mind);
-	            if let Some(prefix) = prefix_for_ctx.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-	                log_dyncontext(p, mind, "assistant", prefix, None, None);
-	            }
-	            // 关键：把“工具调用原文（<tool>...</tool>）”按原样写入上下文，避免任何摘要/前端格式污染。
-	            // 否则模型下一轮只能看到工具回执，会误判为外部执行，或误学到错误的工具调用格式。
-	            let tool_calls_raw = extract_tool_blocks_verbatim(&raw_assistant);
-	            if !tool_calls_raw.trim().is_empty() {
-	                log_dyncontext(p, mind, "assistant", &tool_calls_raw, None, None);
-	            }
-	            if let Some(suffix) = suffix_for_ctx.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-	                log_dyncontext(p, mind, "assistant", suffix, None, None);
-	            }
+            //（1）之前的逻辑会把“清理后的全文（去掉 tool blocks）”覆盖到前置正文，导致前/后正文混成一条。
+            //（2）保留前置正文；剩余正文作为新 assistant 追加。
+            let cleaned_ui_text = assistant_text.trim().to_string();
+            let mut prefix_for_ctx: Option<String> = None;
+            let mut suffix_for_ctx: Option<String> = None;
+            let mut suffix_to_push: Option<String> = None;
+            if let Some(ai) = streaming_state.assistant_idx_before_tool.take() {
+                if let Some(entry) = core.history.get_mut(ai) {
+                    entry.role = Role::Assistant;
+                    entry.mind = Some(kind);
+                    let prefix = entry.text.trim().to_string();
+                    if !prefix.is_empty()
+                        && !cleaned_ui_text.is_empty()
+                        && cleaned_ui_text.starts_with(&prefix)
+                    {
+                        //（1）suffix = cleaned - prefix
+                        let rest = cleaned_ui_text[prefix.len()..].trim().to_string();
+                        entry.text = prefix;
+                        if !entry.text.trim().is_empty() {
+                            prefix_for_ctx = Some(entry.text.trim().to_string());
+                        }
+                        if !rest.is_empty() {
+                            suffix_to_push = Some(rest);
+                            suffix_for_ctx = suffix_to_push.clone();
+                        }
+                    } else if !cleaned_ui_text.is_empty() {
+                        //（1）Fallback：无法可靠切分时，至少保证“清理后的正文”可见。
+                        entry.text.clone_from(&cleaned_ui_text);
+                        prefix_for_ctx = Some(cleaned_ui_text.clone());
+                    }
+                    render_cache.invalidate(ai);
+                }
+            } else if tool_preview_chat_idx.is_some() && !cleaned_ui_text.is_empty() {
+                //（1）tool stub 可无前置正文，但可能有后置正文。
+                //（2）追加一条 assistant，避免“后置正文消失”。
+                suffix_to_push = Some(cleaned_ui_text);
+                suffix_for_ctx = suffix_to_push.clone();
+            }
+            if let Some(t) = suffix_to_push
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                core.history.push(Message {
+                    role: Role::Assistant,
+                    text: t.to_string(),
+                    mind: Some(kind),
+                });
+                render_cache.invalidate(core.history.len().saturating_sub(1));
+            }
+            //（1）外置上下文：当回复中存在“工具调用块”时，也要把前/后正文写入 context（否则下一轮会丢失）。
+            let mind = match kind {
+                MindKind::Sub => "dog",
+                MindKind::Main => "main",
+                MindKind::Memory => "memory",
+            };
+            let p = context_path_for_mind(config, mind);
+            if let Some(prefix) = prefix_for_ctx
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                log_dyncontext(p, mind, "assistant", prefix, None, None);
+            }
+            //（1）关键：把“工具调用原文（<tool>...</tool>）”按原样写入上下文，避免任何摘要/前端格式污染。
+            //（2）否则模型下一轮只能看到工具回执，会误判为外部执行，或误学到错误的工具调用格式。
+            let tool_calls_raw = extract_tool_blocks_verbatim(&raw_assistant);
+            if !tool_calls_raw.trim().is_empty() {
+                log_dyncontext(p, mind, "assistant", &tool_calls_raw, None, None);
+            }
+            if let Some(suffix) = suffix_for_ctx
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                log_dyncontext(p, mind, "assistant", suffix, None, None);
+            }
             if let Some(idx) = streaming_state.idx {
                 let is_tool_stub = tool_preview_chat_idx.is_some_and(|v| v == idx)
                     && core.history.get(idx).is_some_and(|m| m.role == Role::Tool);
@@ -14869,24 +14124,24 @@ fn handle_model_stream_end(
                 }
             }
             pending_tools.extend(extracted);
-	            // 工具执行 owner 必须以“该次回复的 mind(kind)”为准：
-	            // 否则用户切焦点/切目标时，Memory 的工具会被当成 Main 执行，导致 Memory 面板看起来“没轮询/没执行”。
-	            let _ = try_start_next_tool(TryStartNextToolArgs {
-	                pending_tools,
-	                pending_tool_confirm,
-	                tx: tx.clone(),
-	                core,
-	                meta,
-	                context_usage,
-	                mode,
-	                sys_log,
-	                sys_log_limit,
-	                sys_cfg,
-	                owner: kind,
-	                mcp_messages,
-	                pty_messages,
-	                pty_started_notice_prompt_text,
-	            });
+            //（1）工具执行 owner 必须以“该次回复的 mind(kind)”为准：
+            //（2）否则 Memory 工具可能被当成 Main 执行。
+            let _ = try_start_next_tool(TryStartNextToolArgs {
+                pending_tools,
+                pending_tool_confirm,
+                tx: tx.clone(),
+                core,
+                meta,
+                context_usage,
+                mode,
+                sys_log,
+                sys_log_limit,
+                sys_cfg,
+                owner: kind,
+                mcp_messages,
+                pty_messages,
+                pty_started_notice_prompt_text,
+            });
         }
         if matches!(kind, MindKind::Main)
             && matches!(diary_state.stage, DiaryStage::WaitingMain)
@@ -14915,8 +14170,8 @@ fn handle_model_stream_end(
             }
             assistant_text = cleaned.trim().to_string();
         }
-        // 心跳场景：DeepSeek 偶发把“答复”放进 reasoning（thinking_full_text）而 content 为空。
-        // 若本次 content 为空，则用 thinking 内容回填到正文，避免只看到心跳 banner。
+        //（1）心跳场景：DeepSeek 可能把答复放进 reasoning。
+        //（2）若本次 content 为空，则用 thinking 内容回填到正文，避免只看到心跳 banner。
         assistant_text = heartbeat_reply_text(assistant_text, thinking_full_text);
         runlog_event(
             "INFO",
@@ -14934,16 +14189,16 @@ fn handle_model_stream_end(
                 "sse_enabled": sse_enabled,
             }),
         );
-        crate::test::contexttest_log_response_end(
-            kind,
+        crate::test::contexttest_log_response_end(crate::test::ContextTestResponseEndArgs {
+            mind: kind,
             request_id,
-            usage,
-            None,
-            Some(brief_text.as_str()),
-            Some(thinking_full_text.as_str()),
-            Some(raw_assistant.as_str()),
-            Some(assistant_text.as_str()),
-        );
+            usage_total_tokens: usage,
+            error: None,
+            brief: Some(brief_text.as_str()),
+            thinking_full: Some(thinking_full_text.as_str()),
+            raw_text: Some(raw_assistant.as_str()),
+            assistant_text: Some(assistant_text.as_str()),
+        });
         if let Some(idx) = streaming_state.idx
             && let Some(entry) = core.history.get_mut(idx)
         {
@@ -14981,15 +14236,8 @@ fn handle_model_stream_end(
                 Some("main"),
                 &assistant_text,
             );
-            let p = context_path_for_mind(&config, "main");
-            log_dyncontext(
-                p,
-                "main",
-                "assistant",
-                &assistant_text,
-                None,
-                None,
-            );
+            let p = context_path_for_mind(config, "main");
+            log_dyncontext(p, "main", "assistant", &assistant_text, None, None);
             if !is_pass_message(&assistant_text) {
                 log_contextmemo(
                     &config.contextmemo_path,
@@ -15023,9 +14271,9 @@ fn handle_model_stream_end(
         let thinking_chars = thinking_full_text.chars().count();
         let summary = build_thinking_summary(kind, thinking_secs);
         let is_codex = streaming_state.codex_mode;
-        // 统一规则：
-        // - SSE 流式：只在 running 阶段显示思考；一旦正文开始/思考结束就隐藏
-        // - 非流式：默认不显示思考；仅在详情模式回看（Tab 切换）
+        //（1）统一规则：
+        //（2）SSE 流式：只在 running 阶段显示思考；一旦正文开始/思考结束就隐藏
+        //（3）非流式：默认不显示思考；仅在详情模式回看（Tab 切换）
         if has_thinking && !is_heartbeat {
             let msg = if is_codex {
                 build_codex_thinking_tool_message_done(
@@ -15053,7 +14301,7 @@ fn handle_model_stream_end(
             }
             log_memos(meta, context_usage, "tool", None, msg.trim());
         } else if let Some(idx) = *thinking_idx {
-            // 没有思考内容：把占位标记为 done（详情模式也不刷屏）。
+            //（1）没有思考内容：把占位标记为 done（详情模式也不刷屏）。
             if let Some(entry) = core.history.get_mut(idx) {
                 entry.text = if is_codex {
                     build_codex_thinking_tool_message_done(kind, "", 0, 0)
@@ -15064,7 +14312,7 @@ fn handle_model_stream_end(
             }
         }
 
-        // 思考结束即隐藏：不做 5 秒停留与折叠动画。
+        //（1）思考结束即隐藏：不做 5 秒停留与折叠动画。
         *thinking_idx = None;
         thinking_full_text.clear();
         *thinking_started_at = None;
@@ -15129,7 +14377,7 @@ fn handle_model_stream_end(
         && matches!(*mode, Mode::Idle)
     {
         if memory_client.is_some() {
-            // 刷新 fastmemo（尽量保证 Memory 在压缩前看到最新内容）。
+            //（1）刷新 fastmemo（尽量保证 Memory 在压缩前看到最新内容）。
             if sys_cfg.fastmemo_inject_enabled {
                 let fastmemo = read_fastmemo_for_context();
                 main_state.refresh_fastmemo_system(&fastmemo);
@@ -15169,14 +14417,19 @@ fn handle_model_stream_end(
                 *fastmemo_compact_retry_at = None;
             }
         } else {
-            push_sys_log(sys_log, sys_log_limit, "MEMORY: API 未就绪，fastmemo 压缩暂停");
+            push_sys_log(
+                sys_log,
+                sys_log_limit,
+                "MEMORY: API 未就绪，fastmemo 压缩暂停",
+            );
         }
     }
     jump_to_bottom(scroll, follow_bottom);
 }
 
-fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
-    let DrainAsyncEventsArgs {
+// ===== 事件循环回收（AsyncEvent -> 状态机推进）=====
+fn drain_async_events(args: LoopCtx<'_>) {
+    let LoopCtx {
         core,
         rx,
         render_cache,
@@ -15214,7 +14467,6 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
         context_usage,
         diary_state,
         mind_rate_window,
-        pending_mind_half,
         brief_text,
         brief_idx,
         brief_in_progress,
@@ -15562,8 +14814,8 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     .log_lines
                     .iter()
                     .any(|l| l.contains("phase:pty_final"));
-                // 兼容旧链路：仅在“final”阶段才把屏幕快照写回工具 output。
-                // 新链路（后台 PTY）会在启动时提前结束工具调用（phase:pty_started），并在后台发 PtyJobDone。
+                //（1）兼容旧链路：仅在“final”阶段才把屏幕快照写回工具 output。
+                //（2）后台 PTY：启动即结束工具调用，后台发 PtyJobDone。
                 if is_interactive_bash && !is_pty_started && is_pty_final {
                     let active = (*pty_active_idx).min(pty_tabs.len().saturating_sub(1));
                     if let Some(state) = pty_tabs.get_mut(active) {
@@ -15588,14 +14840,13 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             parts.push(format!("[{label}]\n{snap}"));
                         }
 
-                        // 若屏幕内容被截断，补充一段 raw tail（可能含 ANSI 控制序列）。
-                        if snap_chars > PTY_RETURN_SCREEN_MAX_CHARS {
-                            if let Some(raw) =
+                        //（1）若屏幕内容被截断，补充一段 raw tail（可能含 ANSI 控制序列）。
+                        if snap_chars > PTY_RETURN_SCREEN_MAX_CHARS
+                            && let Some(raw) =
                                 read_tail_text(&state.saved_path, PTY_RETURN_RAW_TAIL_BYTES)
-                            {
-                                let raw = truncate_tail(&raw, PTY_RETURN_RAW_TAIL_MAX_CHARS);
-                                parts.push(format!("[raw_tail]\n{raw}"));
-                            }
+                        {
+                            let raw = truncate_tail(&raw, PTY_RETURN_RAW_TAIL_MAX_CHARS);
+                            parts.push(format!("[raw_tail]\n{raw}"));
                         }
 
                         let stdin_full = state.input_log.trim_end_matches('\n').to_string();
@@ -15613,7 +14864,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             .log_lines
                             .push(format!("saved:{}", state.saved_path));
                     }
-                    // 旧链路收尾：结束后清理终端状态（不残留）。
+                    //（1）旧链路收尾：结束后清理终端状态（不残留）。
                     *pty_view = false;
                     pty_tabs.clear();
                     pty_handles.clear();
@@ -15645,16 +14896,16 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 let mut mind_transfer: Option<(MindKind, MindKind, String, String)> = None;
                 let mut mind_pulse_dir: Option<PulseDir> = None;
                 if let Some(state) = active_tool_stream.as_mut() {
-                    // 交互式 bash（PTY）在“启动阶段”提前结束工具调用：不向模型注入、也不继续自动生成。
-                    // 退出策略：等待 PTY Done 或 PTY 审计 tick（由系统注入），用户可在 UI 里交互。
+                    //（1）交互式 bash（PTY）在“启动阶段”提前结束工具调用：不向模型注入、也不继续自动生成。
+                    //（2）退出策略：等待 PTY Done 或 PTY 审计 tick（由系统注入），用户可在 UI 里交互。
                     if is_interactive_bash && is_pty_started {
                         skip_tool_context = true;
                         skip_owner_resume = true;
                     }
-                    // 写日记收尾：只要“日记流程处于 active”且本轮由 Memory 成功执行了 datememo 写入，就认为日记已落盘，
-                    // 后续应清空 fastcontext，准备新一轮记录。
+                    //（1）写日记收尾：active 且 datememo 写入成功即落盘。
+                    //（2）后续应清空 fastcontext，准备新一轮记录。
                     //
-                    // 这里不再绑定某个具体 stage 名称（例如 WaitingMain），避免未来 stage 调整导致漏清空。
+                    //（1）这里不再绑定某个具体 stage 名称（例如 WaitingMain），避免未来 stage 调整导致漏清空。
                     if diary_state.active()
                         && matches!(state.owner, MindKind::Memory)
                         && is_datememo_add(&state.call)
@@ -15671,22 +14922,11 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     if state.call.tool == "mind_msg" {
                         skip_owner_resume = true;
                         skip_tool_context = true;
-                        if let Some((from, target, brief, content)) =
-                            handle_mind_msg_tool(MindMsgToolArgs {
-                                state,
-                                pending_mind_half,
-                                main_state,
-                                dog_state,
-                                sys_cfg,
-                                config,
-                                context_usage,
-                            })
-                        {
+                        if let Some((from, target, brief, content)) = handle_mind_msg_tool(state) {
                             mind_transfer = Some((from, target, brief, content));
                             mind_pulse_dir = Some(pulse_dir(from, target));
                         }
-                        if sys_cfg.fastmemo_compact_enabled
-                            && memory_state.fastmemo_compact_pending
+                        if sys_cfg.fastmemo_compact_enabled && memory_state.fastmemo_compact_pending
                         {
                             *auto_fastmemo_compact = true;
                             push_sys_log(sys_log, sys_log_limit, "fastmemo: 已达阈值，待压缩");
@@ -15710,7 +14950,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             push_sys_log(sys_log, sys_log_limit, "fastmemo: 已达阈值，待压缩");
                         }
                     }
-                    // fastmemo 是固定注入的上下文块：任意写入后应立即重载，避免后续请求仍拿旧内容。
+                    //（1）fastmemo 是固定注入的上下文块：任意写入后应立即重载，避免后续请求仍拿旧内容。
                     if matches!(state.call.tool.as_str(), "memory_add") {
                         let raw = state
                             .call
@@ -15718,13 +14958,11 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                             .as_deref()
                             .unwrap_or(state.call.input.trim())
                             .to_ascii_lowercase();
-                        if raw.contains("fastmemo") {
-                            if sys_cfg.fastmemo_inject_enabled {
-                                let fastmemo = read_fastmemo_for_context();
-                                main_state.refresh_fastmemo_system(&fastmemo);
-                                dog_state.refresh_fastmemo_system(&fastmemo);
-                                memory_state.refresh_fastmemo_system(&fastmemo);
-                            }
+                        if raw.contains("fastmemo") && sys_cfg.fastmemo_inject_enabled {
+                            let fastmemo = read_fastmemo_for_context();
+                            main_state.refresh_fastmemo_system(&fastmemo);
+                            dog_state.refresh_fastmemo_system(&fastmemo);
+                            memory_state.refresh_fastmemo_system(&fastmemo);
                         }
                     }
                     tool_message_model = Some(format_tool_message_for_model(&state.call, &outcome));
@@ -15763,8 +15001,8 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 *active_tool_stream = None;
                 let mut mind_request: Option<(MindKind, String, String)> = None;
                 if let Some((from, target, brief, content)) = mind_transfer.take() {
-                    // 聊天区可视化：○ Dog ➠ Main：brief / ● Main ➠ Dog：brief
-                    // 下一行用 ↳ 承载内容（箭头与内容斜体由 UI 负责）。
+                    //（1）聊天区可视化：○ Dog ➠ Main：brief / ● Main ➠ Dog：brief
+                    //（2）下一行用 ↳ 承载内容（箭头与内容斜体由 UI 负责）。
                     let from_key = if matches!(from, MindKind::Sub) {
                         "dog"
                     } else {
@@ -15814,7 +15052,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     clear_contextmemo(&config.contextmemo_path);
                     push_sys_log(sys_log, sys_log_limit, "日记压缩完成");
                 }
-                // 会话上下文外置：工具回执写入 context.jsonl，供后续请求回放到模型上下文。
+                //（1）会话上下文外置：工具回执写入 context.jsonl，供后续请求回放到模型上下文。
                 if !skip_tool_context && let Some(msg) = tool_message_model.as_ref() {
                     let mind = match owner {
                         MindKind::Sub => "dog",
@@ -15858,8 +15096,8 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                     mcp_messages,
                     pty_messages,
                 });
-                // fastmemo 自动压缩完成判定（由 MEMORY 执行）：最后一个工具结束后检查 fastmemo 是否仍有任一分区 >=10。
-                // 仅依据 fastmemo 文件本身判断，避免依赖“是否回显 notice”导致漏判。
+                //（1）fastmemo 完成判定：最后工具结束后检查分区>=10。
+                //（2）仅依据 fastmemo 文件本身判断，避免依赖“是否回显 notice”导致漏判。
                 if !has_next && *fastmemo_compact_inflight {
                     let pending = std::fs::read_to_string(FASTMEMO_PATH)
                         .ok()
@@ -15874,7 +15112,7 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                         memory_state.fastmemo_compact_pending = false;
                         push_sys_log(sys_log, sys_log_limit, "fastmemo 自动压缩完成");
                     } else {
-                        // 仍超阈值：稍后自动重试（或下一轮继续压缩下一分区）。
+                        //（1）仍超阈值：稍后自动重试（或下一轮继续压缩下一分区）。
                         *fastmemo_compact_inflight = false;
                         *fastmemo_compact_edit_mask = 0;
                         *active_request_is_fastmemo_compact = false;
@@ -15972,67 +15210,65 @@ fn drain_async_events(args: DrainAsyncEventsArgs<'_>) {
                 }
                 if !has_next
                     && skip_owner_resume
-                    && mind_request.is_some()
                     && matches!(*mode, Mode::Idle)
                     && pending_tool_confirm.is_none()
                     && pending_tools.is_empty()
                     && active_tool_stream.is_none()
+                    && let Some((target, mind_system, mind_user)) = mind_request.take()
                 {
-                    if let Some((target, mind_system, mind_user)) = mind_request.take() {
-                        *active_request_is_mind = true;
-                        let client = if matches!(target, MindKind::Main) {
-                            main_client
+                    *active_request_is_mind = true;
+                    let client = if matches!(target, MindKind::Main) {
+                        main_client
+                    } else {
+                        dog_client
+                    };
+                    let state = if matches!(target, MindKind::Main) {
+                        &*main_state
+                    } else {
+                        &*dog_state
+                    };
+                    let started = try_start_mind_generation(TryStartMindGenerationArgs {
+                        target,
+                        client,
+                        state,
+                        mind_system: &mind_system,
+                        mind_user: &mind_user,
+                        tx,
+                        config,
+                        mode,
+                        active_kind,
+                        sending_until,
+                        sys_log,
+                        sys_log_limit,
+                        streaming_state,
+                        request_seq,
+                        active_request_id,
+                        active_cancel,
+                        sse_enabled,
+                    });
+                    if let Some(in_tokens) = started {
+                        record_request_in_tokens(
+                            core,
+                            token_totals,
+                            token_total_path,
+                            context_usage,
+                            active_request_in_tokens,
+                            in_tokens,
+                        );
+                    } else {
+                        *active_request_is_mind = false;
+                        let label = if matches!(target, MindKind::Main) {
+                            "MAIN"
                         } else {
-                            dog_client
+                            "DOG"
                         };
-                        let state = if matches!(target, MindKind::Main) {
-                            &*main_state
-                        } else {
-                            &*dog_state
-                        };
-                        let started = try_start_mind_generation(TryStartMindGenerationArgs {
-                            target,
-                            client,
-                            state,
-                            mind_system: &mind_system,
-                            mind_user: &mind_user,
-                            tx,
-                            config,
-                            mode,
-                            active_kind,
-                            sending_until,
+                        push_sys_log(
                             sys_log,
                             sys_log_limit,
-                            streaming_state,
-                            request_seq,
-                            active_request_id,
-                            active_cancel,
-                            sse_enabled,
-                        });
-                        if let Some(in_tokens) = started {
-                            record_request_in_tokens(
-                                core,
-                                token_totals,
-                                token_total_path,
-                                context_usage,
-                                active_request_in_tokens,
-                                in_tokens,
-                            );
-                        } else {
-                            *active_request_is_mind = false;
-                            let label = if matches!(target, MindKind::Main) {
-                                "MAIN"
-                            } else {
-                                "DOG"
-                            };
-                            push_sys_log(
-                                sys_log,
-                                sys_log_limit,
-                                format!("{label}: API 未就绪，沟通暂停"),
-                            );
-                            let msg = format!("{label}: API 未就绪，沟通暂停");
-                            push_system_and_log(core, meta, context_usage, Some("mind"), &msg);
-                        }
+                            format!("{label}: API 未就绪，沟通暂停"),
+                        );
+                        let msg = format!("{label}: API 未就绪，沟通暂停");
+                        push_system_and_log(core, meta, context_usage, Some("mind"), &msg);
                     }
                 }
             }
@@ -16206,21 +15442,12 @@ struct HandleCommandArgs<'a> {
     meta: &'a mut Option<MetaMemo>,
     context_usage: &'a mut ContextUsage,
     mode: &'a mut Mode,
-    active_kind: &'a mut MindKind,
-    chat_target: &'a mut MindKind,
-    dog_state: &'a mut DogState,
-    main_state: &'a mut DogState,
-    memory_state: &'a mut DogState,
-    mind_ctx_idx_main: &'a mut Option<usize>,
-    mind_ctx_idx_dog: &'a mut Option<usize>,
-    mind_ctx_idx_memory: &'a mut Option<usize>,
     screen: &'a mut Screen,
     help_ui: &'a mut HelpUiState,
     should_exit: &'a mut bool,
     sse_enabled: &'a mut bool,
     enter_cmd_shell: &'a mut bool,
     open_user_terminal: &'a mut bool,
-    memory_panel_open: &'a mut bool,
     exit_code: &'a mut i32,
     sys_cfg: &'a mut SystemConfig,
     sys_cfg_path: &'a Path,
@@ -16235,21 +15462,12 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
         meta,
         context_usage,
         mode,
-        active_kind,
-        chat_target,
-        dog_state,
-        main_state,
-        memory_state,
-        mind_ctx_idx_main,
-        mind_ctx_idx_dog,
-        mind_ctx_idx_memory,
         screen,
         help_ui,
         should_exit,
         sse_enabled,
         enter_cmd_shell,
         open_user_terminal,
-        memory_panel_open,
         exit_code,
         sys_cfg,
         sys_cfg_path,
@@ -16268,9 +15486,11 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
     match cmd.as_str() {
         "/quit" | "/q" => {
             *should_exit = true;
-            // 仅退出 AItermux，返回到当前 shell/session。
-            // Termux 的 session 是否退出由启动器（~/.zshrc）按 exit code 决定；这里默认不触发“结束 session”。
+            //（1）仅退出 AItermux，返回到当前 shell/session。
+            //（2）是否结束 Termux session 由启动器按 exit code 决定。
+            //（3）这里仅退出程序，不主动结束 session。
             *exit_code = 0;
+            push_sys_log(sys_log, sys_log_limit, "Quit");
         }
         "/terminal" | "/term" => {
             *open_user_terminal = true;
@@ -16285,66 +15505,18 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
             *screen = Screen::Chat;
             *help_ui = HelpUiState::Selecting { selected: 0 };
         }
-        "/testmemory" => {
-            *screen = Screen::Chat;
-            // 仅打开/关闭 Memory 面板：不锁定 chat_target，不抢占主聊天。
-            *memory_panel_open = !*memory_panel_open;
-            let msg = if *memory_panel_open {
-                "··· Memory 面板已打开\n- 点击聊天区：发送给主聊天（Main/Dog）\n- 点击记忆面板：发送给记忆模型"
-            } else {
-                "··· Memory 面板已关闭"
-            };
-            push_system_and_log(core, meta, context_usage, None, msg);
-            push_sys_log(sys_log, sys_log_limit, msg);
-        }
-        "/turn" | "/trun" | "/switch" => {
-            let target = match arg.as_str() {
-                "main" => MindKind::Main,
-                "dog" => MindKind::Sub,
-                _ => {
-                    push_system_and_log(
-                        core,
-                        meta,
-                        context_usage,
-                        None,
-                        "用法：/Switch Main 或 /Switch Dog",
-                    );
-                    return Ok(true);
-                }
-            };
-            *chat_target = target;
-            sys_cfg.chat_target = if matches!(target, MindKind::Main) {
-                "main".to_string()
-            } else {
-                "dog".to_string()
-            };
-            let _ = store_config_file(sys_cfg_path, sys_cfg);
-            reset_state_for_target(
-                target,
-                dog_state,
-                main_state,
-                memory_state,
-                mind_ctx_idx_main,
-                mind_ctx_idx_dog,
-                mind_ctx_idx_memory,
-            );
-            if is_idle_like(*mode) {
-                *active_kind = target;
-            }
-            let msg = build_switch_prompt(target);
-            push_system_and_log(core, meta, context_usage, None, &msg);
-            push_sys_log(sys_log, sys_log_limit, msg);
-        }
         "/sse" => match arg.as_str() {
             "open" => {
                 *sse_enabled = true;
                 sys_cfg.sse_enabled = true;
                 let _ = store_config_file(sys_cfg_path, sys_cfg);
+                push_sys_log(sys_log, sys_log_limit, "SSE: on");
             }
             "close" => {
                 *sse_enabled = false;
                 sys_cfg.sse_enabled = false;
                 let _ = store_config_file(sys_cfg_path, sys_cfg);
+                push_sys_log(sys_log, sys_log_limit, "SSE: off");
             }
             _ => {
                 push_system_and_log(
@@ -16354,11 +15526,14 @@ fn handle_command(args: HandleCommandArgs<'_>) -> anyhow::Result<bool> {
                     None,
                     "用法：/SSE Open 或 /SSE Close",
                 );
+                push_sys_log(sys_log, sys_log_limit, "SSE: invalid args");
             }
         },
         _ => {
-            const UNKNOWN: &str = "未知命令：/Terminal /Cmd /Settings /Help /Switch Main /Switch Dog /TestMemory /SSE Open /SSE Close /Quit";
+            const UNKNOWN: &str =
+                "未知命令：/Terminal /Cmd /Settings /Help /SSE Open /SSE Close /Quit";
             push_system_and_log(core, meta, context_usage, None, UNKNOWN);
+            push_sys_log(sys_log, sys_log_limit, "Unknown command");
         }
     }
 
@@ -16529,11 +15704,8 @@ fn try_start_main_generation(args: TryStartMainGenerationArgs<'_>) -> Option<u64
     push_sys_log(sys_log, sys_log_limit, "现在[萤]MAIN正在思考");
     streaming_state.reset();
     let p = context_path_for_mind(config, "main");
-    let messages = main_state.message_snapshot_with_context_file(
-        extra_system.as_deref(),
-        p,
-        "main",
-    );
+    let messages =
+        main_state.message_snapshot_with_context_file(extra_system.as_deref(), p, "main");
     let in_tokens = estimate_messages_in_tokens(&messages);
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     spawn_dog_request(
@@ -16547,7 +15719,6 @@ fn try_start_main_generation(args: TryStartMainGenerationArgs<'_>) -> Option<u64
     );
     Some(in_tokens)
 }
-
 
 struct TryStartMemoryGenerationArgs<'a> {
     memory_client: &'a Option<DogClient>,
@@ -16597,11 +15768,8 @@ fn try_start_memory_generation(args: TryStartMemoryGenerationArgs<'_>) -> Option
     push_sys_log(sys_log, sys_log_limit, "现在[萤]MEM正在思考");
     streaming_state.reset();
     let p = context_path_for_mind(config, "memory");
-    let messages = memory_state.message_snapshot_with_context_file(
-        extra_system.as_deref(),
-        p,
-        "memory",
-    );
+    let messages =
+        memory_state.message_snapshot_with_context_file(extra_system.as_deref(), p, "memory");
     let in_tokens = estimate_messages_in_tokens(&messages);
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     spawn_dog_request(
@@ -16682,8 +15850,8 @@ fn try_start_mind_generation(args: TryStartMindGenerationArgs<'_>) -> Option<u64
             content: mind_user.to_string(),
         });
     }
-	    // 这里不依赖具体 provider：仅做基础清洗（空消息过滤 + 连续 assistant 合并）。
-	    let messages = normalize_messages_for_model_context(&messages);
+    //（1）这里不依赖具体 provider：仅做基础清洗（空消息过滤 + 连续 assistant 合并）。
+    let messages = normalize_messages_for_model_context(&messages);
     let in_tokens = estimate_messages_in_tokens(&messages);
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     spawn_dog_request(
@@ -16816,13 +15984,13 @@ fn try_start_dog_generation(args: TryStartDogGenerationArgs<'_>) -> Option<u64> 
     };
     push_sys_log(sys_log, sys_log_limit, format!("现在[萤]{label}正在思考"));
     streaming_state.reset();
-    let mind = if matches!(kind, MindKind::Sub) { "dog" } else { "main" };
+    let mind = if matches!(kind, MindKind::Sub) {
+        "dog"
+    } else {
+        "main"
+    };
     let p = context_path_for_mind(config, mind);
-    let messages = dog_state.message_snapshot_with_context_file(
-        extra_system.as_deref(),
-        p,
-        mind,
-    );
+    let messages = dog_state.message_snapshot_with_context_file(extra_system.as_deref(), p, mind);
     let in_tokens = estimate_messages_in_tokens(&messages);
     let (request_id, cancel) = begin_request(request_seq, active_request_id, active_cancel);
     spawn_dog_request(
@@ -16864,10 +16032,9 @@ fn main() -> anyhow::Result<()> {
     if !args
         .iter()
         .any(|a| a == "--no-bootstrap" || a == "--skip-bootstrap")
+        && let Err(e) = run_bootstrap_script(false)
     {
-        if let Err(e) = run_bootstrap_script(false) {
-            eprintln!("[ying] 依赖 bootstrap 失败：{e:#}");
-        }
+        eprintln!("[ying] 依赖 bootstrap 失败：{e:#}");
     }
 
     let code = match run() {
@@ -17017,7 +16184,7 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
     let mut pty_done: Vec<(NaiveDateTime, u64)> = Vec::new();
 
     fn parse_runtime_header(line: &str) -> Option<(Option<NaiveDateTime>, String)> {
-        // 新格式（文本块）：
+        //（1）新格式（文本块）：
         // ==== [2026-02-21 13:45:12] [INFO] event.name seq=1 run_id=... thread=... ====
         let s = line.trim().strip_prefix("==== [")?;
         let ts_end = s.find(']')?;
@@ -17040,16 +16207,16 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
             continue;
         }
 
-        // 新版文本块 runtime log
+        //（1）新版文本块 runtime log
         if line_trim.starts_with("==== [") {
             let Some((ts_opt, event)) = parse_runtime_header(line_trim) else {
                 continue;
             };
             *counts.entry(event.clone()).or_default() += 1;
 
-            // header 之后紧跟 data(JSON pretty) + ---- 分隔。只在需要时解析。
+            //（1）header 之后紧跟 data(JSON pretty) + ---- 分隔。只在需要时解析。
             let mut data_block = String::new();
-            while let Some((_, l)) = iter.next() {
+            for (_, l) in iter.by_ref() {
                 if l.trim_end() == "----" {
                     break;
                 }
@@ -17064,17 +16231,17 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
                         let cmd = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("");
                         pty_ready.push((ts, job_id, cmd.to_string()));
                     }
-                } else if event == "pty.done" {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data_block) {
-                        let job_id = v.get("job_id").and_then(|x| x.as_u64()).unwrap_or(0);
-                        pty_done.push((ts, job_id));
-                    }
+                } else if event == "pty.done"
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&data_block)
+                {
+                    let job_id = v.get("job_id").and_then(|x| x.as_u64()).unwrap_or(0);
+                    pty_done.push((ts, job_id));
                 }
             }
             continue;
         }
 
-        // 兼容旧版 JSONL runtime log（历史文件可能仍存在）
+        //（1）兼容旧版 JSONL runtime log（历史文件可能仍存在）
         let v: serde_json::Value = match serde_json::from_str(line_trim) {
             Ok(v) => v,
             Err(_) => continue,
@@ -17102,8 +16269,8 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
                 pty_done.push((ts, job_id));
             }
         } else if lineno < 3 {
-            // 避免完全静默：若头几行格式不符合预期，给一点提示。
-            // 但不当作错误：runtime log 可能混有旧格式/其它日志。
+            //（1）避免完全静默：若头几行格式不符合预期，给一点提示。
+            //（2）但不当作错误：runtime log 可能混有旧格式/其它日志。
         }
     }
 
@@ -17113,7 +16280,7 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
         println!("  - {k}: {v}");
     }
 
-    // PTY storm：30s 内启动 >=4 个 PTY
+    //（1）PTY storm：30s 内启动 >=4 个 PTY
     if !pty_ready.is_empty() {
         pty_ready.sort_by_key(|(ts, _, _)| *ts);
         let mut storm_found = false;
@@ -17127,8 +16294,7 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
             if n >= 4 {
                 storm_found = true;
                 println!("\nwarn: PTY storm detected ({n} starts within 30s)");
-                for k in i..j {
-                    let (ts, job_id, cmd) = &pty_ready[k];
+                for (ts, job_id, cmd) in pty_ready.iter().take(j).skip(i) {
                     let cmd = crate::truncate_with_suffix(cmd.as_str(), 120);
                     println!("  - {ts} job_id={job_id} cmd={cmd}");
                 }
@@ -17143,7 +16309,7 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-	mod types {
+mod types {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Mode {
         Idle,
@@ -17233,7 +16399,7 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
         }
     }
 
-	    impl Core {
+    impl Core {
         pub fn new() -> Self {
             Self {
                 history: Vec::new(),
@@ -17309,29 +16475,29 @@ fn run_diag_runtime(path: &str) -> anyhow::Result<()> {
             });
         }
 
-	        pub fn push_tool(&mut self, text: String) {
-	            let clean = text.trim_end().to_string();
-	            if clean.is_empty() {
-	                return;
-	            }
-	            self.history.push(Message {
-	                role: Role::Tool,
-	                text: clean,
-	                mind: None,
-	            });
-	        }
+        pub fn push_tool(&mut self, text: String) {
+            let clean = text.trim_end().to_string();
+            if clean.is_empty() {
+                return;
+            }
+            self.history.push(Message {
+                role: Role::Tool,
+                text: clean,
+                mind: None,
+            });
+        }
 
-	        pub fn push_tool_mind(&mut self, text: String, mind: Option<MindKind>) {
-	            let clean = text.trim_end().to_string();
-	            if clean.is_empty() {
-	                return;
-	            }
-	            self.history.push(Message {
-	                role: Role::Tool,
-	                text: clean,
-	                mind,
-	            });
-	        }
+        pub fn push_tool_mind(&mut self, text: String, mind: Option<MindKind>) {
+            let clean = text.trim_end().to_string();
+            if clean.is_empty() {
+                return;
+            }
+            self.history.push(Message {
+                role: Role::Tool,
+                text: clean,
+                mind,
+            });
+        }
 
         pub fn clear_chat(&mut self) {
             self.history.clear();
@@ -17384,58 +16550,36 @@ mod commands {
         !after.chars().any(|c| c.is_whitespace())
     }
 
-pub fn filter_commands_for_input(
-    input: &str,
-    sse_enabled: bool,
-    chat_target: MindKind,
-) -> Vec<CommandSpec> {
+    pub fn filter_commands_for_input(
+        input: &str,
+        sse_enabled: bool,
+        _chat_target: MindKind,
+    ) -> Vec<CommandSpec> {
         if !should_show_command_menu(input) {
             return Vec::new();
         }
-        let mut items: Vec<CommandSpec> = Vec::new();
-        items.push(CommandSpec {
-            cmd: "/Terminal",
-            desc: "Terminal",
-        });
-        items.push(CommandSpec {
-            cmd: "/Cmd",
-            desc: "Shell",
-        });
-        items.push(CommandSpec {
-            cmd: "/Settings",
-            desc: "Settings",
-        });
-        items.push(CommandSpec {
-            cmd: "/Help",
-            desc: "Help",
-        });
-        let switch_target = if matches!(chat_target, MindKind::Main) {
+        let mut items: Vec<CommandSpec> = vec![
             CommandSpec {
-                cmd: "/Switch to",
-                desc: "Dog",
-            }
-        } else {
+                cmd: "/Terminal",
+                desc: "Terminal",
+            },
             CommandSpec {
-                cmd: "/Switch to",
-                desc: "Main",
-            }
-        };
-        items.push(switch_target);
+                cmd: "/Cmd",
+                desc: "Shell",
+            },
+            CommandSpec {
+                cmd: "/Settings",
+                desc: "Settings",
+            },
+            CommandSpec {
+                cmd: "/Help",
+                desc: "Help",
+            },
+        ];
         items.push(CommandSpec {
-            cmd: "/TestMemory",
-            desc: "Memory",
+            cmd: "/SSE",
+            desc: if sse_enabled { "Off" } else { "On" },
         });
-        if sse_enabled {
-            items.push(CommandSpec {
-                cmd: "/SSE",
-                desc: "Off",
-            });
-        } else {
-            items.push(CommandSpec {
-                cmd: "/SSE",
-                desc: "On",
-            });
-        }
         items.push(CommandSpec {
             cmd: "/Quit",
             desc: "Quit",
@@ -17642,7 +16786,7 @@ mod config {
                 paste_redraw_throttle_ms: 90,
                 send_status_ms,
                 input_status_ms,
-                // 省电：空闲时降低 event::poll 唤醒频率（仍保持 1Hz 的运行时钟刷新）。
+                //（1）省电：空闲时降低 event::poll 唤醒频率（仍保持 1Hz 的运行时钟刷新）。
                 exit_poll_ms: 1000,
                 sys_log_limit: 6,
                 sys_display_limit: 3,
@@ -17798,7 +16942,7 @@ mod config {
                 pty_help_prompt_path: default_pty_help_prompt_path(),
                 welcome_shortcuts_prompt_path: default_welcome_shortcuts_prompt_path(),
                 pty_audit_enabled: false,
-                chat_target: "dog".to_string(),
+                chat_target: "main".to_string(),
             }
         }
     }
@@ -17924,7 +17068,7 @@ mod input {
             buf: already,
         });
         *toast = Some((
-            // 标题栏现在会走“●闪烁→乱码展开”动画；给足时间让短提示能完整读到。
+            //（1）标题栏现在会走“●闪烁→乱码展开”动画；给足时间让短提示能完整读到。
             now + Duration::from_millis(1600),
             "检测到粘贴，捕获中…".to_string(),
         ));

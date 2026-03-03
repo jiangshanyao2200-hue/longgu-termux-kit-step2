@@ -7,13 +7,43 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 
-// DeepSeek chat/completions: some deployments reject requests unless the last message role is user.
-// We keep tool results in `system` (so they are not misread as user input), then append this
-// ephemeral user tail placeholder at request time (providers.rs) when needed.
+// ===== 注释链（上下文层：协议清洗 + 外置回放 + DogState）=====
 //
-// Important:
-// - This must NEVER be written into long-term chat history/context (DogState/Core history).
-// - It exists only to satisfy provider protocol constraints.
+//（1）A provider 发送前链路（构造 messages）
+//（2）core.rs:start_user_chat_request
+//（3）-> DogState::message_snapshot_with_context_file
+//（4）-> read_contextlog_messages_for_mind（回放外置 context JSONL）
+//（5）-> normalize_messages_for_model_context（去空/去噪/合并）
+//（6）-> providers.rs:normalize_messages_for_provider(provider
+//（7）, messages)
+//
+//（1）B 外置 context 写入链路（本轮记录）
+//（2）core.rs:start_user_chat_request /
+//（3）handle_model_stream_end / drain_async_events(tool end)
+//（4）-> log_dyncontext(mind, role=user|assistant|tool,
+//（5）content, tool?, meta?)
+//
+//（1）C 外置 context 回放链路（下轮注入）
+//（2）read_contextlog_messages_for_mind
+//（3）role=user/assistant/system：原样回放
+//（4）role=tool：render_tool_result_system_message（工具回执以 system
+//（5）角色呈现，带 [MCP:工具输出code...] 头）
+//
+//（1）D DeepSeek role 约束兜底（仅 request time）
+//（2）ROLE_NEEDED_USER_PLACEHOLDER_*：仅用于满足“最后一条必须是 user”的部署差异，
+//（3）不写入长期上下文。
+
+//（1）DeepSeek chat/completions: some deployments reject
+//（2）requests unless the last message role is user.
+//（3）We keep tool results in `system` (so they are not
+//（4）misread as user input), then append this
+//（5）ephemeral user tail placeholder at request time
+//（6）(providers.rs) when needed.
+//
+//（1）Important:
+//（2）This must NEVER be written into long-term chat
+//（3）history/context (DogState/Core history).
+//（4）It exists only to satisfy provider protocol constraints.
 pub(crate) const ROLE_NEEDED_USER_PLACEHOLDER_BASE: &str =
     "[MCP:role协议占位]非用户输入，请忽略本条消息，基于上一轮工具回执继续响应。";
 
@@ -43,11 +73,9 @@ pub(crate) fn extract_last_mcp_tool_code(messages: &[ApiMessage]) -> Option<Stri
 }
 
 fn extract_mcp_tool_code_from_text(text: &str) -> Option<String> {
-    // `[MCP:工具输出code001]...` -> `code001`
+    //（1）`[MCP:工具输出code001]...` -> `code001`
     let t = text.trim();
-    let Some(pos) = t.find("[MCP:工具输出") else {
-        return None;
-    };
+    let pos = t.find("[MCP:工具输出")?;
     let rest = &t[(pos + "[MCP:工具输出".len())..];
     let end = rest.find(']').unwrap_or(rest.len());
     let code = rest[..end].trim();
@@ -55,22 +83,21 @@ fn extract_mcp_tool_code_from_text(text: &str) -> Option<String> {
 }
 
 fn failure_reason_preview(result_text: &str) -> Option<String> {
-    // 给模型用的“失败原因预览”：只取极短、可读的一段，避免撑爆上下文。
-    // 不参与“状态推断”（状态只看 meta），因此即使包含 timeout/超时字样也不会误判状态。
+    //（1）给模型用的“失败原因预览”：只取极短、可读的一段，避免撑爆上下文。
+    //（2）不参与“状态推断”（状态只看 meta），因此即使包含 timeout/超时字样也不会误判状态。
     let mut lines = result_text.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next()?;
-    // 常见导出提示行本身就足够表达原因；否则就取第一行做预览。
+    //（1）常见导出提示行本身就足够表达原因；否则就取第一行做预览。
     let mut s = first.to_string();
-    // 若第一行是泛化标题（例如 exported notice），尝试拼一行补充信息。
+    //（1）若第一行是泛化标题（例如 exported notice），尝试拼一行补充信息。
     if (s.contains("已导出") || s.contains("exported") || s.contains("truncated"))
         && let Some(second) = lines.next()
+        && !second.is_empty()
     {
-        if !second.is_empty() {
-            s.push_str(" | ");
-            s.push_str(second);
-        }
+        s.push_str(" | ");
+        s.push_str(second);
     }
-    // 压缩空白并截断。
+    //（1）压缩空白并截断。
     let s = s
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -100,24 +127,24 @@ pub(crate) struct ApiMessage {
 }
 
 pub(crate) fn strip_stamp_footer(text: &str) -> &str {
-    // 兼容两种历史格式：
-    // - 旧：末尾 "\n[[t:HHMMSS]]"
-    // - 新：头部 "[t:HHMMSS]\n"
+    //（1）兼容两种历史格式：
+    //（2）旧：末尾 "\n[[t:HHMMSS]]"
+    //（3）新：头部 "[t:HHMMSS]\n"
     let mut out = text;
 
-    // strip new header
-    if let Some(rest) = out.strip_prefix("[t:") {
-        if rest.len() >= 7 {
-            let hhmmss = &rest[..6];
-            let end = rest.as_bytes().get(6).copied().unwrap_or(b'\0');
-            if hhmmss.chars().all(|c| c.is_ascii_digit()) && end == b']' {
-                let after = &rest[7..]; // skip "HHMMSS]"
-                out = after.strip_prefix('\n').unwrap_or(after);
-            }
+    //（1）strip new header
+    if let Some(rest) = out.strip_prefix("[t:")
+        && rest.len() >= 7
+    {
+        let hhmmss = &rest[..6];
+        let end = rest.as_bytes().get(6).copied().unwrap_or(b'\0');
+        if hhmmss.chars().all(|c| c.is_ascii_digit()) && end == b']' {
+            let after = &rest[7..]; // skip "HHMMSS]"
+            out = after.strip_prefix('\n').unwrap_or(after);
         }
     }
 
-    // strip old footer
+    //（1）strip old footer
     const MARK: &str = "\n[[t:";
     if let Some(pos) = out.rfind(MARK) {
         let tail = &out[pos + 1..]; // skip the leading '\n'
@@ -129,10 +156,10 @@ pub(crate) fn strip_stamp_footer(text: &str) -> &str {
 }
 
 pub(crate) fn with_stamp_footer(text: &str) -> String {
-    // 兼容函数：历史上我们会把时间戳注入每条消息内容（如 `[t:HHMMSS]`）。
-    // 但实践中这会被部分模型“学走并回显”，污染正文与工具调用判断，因此禁用内容级时间戳。
+    //（1）兼容函数：历史上我们会把时间戳注入每条消息内容（如 `[t:HHMMSS]`）。
+    //（2）但实践中这会被部分模型“学走并回显”，污染正文与工具调用判断，因此禁用内容级时间戳。
     //
-    // 这里仅做“去除历史时间戳”，返回干净文本。
+    //（1）这里仅做“去除历史时间戳”，返回干净文本。
     strip_stamp_footer(text).trim_end().to_string()
 }
 
@@ -165,7 +192,7 @@ fn normalize_messages_basic(messages: &[ApiMessage]) -> Vec<ApiMessage> {
 /// Generic, provider-agnostic normalization for building model context snapshots:
 /// - filter empty messages
 /// - merge consecutive assistant messages
-/// This is safe for all providers and all minds.
+///   This is safe for all providers and all minds.
 pub(crate) fn normalize_messages_for_model_context(messages: &[ApiMessage]) -> Vec<ApiMessage> {
     normalize_messages_basic(messages)
 }
@@ -173,19 +200,23 @@ pub(crate) fn normalize_messages_for_model_context(messages: &[ApiMessage]) -> V
 /// Provider-level normalization:
 /// - Strictly protocol-level (never inject UI strings, never rewrite semantics).
 /// - Keep behavior centralized per provider so Main/Dog/Memory share one rule set.
-pub(crate) fn normalize_messages_for_provider(provider: &str, messages: &[ApiMessage]) -> Vec<ApiMessage> {
+pub(crate) fn normalize_messages_for_provider(
+    provider: &str,
+    messages: &[ApiMessage],
+) -> Vec<ApiMessage> {
     let p = crate::api::normalize_provider(provider);
     match p {
-        // DeepSeek rejects some sequences (e.g. consecutive assistant messages).
-        // We pre-merge assistant and strip empties for stability.
+        //（1）DeepSeek rejects some sequences (e.g. consecutive
+        //（2）assistant messages).
+        //（3）We pre-merge assistant and strip empties for stability.
         "deepseek" => normalize_messages_basic(messages),
-        // Codex endpoints are generally tolerant, but we still apply the same basic cleanup.
-        // Keeping this consistent reduces edge cases across minds.
+        //（1）Codex endpoints are generally tolerant, but we still
+        //（2）apply the same basic cleanup.
+        //（3）Keeping this consistent reduces edge cases across minds.
         "codex" => normalize_messages_basic(messages),
         _ => normalize_messages_basic(messages),
     }
 }
-
 
 /// Best-effort detector for "context pollution" where UI-rendered strings leak into model context.
 /// Returns human-readable findings; callers should log, not mutate context here.
@@ -196,7 +227,8 @@ pub(crate) fn detect_context_contamination(messages: &[ApiMessage]) -> Vec<Strin
         let role = m.role.trim();
         let c = m.content.as_str();
 
-        // UI glyphs / headings that should never be sent to providers.
+        //（1）UI glyphs / headings that should never be sent to
+        //（2）providers.
         for needle in [
             "● Ran CMD",
             "● Brief",
@@ -261,23 +293,22 @@ pub(crate) fn score_context_health(provider: &str, messages: &[ApiMessage]) -> C
         }
     }
 
-    if is_deepseek {
-        if let Some(last) = messages.last() {
-            let role = last.role.trim();
-            if role != "user" {
-                score -= 20;
-                deductions.push("-20: deepseek last role is not user".to_string());
-            }
-            let tail = last.content.trim();
-            if is_role_needed_user_placeholder(tail) {
-                // ok: this tail exists only for protocol; do not treat as a user directive.
-            } else if tail.contains("[sys:轮询占位]") {
-                score -= 10;
-                deductions.push("-10: sys poll tail uses legacy marker".to_string());
-            } else if tail.contains("continue") || tail.contains("继续") {
-                score -= 15;
-                deductions.push("-15: last user tail contains directive-like words".to_string());
-            }
+    if is_deepseek && let Some(last) = messages.last() {
+        let role = last.role.trim();
+        if role != "user" {
+            score -= 20;
+            deductions.push("-20: deepseek last role is not user".to_string());
+        }
+        let tail = last.content.trim();
+        if is_role_needed_user_placeholder(tail) {
+            //（1）ok: this tail exists only for protocol; do not treat as
+            //（2）a user directive.
+        } else if tail.contains("[sys:轮询占位]") {
+            score -= 10;
+            deductions.push("-10: sys poll tail uses legacy marker".to_string());
+        } else if tail.contains("continue") || tail.contains("继续") {
+            score -= 15;
+            deductions.push("-15: last user tail contains directive-like words".to_string());
         }
     }
 
@@ -359,9 +390,9 @@ fn truncate_chars_safe(text: &str, max_chars: usize) -> String {
 }
 
 pub(crate) fn read_fastmemo_for_context() -> String {
-    // fastmemo 文件由记忆工具维护；这里仅做只读注入。
+    //（1）fastmemo 文件由记忆工具维护；这里仅做只读注入。
     let path = Path::new(FASTMEMO_PATH);
-    // 结构自愈：避免 fastmemo v1/脏结构进入上下文，导致后续 memory_add/edit 逻辑出现偏差。
+    //（1）结构自愈：避免 fastmemo v1/脏结构进入上下文，导致后续 memory_add/edit 逻辑出现偏差。
     let _ = crate::mcp::ensure_memory_file("fastmemo", FASTMEMO_PATH);
     let text = std::fs::read_to_string(path).unwrap_or_default();
     truncate_chars_safe(text.trim(), FASTMEMO_MAX_INJECT_CHARS)
@@ -381,7 +412,7 @@ pub(crate) fn fastmemo_event_count_and_any_ge10(text: &str) -> (usize, bool) {
                 "[用户感知]" => Some("用户感知"),
                 "[环境感知]" => Some("环境感知"),
                 "[动态上下文]" => Some("动态上下文"),
-                // 兼容旧名
+                //（1）兼容旧名
                 "[事件感知]" => Some("动态上下文"),
                 _ => None,
             };
@@ -403,8 +434,8 @@ pub(crate) fn fastmemo_event_count_and_any_ge10(text: &str) -> (usize, bool) {
 }
 
 pub(crate) fn fastmemo_max_section_usage(text: &str) -> Option<(&'static str, usize)> {
-    // 返回“最接近 10 的那一栏”，并在并列时按固定优先级选择：
-    // 自我感知 > 用户感知 > 环境感知 > 动态上下文
+    //（1）返回“最接近 10 的那一栏”，并在并列时按固定优先级选择：
+    //（2）自我感知 > 用户感知 > 环境感知 > 动态上下文
     let mut current: Option<&'static str> = None;
     let mut self_n = 0usize;
     let mut user_n = 0usize;
@@ -418,7 +449,7 @@ pub(crate) fn fastmemo_max_section_usage(text: &str) -> Option<(&'static str, us
                 "[用户感知]" => Some("用户感知"),
                 "[环境感知]" => Some("环境感知"),
                 "[动态上下文]" => Some("动态上下文"),
-                // 兼容旧名
+                //（1）兼容旧名
                 "[事件感知]" => Some("动态上下文"),
                 _ => None,
             };
@@ -454,15 +485,8 @@ pub(crate) fn fastmemo_max_section_usage(text: &str) -> Option<(&'static str, us
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn read_dyncontext_for_context(path: &str) -> String {
-    // 兼容遗留：旧版会把 dyncontext 作为 system 原文注入。
-    // 目前我们把该文件作为“会话上下文日志”（JSONL）；不建议再把原文直接注入 system。
-    std::fs::read_to_string(path).unwrap_or_default()
-}
-
 fn dyncontext_ts() -> String {
-    // 秒级即可；动态上下文注入本身会带入完整原文。
+    //（1）秒级即可；动态上下文注入本身会带入完整原文。
     chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %:z")
         .to_string()
@@ -489,10 +513,10 @@ fn append_dyncontext(
     if let Some(t) = tool.map(str::trim).filter(|s| !s.is_empty()) {
         entry["tool"] = json!(t);
     }
-    if let Some(m) = meta {
-        if !m.is_empty() {
-            entry["meta"] = json!(m);
-        }
+    if let Some(m) = meta
+        && !m.is_empty()
+    {
+        entry["meta"] = json!(m);
     }
     let line = serde_json::to_string(&entry)?;
     let p = Path::new(path);
@@ -531,7 +555,7 @@ pub(crate) fn clear_dyncontext_file(path: &str) {
     {
         let _ = fs::create_dir_all(parent);
     }
-    // best-effort：重启清空会话上下文；失败不阻断启动
+    //（1）best-effort：重启清空会话上下文；失败不阻断启动
     let _ = fs::write(p, "");
 }
 
@@ -587,7 +611,8 @@ fn render_tool_result_system_message(
         "[MCP:工具输出{code}]工具名：{} 状态：{status}{reason}{elapsed}{path}{saved}",
         tool.trim()
     );
-    let body = crate::messages::render_template(template, &[("HEADER", &header), ("RESULT", clean)]);
+    let body =
+        crate::messages::render_template(template, &[("HEADER", &header), ("RESULT", clean)]);
     ApiMessage {
         role: "system".to_string(),
         content: body,
@@ -637,11 +662,7 @@ pub(crate) fn read_contextlog_messages_for_mind(
             }),
             "tool" => {
                 tool_seq = tool_seq.saturating_add(1);
-                let tool = entry
-                    .tool
-                    .as_deref()
-                    .unwrap_or("tool")
-                    .trim();
+                let tool = entry.tool.as_deref().unwrap_or("tool").trim();
                 let meta = entry.meta.as_deref().unwrap_or(&[]);
                 out.push(render_tool_result_system_message(
                     tool_seq,
@@ -770,13 +791,14 @@ pub(crate) fn clear_contextmemo(path: &str) {
 
 pub(crate) fn contextmemo_size_kb(path: &str) -> usize {
     let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    // 0 bytes => 0KB；其余向上取整，便于阈值直观控制。
-    ((bytes + 1023) / 1024) as usize
+    //（1）0 bytes => 0KB；其余向上取整，便于阈值直观控制。
+    bytes.div_ceil(1024) as usize
 }
 
 fn infer_mcp_exec_status_from_meta(meta: &[String]) -> &'static str {
-    // 只依据 meta 推断状态：绝不能扫描 output 文本，否则会被 `ps` 等输出里的单词（如 `timeout` 进程名）
-    // 误判为“超时/失败”，污染上下文与 UI 展示。
+    //（1）只依据 meta 推断状态：绝不能扫描 output 文本，
+    //（2）否则会被 `ps` 等输出里的单词（如 `timeout` 进程名）
+    //（3）误判为“超时/失败”，污染上下文与 UI 展示。
     let joined = meta
         .iter()
         .map(|s| s.as_str())
@@ -784,7 +806,7 @@ fn infer_mcp_exec_status_from_meta(meta: &[String]) -> &'static str {
         .join("\n")
         .to_ascii_lowercase();
 
-    // 超时：优先看 ok/result（工具层会在 meta 里写明）。
+    //（1）超时：优先看 ok/result（工具层会在 meta 里写明）。
     if joined.contains("ok:timeout")
         || joined.contains("result:timeout")
         || joined.contains("状态:timeout")
@@ -792,11 +814,11 @@ fn infer_mcp_exec_status_from_meta(meta: &[String]) -> &'static str {
     {
         return "超时";
     }
-    // 成功：优先 ok:true；兼容旧 meta。
+    //（1）成功：优先 ok:true；兼容旧 meta。
     if joined.contains("ok:true") || joined.contains("状态:0") || joined.contains("result:0") {
         return "成功";
     }
-    // 失败：明确 ok:false/状态:fail 等。
+    //（1）失败：明确 ok:false/状态:fail 等。
     if joined.contains("ok:false")
         || joined.contains("状态:fail")
         || joined.contains("tool failed")
@@ -804,14 +826,14 @@ fn infer_mcp_exec_status_from_meta(meta: &[String]) -> &'static str {
     {
         return "失败";
     }
-    // 不确定时默认失败（更安全）。
+    //（1）不确定时默认失败（更安全）。
     "失败"
 }
 
 fn extract_meta_kv(meta: &[String], key: &str) -> Option<String> {
     let k = format!("{key}:");
     for line in meta {
-        // 只解析 key:value 形式；meta 行通常为 `... | key:value | ...`
+        //（1）只解析 key:value 形式；meta 行通常为 `... | key:value | ...`
         for part in line.split('|') {
             let p = part.trim();
             if let Some(rest) = p.strip_prefix(&k) {
@@ -849,13 +871,13 @@ pub(crate) struct DogState {
 
 impl DogState {
     fn now_date_tz() -> String {
-        // 只注入日期与时区，便于模型用 HHMM 构建“时间链”，同时减少 token。
+        //（1）只注入日期与时区，便于模型用 HHMM 构建“时间链”，同时减少 token。
         chrono::Local::now().format("%Y-%m-%d %:z").to_string()
     }
 
     #[allow(dead_code)]
     fn now_time_tz() -> String {
-        // 仅秒级：足够让模型感知时间流动，且 token 成本低；ms 级对模型决策通常无价值。
+        //（1）仅秒级：足够让模型感知时间流动，且 token 成本低；ms 级对模型决策通常无价值。
         chrono::Local::now().format("%H:%M:%S %:z").to_string()
     }
 
@@ -904,8 +926,9 @@ impl DogState {
     }
 
     fn relocate_pinned_systems_after_prompt(&mut self) {
-        // 确保“prompt → fastmemo → dyncontext”的相对顺序稳定：
-        // 每次 inject_prompt() 发生时，把 pinned system blocks 重新移动到 prompt 之后（列表尾部）。
+        //（1）确保“prompt → fastmemo → dyncontext”的相对顺序稳定：
+        //（2）每次 inject_prompt() 发生时，
+        //（3）把 pinned system blocks 重新移动到 prompt 之后（列表尾部）。
         let mut fast: Option<ApiMessage> = None;
         let mut dynctx: Option<ApiMessage> = None;
 
@@ -927,7 +950,7 @@ impl DogState {
         if pins.is_empty() {
             return;
         }
-        // 倒序删除，避免索引漂移。
+        //（1）倒序删除，避免索引漂移。
         pins.sort_by_key(|(i, _)| *i);
         for (i, kind) in pins.into_iter().rev() {
             if let Some(msg) = self.remove_message_at(i) {
@@ -954,7 +977,7 @@ impl DogState {
     }
 
     fn inject_prompt(&mut self) {
-        // 日期只注入一次：避免 prompt reinject 时重复出现日期，造成上下文噪音与模型误判。
+        //（1）日期只注入一次：避免 prompt reinject 时重复出现日期，造成上下文噪音与模型误判。
         if !self.date_injected {
             self.push_message("system", format!("[sys:日期]{}", Self::now_date_tz()));
             self.date_injected = true;
@@ -964,7 +987,8 @@ impl DogState {
             return;
         }
         self.push_message("system", prompt.to_string());
-        // prompt reinject 之后，把 fastmemo/dyncontext 固定移动到 prompt 后面，避免顺序倒置。
+        //（1）prompt reinject 之后，把 fastmemo/dyncontext 固定移动到 prompt 后面，
+        //（2）避免顺序倒置。
         self.relocate_pinned_systems_after_prompt();
     }
 
@@ -973,8 +997,9 @@ impl DogState {
         if clean.is_empty() {
             return;
         }
-        // DeepSeek 会拒绝连续 assistant 消息（400: Invalid consecutive assistant message）。
-        // 工具链/自动续写等场景可能造成 assistant 连续出现；这里做最小合并，保持请求合法。
+        //（1）DeepSeek 会拒绝连续 assistant 消息（400: Invalid consecutive
+        //（2）assistant message）。
+        //（3）工具链/自动续写等场景可能造成 assistant 连续出现；这里做最小合并，保持请求合法。
         if role == "assistant"
             && let Some(last) = self.messages.last_mut()
             && last.role == "assistant"
@@ -1020,7 +1045,8 @@ impl DogState {
             self.inject_prompt();
             self.last_prompt_inject_user = self.user_count;
         }
-        // 时间线：每条用户消息前注入一次时间（system role），避免在 assistant 内容中注入时间戳造成回显/污染。
+        //（1）时间线：每条用户消息前注入一次时间（system role），
+        //（2）避免在 assistant 内容中注入时间戳造成回显/污染。
         self.push_message("system", format!("[sys:时间]{}", Self::now_time_tz()));
         self.push_message("user", text.trim().to_string());
         reinject_now
@@ -1068,7 +1094,7 @@ impl DogState {
         if clean.is_empty() {
             return;
         }
-        // 兼容旧调用：无法得知 tool 名称与 meta，只能把整段内容作为“工具输出”写回上下文。
+        //（1）兼容旧调用：无法得知 tool 名称与 meta，只能把整段内容作为“工具输出”写回上下文。
         self.push_mcp_tool_result("tool", clean, &[]);
     }
 
@@ -1115,13 +1141,14 @@ impl DogState {
             "[MCP:工具输出{code}]工具名：{} 状态：{status}{reason}{elapsed}{path}{saved}",
             tool.trim()
         );
-        // 工具回执（工具输出）写回上下文：
-        // - 不能用 user：否则模型会把“工具输出”误判为“用户说的话/用户执行的结果”，进而误学工具协议；
-        // - 不能用 tool role（DeepSeek/Codex 协议层不统一）；
-        // - 这里使用 system，并用固定前缀显式声明“这是工具输出，不是系统指令/用户输入”。
+        //（1）工具回执（工具输出）写回上下文：
+        //（2）不能用 user：否则模型会把“工具输出”误判为“用户说的话/用户执行的结果”，进而误学工具协议；
+        //（3）不能用 tool role（DeepSeek/Codex 协议层不统一）；
+        //（4）这里使用 system，并用固定前缀显式声明“这是工具输出，不是系统指令/用户输入”。
         //
-        // 注意：system 的优先级更高，因此 tool_result_assistant_template 必须足够明确、简短，
-        // 且禁止混入任何 UI 渲染文本（●/Ran/TOOL: 等）。
+        //（1）注意：system 的优先级更高，因此 tool_result_assistant_template
+        //（2）必须足够明确、简短，
+        //（3）且禁止混入任何 UI 渲染文本（●/Ran/TOOL: 等）。
         self.push_message(
             "system",
             crate::messages::render_template(
@@ -1157,7 +1184,8 @@ impl DogState {
 
     #[allow(dead_code)]
     pub(crate) fn message_snapshot(&self, extra_system: Option<&str>) -> Vec<ApiMessage> {
-        // Provider-facing: strip any historical `[t:HHMMSS]` stamps to avoid models echoing them.
+        //（1）Provider-facing: strip any historical `[t:HHMMSS]
+        //（2）` stamps to avoid models echoing them.
         let mut out: Vec<ApiMessage> = self
             .messages
             .iter()
@@ -1170,7 +1198,7 @@ impl DogState {
         if let Some(extra) = extra_system {
             let clean = extra.trim();
             if !clean.is_empty() {
-                // 额外指令按 system 角色入列，保持上下文语义稳定。
+                //（1）额外指令按 system 角色入列，保持上下文语义稳定。
                 out.push(ApiMessage {
                     role: "system".to_string(),
                     content: Self::with_stamp_footer(clean),
@@ -1186,8 +1214,10 @@ impl DogState {
         context_path: &str,
         mind: &str,
     ) -> Vec<ApiMessage> {
-        // Provider-facing: pinned blocks come from in-memory snapshot (prompt/fastmemo),
-        // while turn history & tool receipts are replayed from the external context JSONL.
+        //（1）Provider-facing: pinned blocks come from in-memory
+        //（2）snapshot (prompt/fastmemo),
+        //（3）while turn history & tool receipts are replayed from the
+        //（4）external context JSONL.
         let mut out: Vec<ApiMessage> = self
             .messages
             .iter()
@@ -1202,7 +1232,8 @@ impl DogState {
             mind,
             self.tool_result_assistant_template.as_str(),
         );
-        // strip any legacy stamps (should be rare, but keep consistent)
+        //（1）strip any legacy stamps (should be rare, but keep
+        //（2）consistent)
         for m in &mut ctx {
             m.content = Self::strip_stamp_footer(&m.content).trim().to_string();
         }
@@ -1222,7 +1253,6 @@ impl DogState {
     pub(crate) fn set_include_tool_context(&mut self, enabled: bool) {
         self.include_tool_context = enabled;
     }
-
 
     pub(crate) fn refresh_fastmemo_system(&mut self, text: &str) {
         let clean = text.trim();

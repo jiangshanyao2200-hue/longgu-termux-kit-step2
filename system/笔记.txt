@@ -1,37 +1,17 @@
-● Ran Bash · 获取系统信息
-             ↳ uname -a; echo '---'; pwd in ./system
+[自我感知]1/10 Date 3% ↑0.00M ↓0.00M T↑6.54M T↓2.72M ♡33 ♥15 这里date尾部和↑应该有空格间隔开
+·Powered by AItermux
+这里下方新增一行顶栏，我们做标签页 做什么标签页呢，做窗口切换。分别为 Matrix/WatchDog/Memory 分别作为三个窗口，分别对应main dog memory api 他们现在各自独占一个标签页 这三个是固定标签页 支持触控 也支持按shift+← →切换。然后输入框shift enter 应该为换行 alt enter应该为强制发送到队列 ctrl+enter 也应该是换行
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+♡ · 系统信息 · 欢迎使用AItermux。
+  build: release
 
-● SHELL · 检查设备连接
-          ↳ devices
+  Project Ying（萤）
 
-● TERMUX · 检查电源状态
-           ↳ termux-battery-status
-
-● Ran Bash · 获取系统信息
-             ↳ uname -a; echo '---'; pwd in ./system
-
-● SHELL · 检查设备连接
-          ↳ devices
-
-● TERMUX · 检查电源状态
-
-执行一轮显示优化
-这里 工具名称为黄色 非工具名称正常颜色 brief也是黄色（目前已是）需要优化其它工具的聊天区域解析显示优化
-如 ● Ran Bash
-adb为 ● ADB Shell （adb为白色不视为工具）
-TERMUX为● TERMUX api （api白色）
-list改为 ●Get List （get为白色）
-applypatch改为●Edited Ap（edited为白色 ap为黄色工具名）
-●memory系列修改优化
-●Memory Cheak（黄色）
-●Memory Read（黄色）
-●Memory Add（黄色）
-对各个工具的SHELL · 检查设备连接
-          ↳ devices（这里区域增加优化 使得其可以显示更多关键内容 尤其是执行memory工具和list等工具时） 然后优化applypatch 这个工具展开详情后不做截断优化，将模型写的++++----按顺序整理 按行数排版 单行信息过多做尾部截断
-          完整显示。
-然后优化每个工具的解析逻辑
-先解析工具类型 显示出来 如 ●Bash ·
-然后解析brief 显示出来 ●Bash · brief
-然后下方的内容才可以是Typing... 而非解析中。
-这个优化预期做到 瞬间解析工具类型与brief，至于后续命令慢慢解析。我希望↳ devices 这一行 在流式下能解析为跑马形式的，单行跑马显示AI在编辑什么 直到tool首尾 显示解析后内容
-那么需要做到这样就要改变数组 让inpput数组也就是模型可能编辑最多的地方始终置于tool name和brief的后面，方便前端解析toolname和brief 剩下的慢慢解析 跑马形式。单行 不超行。仅SSE下生效。非sse都走一次性解析。
+  欢迎。你在一个终端聊天里使用 AI 助手。 这里有个多余的build release 。 把欢迎语设为所有快捷键介绍。 
+  然后移除/ switch to 这个功能 和相关代码，主聊天区域main不再支持切换dog ，顺便移除切换dog等系统提示 而是每个因此独立。顺便移除testmemory和相关test逻辑。 当处于不同标签页时 消息发送给不同的api。一并移除上方顶栏展开memory的所有展开和显示逻辑 因为不再需要 ，而是分标签页取代。标签页需要是动态可变的 如果WatchDog活跃 就显示标签动画，动画的设计要赛博朋克。如果memory在活跃 ，就显示memory动画，如果matrix活跃标签页也动画。 
+  然后顶栏的·Powered by AItermux 改为 状态栏 用于显示 标签页动态 如 
+  ●NOW Working · Matrix · WatchDog · Memory 
+  只有正在活跃的显示 ，同时活跃就用· 间隔 如果同时活跃的多了从●NOW Working · 开始左右移动显示 以最右侧的时间为间隔 显示不要超过时间将时间挤压或者覆盖
+  
+  这些操作我们移除了 顶栏memory的展开逻辑 移除了test memory逻辑  移除了Switch to逻辑 确保这些被完全清理 我们的新方案稳定落地
+  

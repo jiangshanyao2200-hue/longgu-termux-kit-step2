@@ -140,8 +140,8 @@ fn normalize_role_for_codex(role: &str) -> &'static str {
 
 fn content_type_for_codex(role: &str) -> &'static str {
     match normalize_role_for_codex(role) {
-        // responses API 的历史 assistant 消息必须是 output_text/refusal；
-        // 我们这里只回放普通文本，统一使用 output_text。
+        //（1）responses API 的历史 assistant 消息必须是 output_text/refusal；
+        //（2）我们这里只回放普通文本，统一使用 output_text。
         "assistant" => "output_text",
         _ => "input_text",
     }
@@ -173,7 +173,7 @@ pub(crate) fn build_codex_input_messages(messages: &[ApiMessage]) -> Vec<Value> 
             "content": [
                 {
                     "type": "input_text",
-                    // 最小占位：避免空请求；同时保持零指令语义，防止模型误判为“用户要求继续执行”。
+                    //（1）最小占位：避免空请求；同时保持零指令语义，防止模型误判为“用户要求继续执行”。
                     "text": placeholder
                 }
             ],

@@ -3,15 +3,16 @@
 ## 更新记录（人工维护）
 
 - 2026-02-24：索引文件移动到 `AItermux/system/INDEX.md`（从 `docs/system_index.md` 迁出），作为主入口持续维护。
-- 2026-02-24：文件系统工具（旧版本）曾短暂收敛到“文件管理器门面”，现已被 2026-02-26 的 `list/trash` 替代（见下）。
-- 2026-02-25：工具门面（旧版本）曾收敛到“文件管理器门面 + editor”，现已被 2026-02-26 的 `list/trash` 替代（见下）。
-- 2026-02-25：实现外置（旧版本）曾将“文件管理器门面 + editor”逻辑外置到 `src/Extention/*.rs`；其中“文件管理器模块”已在 2026-02-26 移除，`editor` 仍保留。
+- 2026-02-24：文件系统工具（旧版本）曾短暂收敛到“文件管理器门面”，后续已移除，当前以 `list` 为基础目录/文件信息入口。
+- 2026-02-25：工具门面（旧版本）曾收敛到“文件管理器门面 + editor”，后续已移除（避免提示词与协议漂移）。
+- 2026-02-25：实现外置（旧版本）曾将“文件管理器门面 + editor”逻辑外置到 `src/Extention/*.rs`；该目录已移除，PTY 已收敛为 `src/pseudo_terminal.rs`。
 - 2026-02-25：移除 `plan/work` 工具：后端路由、提示词与 UI 专用渲染（plan panel / reveal 动画）已清理，避免出现 “● Planning…” 之类的伪工具状态与误导性展示。
 - 2026-02-25：提示词收敛：`prompt/mainprompt.txt` 仅保留“基础稳定工具 + 硬规则”，扩展工具说明迁移到 `prompt/Agentskills.md`（用 `skills_mcp` 按需拉取），并删除 `prompt/mainprompt.full.txt` 以避免双版本漂移。
-- 2026-02-26：文件系统工具再次收敛：移除旧“文件管理器模块”；新增基础工具 `list` 与 `trash`（list 合并 stat；trash 合并 remove/list/restore/empty）；并同步更新提示词与 `skills_mcp` 文档。
+- 2026-02-26：文件系统工具再次收敛：移除旧“文件管理器模块”；新增基础工具 `list`（合并目录与文件信息）；并同步更新提示词与 `skills_mcp` 文档。
 - 2026-02-28：日记/记忆链路修复与收敛：底栏 Date 改为基于 `contextmemo` 文件大小（KB）显示；新增系统配置 `date_kb_limit`（0=关闭）；日记触发条件从 token 计数改为 KB；`memory_add` 支持写入 `datememo/metamemo`（sqlite）；并修复 WaitingMain 阶段的工具过滤（仅保留 datememo 的 `memory_add`），避免误把日记写入当成 `context_compact`。
 - 2026-02-28：`contextmemo` 只记录 user/main：移除 mind 协同消息写入 `contextmemo`，避免日记压缩混入 dog<->main 的中间协同内容。
 - 2026-02-28：Memory 面板收敛：记忆模型使用独立 `prompt/memoryprompt.txt`（允许调用 memory_* 工具）；Memory 面板中的工具回执改为单行摘要（例如 `▶ MemoryRead · ...`），不显示工具详情；所有 provider 请求在发送前统一做协议层消息清洗（去空/合并连续 assistant），降低因供应商切换导致的上下文差异。
+- 2026-03-02：会话上下文外置：Main/Dog/Memory 各自写入并回放 `memory/context/*.jsonl`；修复工具 owner 归属与“工具块前后正文”落盘；清理 mind_msg 未完成的中间态（PendingMindHalf）。
 
 ## 0. 项目概述（来自 `README.md` / 测试记录）
 
@@ -44,9 +45,8 @@
 - `src/api.rs`：供应商能力与规格归一（provider/model/reasoning 选项、Codex 输入消息格式）。
 - `src/providers.rs`：供应商请求与解析（DeepSeek chat/completions、Codex responses/SSE；内部完成分流、重试、usage 解析与 `AsyncEvent` 发射）。
 - `src/context.rs`：上下文协议层与治理（`ApiMessage`、时间戳 stamp、DeepSeek 消息 normalize、上下文污染检测、fastmemo 注入/压缩池、`DogState` 上下文状态机、`ContextUsage` + `contextmemo` 审计日志）。
-- `src/mcp.rs`：工具协议层（解析、校验、路由、重试、结果格式化、状态规范；基础文件类工具 list/trash 也在此实现）。
-- `src/Extention/editor.rs`：文本编辑器门面实现（batch steps：read/edit/apply_patch/write/move_block + history 快照；`replace_exact` 已移除）。
-- `src/Extention/pseudo_terminal.rs`：PTY 扩展实现（spawn、事件处理、渲染、触摸滚动、键盘映射、审计文案）。
+- `src/mcp.rs`：工具协议层（解析、校验、路由、重试、结果格式化、状态规范；基础工具 list/apply_patch/memory_* 也在此实现）。
+- `src/pseudo_terminal.rs`：PTY（spawn、事件处理、渲染、触摸滚动、键盘映射、审计文案）。
 - `src/ui.rs`：渲染层（聊天布局、状态栏、设置页、输入框、tool/think/brief 展示与折叠）。
 - `src/memory.rs`：记忆数据库访问（SQLite 初始化/迁移、按日期与关键词检索、memo 记录格式化）。
 - `src/test.rs`：测试/诊断与日志（测试模式开关当前 `TEST_MODE_FORCE_DISABLED=true`；runtime log 默认开启并每条事件 flush；`contexttest.txt` 仅保留“最后一轮请求+回复”的快照，避免文件膨胀）。
@@ -100,7 +100,7 @@
   - Codex 聊天区占位：只渲染一个 `Working...` 动画占位（闪烁点 + 三点循环）；不展示 `Thinking...` 空占位，避免双占位与误导。
 - DeepSeek UI 约定（减噪）：
   - 未收到 reasoning 首段时，聊天区占位仅显示“闪烁点 + 三点循环”，不显示 `Thinking.../Typing...` 文案（避免快响应场景下的闪屏噪音）。
-- DeepSeek 约束：避免 `assistant` 连续消息导致 400（`Invalid consecutive assistant message`）；上下文侧会做 normalize/合并（见 `normalize_messages_for_deepseek`）。工具回执采用 `system` 角色，不再用 `user` 承载，避免模型把工具输出误判为用户消息。
+- DeepSeek 约束：避免 `assistant` 连续消息导致 400（`Invalid consecutive assistant message`）；上下文侧会做 normalize/合并（见 `normalize_messages_for_provider("deepseek", ...)`）。工具回执采用 `system` 角色，不再用 `user` 承载，避免模型把工具输出误判为用户消息。
 - DeepSeek 协议兼容尾巴（重要）：
   - 某些 DeepSeek 实现要求请求的最后一条必须是 `user` role；当最后写入的是 `system` 工具回执时，会补一个最小 `user` 占位。
   - 占位必须保持“零指令语义”，严禁使用 `continue/继续` 这类会诱导模型主动续跑工具的词。
@@ -108,11 +108,11 @@
 
 ### 4.5 PTY 扩展链路
 
-- PTY 启动：`spawn_interactive_bash_execution` `src/Extention/pseudo_terminal.rs:806`。
+- PTY 启动：`spawn_interactive_bash_execution` `src/pseudo_terminal.rs`。
   - 初始尺寸不再固定 `80x24`：基于当前终端尺寸 + `pty_bottom_height` 近似计算 `init_cols/init_rows`，后续由 `PtyUiState::ensure_size` 精确同步（降低首屏错位与键盘弹出/收回导致的漂移感）。
-- 异步事件回收：`handle_async_event_pty_ready` `src/Extention/pseudo_terminal.rs:1512`、`handle_async_event_pty_job_done` `src/Extention/pseudo_terminal.rs:1626`、`handle_async_event_pty_tool_request` `src/Extention/pseudo_terminal.rs:1766`。
-- PTY 渲染：`draw_pty_panel` `src/Extention/pseudo_terminal.rs:1992`。
-- PTY 交互：`handle_pty_view_key` `src/Extention/pseudo_terminal.rs:2152`，触摸/滚轮：`apply_touch_drag_to_pty_view` `src/Extention/pseudo_terminal.rs:2082`、`apply_mouse_wheel_to_pty_view` `src/Extention/pseudo_terminal.rs:2059`。
+- 异步事件回收：`handle_async_event_pty_ready`、`handle_async_event_pty_job_done`、`handle_async_event_pty_tool_request`（`src/pseudo_terminal.rs`）。
+- PTY 渲染：`draw_pty_panel`（`src/pseudo_terminal.rs`）。
+- PTY 交互：`handle_pty_view_key`，触摸/滚轮：`apply_touch_drag_to_pty_view`、`apply_mouse_wheel_to_pty_view`（`src/pseudo_terminal.rs`）。
 - core 对接点：导入与调用集中在 `src/core.rs:215`~`src/core.rs:224`、`src/core.rs:13661` 起的 `AsyncEvent` 分发。
 - 约束：`pty.run` 默认保持会话（不自动退出）；同时运行任务上限 3；终止用 `pty.kill(pid)` 或 Terminal 视图双击 Esc。
 - `pty.kill` 回执策略（避免冲突）：
@@ -146,7 +146,13 @@
 - Prompt 目录：`prompt/`（main/dog/context/压缩提示词等）。
 - PTY 审计提示词：`prompt/ptycheck.txt`（当 `pty_audit_enabled=true` 时，每 10 分钟注入一次审计 prompt）。
 - 帮助文档目录：`config/Documents/`（welcome/pty help/keymap；会被注入到聊天区）。
-- 记忆目录：`memory/`（`fastmemory.jsonl`、`fastcontext.jsonl`、`metamemory.db`）。
+- 记忆目录：`memory/`
+  - `memory/fastmemory.jsonl`：fastmemo 表层记忆。
+  - `memory/fastcontext.jsonl`：contextmemo（用于 Date 阈值与日记压缩输入）。
+  - `memory/metamemory.db`：SQLite 记忆库（datememo/metamemo）。
+  - `memory/context/context.jsonl`：Main 会话上下文外置回放（启动清空）。
+  - `memory/context/dogcontext.jsonl`：Dog 会话上下文外置回放（启动清空）。
+  - `memory/context/memorycontext.jsonl`：Memory 会话上下文外置回放（启动清空）。
 - 日志目录：`log/`（cache、recycle、pty/status 等子目录由运行时生成/使用）。
 - `log/runtime.txt`：运行时事件日志（文本块：header + pretty JSON data）。
 - `log/contexttest.txt`：上下文审计日志（请求/回复；messages 与模型输出按原样换行记录，便于审计上下文工程）。
@@ -160,7 +166,7 @@
 | `src/api.rs` provider/capability | `src/core.rs`、`src/ui.rs`、`config/*.json` | 设置页显示字段、请求体字段、默认值与回退逻辑可能联动 |
 | `DogClient` 请求/解析逻辑（`src/core.rs`） | `src/ui.rs`、`src/mcp.rs` | `brief/reasoning/content` 事件节奏变化会影响 UI 状态机与工具触发 |
 | 工具解析/校验（`src/mcp.rs`） | `src/core.rs`、`src/ui.rs` | tool 提取、确认、回执注入与展示格式强耦合 |
-| PTY 扩展（`src/Extention/pseudo_terminal.rs`） | `src/core.rs`、`src/ui.rs` | AsyncEvent 字段、焦点与键位/触摸、状态栏和审计提示会联动 |
+| PTY（`src/pseudo_terminal.rs`） | `src/core.rs`、`src/ui.rs` | AsyncEvent 字段、焦点与键位/触摸、状态栏和审计提示会联动 |
 | UI 折叠/输入交互（`src/ui.rs`） | `src/core.rs` | 选择态、展开集合、滚动边界、键位分流都在 core 管理 |
 | 配置结构（`config` 子模块 in `core.rs`） | `config/*.json`、加载/保存函数、设置页字段映射 | 字段名变化会导致旧配置读不到或 UI 写回错位 |
 | 记忆层（`src/memory.rs`） | `src/mcp.rs`（memory 工具）、`src/core.rs`（上下文统计） | 查询语义与输出预算、token 统计都可能受影响 |
@@ -177,7 +183,7 @@
    - `brief/reasoning/content` 显示合理；
    - 不出现 400（上下文角色/格式错误）。
 4. 工具链至少测 4 类：
-   - `bash`、`read_file`、`search`、`memory_*`；
+   - `bash`、`pty`、`list`、`memory_*`（含 apply_patch）；
    - 确认 `状态:*` 行存在且失败只在 `状态:fail`。
 5. PTY 最少测：
    - 启动、切 tab、结束、DONE 回传；
@@ -213,8 +219,8 @@ grep -nE 'handle_model_stream_chunk|handle_model_stream_end|extract_tool_calls|t
 # provider 能力与模型列表
 grep -nE 'capabilities|normalize_provider|available_models_for_provider|normalize_reasoning_effort|build_codex_input_messages' src/api.rs
 
-# PTY 扩展锚点
-grep -nE 'spawn_interactive_bash_execution|handle_async_event_pty_|draw_pty_panel|handle_pty_view_key' src/Extention/pseudo_terminal.rs
+# PTY 锚点
+grep -nE 'spawn_interactive_bash_execution|handle_async_event_pty_|draw_pty_panel|handle_pty_view_key' src/pseudo_terminal.rs
 
 # UI 折叠与输入锚点
 grep -nE 'draw_chat|draw_input|parse_tool_summary|render_message_lines|thinking_scroll_limit' src/ui.rs
@@ -239,7 +245,7 @@ grep -nE 'Alt\\+Tab|BackTab|KeyCode::Up|KeyCode::Down|MouseEventKind::Scroll' sr
 
 - 协议/上下文层：`src/context.rs` + `src/api.rs` + `src/providers.rs` 负责“发什么给模型 / 如何解析回来的事件”。
 - 编排层：`src/core.rs` 负责“何时发 / 何时停 / 工具链如何串联 / 状态如何恢复”。
-- 展示层：`src/ui.rs` + `src/Extention/pseudo_terminal.rs` 负责“怎么画 / 怎么交互”，不得影响协议层内容。
+- 展示层：`src/ui.rs` + `src/pseudo_terminal.rs` 负责“怎么画 / 怎么交互”，不得影响协议层内容。
 
 ### 10.2 收敛步骤（建议按顺序做）
 

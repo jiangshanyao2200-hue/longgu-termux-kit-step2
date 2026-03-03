@@ -63,17 +63,16 @@ fn find_repo_root_from(mut dir: PathBuf) -> Option<PathBuf> {
 }
 
 fn repo_root_best_effort() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::current_dir() {
-        if let Some(root) = find_repo_root_from(dir) {
-            return Some(root);
-        }
+    if let Ok(dir) = std::env::current_dir()
+        && let Some(root) = find_repo_root_from(dir)
+    {
+        return Some(root);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            if let Some(root) = find_repo_root_from(parent.to_path_buf()) {
-                return Some(root);
-            }
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+        && let Some(root) = find_repo_root_from(parent.to_path_buf())
+    {
+        return Some(root);
     }
     None
 }
@@ -98,7 +97,7 @@ fn resolve_path_from_env(key: &str, default_rel: &str) -> PathBuf {
 
 fn load_debug_trace_from_env() -> DebugTraceConfig {
     DebugTraceConfig {
-        // 默认开启：便于追踪上下文工程与启动问题。
+        //（1）默认开启：便于追踪上下文工程与启动问题。
         runtime_log_enabled: parse_bool_env("YING_RUNTIME_LOG").unwrap_or(true),
         runtime_log_stream_chunks: parse_bool_env("YING_RUN_LOG_STREAM_CHUNKS")
             .or_else(|| parse_bool_env("YING_RUNLOG_STREAM_CHUNKS"))
@@ -119,8 +118,9 @@ pub(crate) fn debug_trace_config() -> &'static DebugTraceConfig {
 }
 
 fn now_ts() -> String {
-    // Debug timestamps need millisecond precision for interval analysis.
-    // Example: 2026-02-24 10:44:09.123 +08:00
+    //（1）Debug timestamps need millisecond precision for interval
+    //（2）analysis.
+    //（3）Example: 2026-02-24 10:44:09.123 +08:00
     chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S%.3f %:z")
         .to_string()
@@ -153,7 +153,8 @@ pub(crate) fn recover_terminal_best_effort() {
 }
 
 fn resolve_crash_log_path() -> PathBuf {
-    // 兼容旧变量：该变量本来用于覆盖 crash log 路径；现在额外用 CRASH_LOG_ENABLED 控制开关。
+    //（1）兼容旧变量：该变量本来用于覆盖 crash log 路径；
+    //（2）现在额外用 CRASH_LOG_ENABLED 控制开关。
     if let Ok(p) = std::env::var("YING_CRASH_LOG") {
         let p = p.trim();
         if !p.is_empty() {
@@ -311,7 +312,7 @@ pub(crate) fn runlog_event(level: &str, event: &str, data: serde_json::Value) {
         let _ = w.write_all(data_pretty.as_bytes());
         let _ = w.write_all(b"\n");
         let _ = w.write_all(b"----\n");
-        // 调试期宁可多 flush（便于实时观察），也不要“看起来像没启用日志”。
+        //（1）调试期宁可多 flush（便于实时观察），也不要“看起来像没启用日志”。
         let _ = w.flush();
     }
 }
@@ -359,7 +360,7 @@ fn write_contexttest_snapshot(path: &Path, text: &str) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    // 只保留最后一轮：覆盖写（truncate），避免文件无限膨胀。
+    //（1）只保留最后一轮：覆盖写（truncate），避免文件无限膨胀。
     let _ = fs::write(path, text);
 }
 
@@ -380,19 +381,46 @@ fn init_contexttest_logger() -> Option<&'static ContextTestLogger> {
     CONTEXTTEST_LOGGER.get()
 }
 
-pub(crate) fn contexttest_log_request_start(
-    mind: MindKind,
-    request_id: u64,
-    stream: bool,
-    provider: &str,
-    base_url: &str,
-    model: &str,
-    reasoning_effort: Option<&str>,
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
-    timeout_secs: u64,
-    messages: &[ApiMessage],
-) {
+pub(crate) struct ContextTestRequestStartArgs<'a> {
+    pub(crate) mind: MindKind,
+    pub(crate) request_id: u64,
+    pub(crate) stream: bool,
+    pub(crate) provider: &'a str,
+    pub(crate) base_url: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) reasoning_effort: Option<&'a str>,
+    pub(crate) temperature: Option<f32>,
+    pub(crate) max_tokens: Option<u32>,
+    pub(crate) timeout_secs: u64,
+    pub(crate) messages: &'a [ApiMessage],
+}
+
+pub(crate) struct ContextTestResponseEndArgs<'a> {
+    pub(crate) mind: MindKind,
+    pub(crate) request_id: u64,
+    pub(crate) usage_total_tokens: u64,
+    pub(crate) error: Option<&'a str>,
+    pub(crate) brief: Option<&'a str>,
+    pub(crate) thinking_full: Option<&'a str>,
+    pub(crate) raw_text: Option<&'a str>,
+    pub(crate) assistant_text: Option<&'a str>,
+}
+
+pub(crate) fn contexttest_log_request_start(args: ContextTestRequestStartArgs<'_>) {
+    let ContextTestRequestStartArgs {
+        mind,
+        request_id,
+        stream,
+        provider,
+        base_url,
+        model,
+        reasoning_effort,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        messages,
+    } = args;
+
     let Some(logger) = init_contexttest_logger() else {
         return;
     };
@@ -403,9 +431,9 @@ pub(crate) fn contexttest_log_request_start(
         MindKind::Memory => "memory",
     };
     let ts = now_ts();
-    // 只记录“模型实际收到的上下文”：
-    // - DeepSeek：直接使用 messages
-    // - Codex：按 responses API 的 input 规范做一次归一（role/trim/空消息过滤）
+    //（1）只记录“模型实际收到的上下文”：
+    //（2）DeepSeek：直接使用 messages
+    //（3）Codex：按 responses API 的 input 规范做一次归一（role/trim/空消息过滤）
     let is_codex = crate::api::normalize_provider(provider) == "codex";
     let mut codex_normalized: Vec<ApiMessage> = Vec::new();
     let messages_for_log: &[ApiMessage] = if is_codex {
@@ -504,7 +532,7 @@ pub(crate) fn contexttest_log_request_start(
     }
     buf.push('\n');
 
-    // 只保留最后一轮：请求开始就覆盖写入（便于看“模型实际收到了什么”）。
+    //（1）只保留最后一轮：请求开始就覆盖写入（便于看“模型实际收到了什么”）。
     logger.latest_started_seq.store(seq, Ordering::Relaxed);
     let key = ContextTestKey {
         mind: mind_key(mind),
@@ -527,16 +555,18 @@ pub(crate) fn contexttest_log_request_start(
     write_contexttest_snapshot(&logger.path, &snapshot);
 }
 
-pub(crate) fn contexttest_log_response_end(
-    mind: MindKind,
-    request_id: u64,
-    usage_total_tokens: u64,
-    error: Option<&str>,
-    brief: Option<&str>,
-    thinking_full: Option<&str>,
-    raw_text: Option<&str>,
-    assistant_text: Option<&str>,
-) {
+pub(crate) fn contexttest_log_response_end(args: ContextTestResponseEndArgs<'_>) {
+    let ContextTestResponseEndArgs {
+        mind,
+        request_id,
+        usage_total_tokens,
+        error,
+        brief,
+        thinking_full,
+        raw_text,
+        assistant_text,
+    } = args;
+
     let Some(logger) = init_contexttest_logger() else {
         return;
     };
@@ -559,64 +589,75 @@ pub(crate) fn contexttest_log_response_end(
         "--------------------------------------------------------------------------------\n",
     );
 
-    if let Some(e) = error {
-        if !e.trim().is_empty() {
-            response.push_str("--- error ---\n");
-            response.push_str(e);
-            if !e.ends_with('\n') {
-                response.push('\n');
-            }
-            response.push_str("--------------------------------------------------------------------------------\n");
+    if let Some(e) = error
+        && !e.trim().is_empty()
+    {
+        response.push_str("--- error ---\n");
+        response.push_str(e);
+        if !e.ends_with('\n') {
+            response.push('\n');
         }
+        response.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
     }
 
-    if let Some(b) = brief {
-        if !b.trim().is_empty() {
-            response.push_str("--- brief ---\n");
-            response.push_str(b);
-            if !b.ends_with('\n') {
-                response.push('\n');
-            }
-            response.push_str("--------------------------------------------------------------------------------\n");
+    if let Some(b) = brief
+        && !b.trim().is_empty()
+    {
+        response.push_str("--- brief ---\n");
+        response.push_str(b);
+        if !b.ends_with('\n') {
+            response.push('\n');
         }
+        response.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
     }
 
-    if let Some(t) = thinking_full {
-        if !t.trim().is_empty() {
-            response.push_str("--- thinking_full ---\n");
-            response.push_str(t);
-            if !t.ends_with('\n') {
-                response.push('\n');
-            }
-            response.push_str("--------------------------------------------------------------------------------\n");
+    if let Some(t) = thinking_full
+        && !t.trim().is_empty()
+    {
+        response.push_str("--- thinking_full ---\n");
+        response.push_str(t);
+        if !t.ends_with('\n') {
+            response.push('\n');
         }
+        response.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
     }
 
-    if let Some(r) = raw_text {
-        if !r.trim().is_empty() {
-            response.push_str("--- raw_text ---\n");
-            response.push_str(r);
-            if !r.ends_with('\n') {
-                response.push('\n');
-            }
-            response.push_str("--------------------------------------------------------------------------------\n");
+    if let Some(r) = raw_text
+        && !r.trim().is_empty()
+    {
+        response.push_str("--- raw_text ---\n");
+        response.push_str(r);
+        if !r.ends_with('\n') {
+            response.push('\n');
         }
+        response.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
     }
 
-    if let Some(a) = assistant_text {
-        if !a.trim().is_empty() {
-            response.push_str("--- assistant_text ---\n");
-            response.push_str(a);
-            if !a.ends_with('\n') {
-                response.push('\n');
-            }
-            response.push_str("--------------------------------------------------------------------------------\n");
+    if let Some(a) = assistant_text
+        && !a.trim().is_empty()
+    {
+        response.push_str("--- assistant_text ---\n");
+        response.push_str(a);
+        if !a.ends_with('\n') {
+            response.push('\n');
         }
+        response.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
     }
 
     response.push('\n');
 
-    // 只写“最后一轮快照”：仅当该 response 对应当前最新的 request 才覆盖 contexttest 文件。
+    //（1）只写“最后一轮快照”：仅当该 response 对应当前最新的 request 才覆盖 contexttest
+    //（2）文件。
     let key = ContextTestKey {
         mind: mind_key(mind),
         request_id,

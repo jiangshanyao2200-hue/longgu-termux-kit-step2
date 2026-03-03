@@ -1,19 +1,26 @@
-# Project Ying（萤）
+Project Ying（萤）
 
 欢迎。你在一个终端聊天里使用 AI 助手。
 
-## 常用入口
+常用入口
+- 输入 "/"：打开命令菜单（/Terminal /Cmd /Settings /Help /SSE /Quit）
 
-- 输入 `/`：打开命令菜单（`/Cmd` `/Settings` `/Help` `/Switch` `/SSE` `/Quit`）
-- `/Help`：帮助（可把快捷键地图注入到聊天里）
+窗口切换（标签页）
+- Matrix：主模型
+- WatchDog：辅模型
+- Memory：记忆模型
+- Shift+← / Shift+→：切换标签页
+- 触控：点击标签页切换
 
-## Terminal（PTY）
+输入框
+- Enter：空闲时发送；忙碌时换行
+- Shift+Enter：换行
+- Ctrl+Enter：换行
+- Alt+Enter：强制入队（发送到队列，稍后自动发送）
 
+Terminal（PTY）
 当 AI 启动后台终端任务（PTY）后：
-
-- `Home`：显示/隐藏 Terminal（后台继续运行）
-- `Esc`：透传给终端程序；`Esc`×2（350ms 内）结束当前任务
-- `PgUp/PgDn`：切换终端 tab 或切回 Chat
-- `Alt+↑`：把终端快照暂存到输入框（你决定是否发送给 AI）
-
-完整快捷键：`/Help` → `快捷键`
+- Home：显示/隐藏 Terminal（后台继续运行）
+- Esc：透传给终端程序；Esc×2（350ms 内）结束当前任务
+- PgUp/PgDn：切换终端 tab 或切回 Chat
+- Alt+↑：把终端快照暂存到输入框（你决定是否发送给 AI）

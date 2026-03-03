@@ -6,6 +6,22 @@ use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use std::time::Duration;
 
+// ===== 注释链（记忆 DB：SQLite + 迁移 + 检索）=====
+//
+//（1）A 工具入口（MCP）
+//（2）mcp.rs:memory_check / memory_read / memory_add
+//（3）-> MemoDb::open_default -> connect ->
+//（4）init_schema/migrate_if_needed
+//
+//（1）B 存储模型
+//（2）datememo：日记索引/摘要（用于回忆检索）
+//（3）metamemo：元聊天记录（更长，更细）
+//
+//（1）C 常用调用
+//（2）写入：append_entry（memory_add -> datememo/fastmemo）
+//（3）检索：check_by_keywords（memory_check）
+//（4）读取：read_by_date（memory_read）
+
 pub const DEFAULT_MEMO_DB_PATH: &str = "memory/metamemory.db";
 pub const DEFAULT_METAMEMO_PATH: &str = "memory/metamemo.jsonl";
 pub const DEFAULT_DATEMEMO_PATH: &str = "memory/datememo.jsonl";
@@ -41,10 +57,10 @@ pub struct MemoRow {
 
 #[derive(Debug, Clone)]
 pub struct DateMemoDayAgg {
-    pub date: String,       // YYYY-MM-DD (来自 DB 字段)
-    pub latest_ts: String,  // 该日最新一条记录的 ts（来自 DB 字段）
-    pub entries: usize,     // 该日命中条目数量（DB 行数）
-    pub kw_hits: usize,     // 该日命中“不同关键词”的数量（按日聚合）
+    pub date: String,      // YYYY-MM-DD (来自 DB 字段)
+    pub latest_ts: String, // 该日最新一条记录的 ts（来自 DB 字段）
+    pub entries: usize,    // 该日命中条目数量（DB 行数）
+    pub kw_hits: usize,    // 该日命中“不同关键词”的数量（按日聚合）
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,8 +82,14 @@ impl MemoDb {
     }
 
     pub fn open_default() -> Result<Self> {
-        let db_path =
-            std::env::var("YING_MEMO_DB_PATH").unwrap_or_else(|_| DEFAULT_MEMO_DB_PATH.to_string());
+        let db_path = std::env::var("YING_MEMO_DB_PATH").unwrap_or_else(|_| {
+            //（1）测试环境下避免复用运行中的数据库文件（可能被 UI 进程锁定导致 cargo test 偶发失败）。
+            if cfg!(test) {
+                "target/test_metamemory.db".to_string()
+            } else {
+                DEFAULT_MEMO_DB_PATH.to_string()
+            }
+        });
         let meta_path = std::env::var("YING_METAMEMO_PATH")
             .unwrap_or_else(|_| DEFAULT_METAMEMO_PATH.to_string());
         let date_path = std::env::var("YING_DATEMEMO_PATH")
@@ -93,27 +115,6 @@ impl MemoDb {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn append_datememo_content(&self, content: &str) -> Result<()> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-        let (ts, speaker) = parse_header_ts_speaker(trimmed.lines().next().unwrap_or(""));
-        let normalized_ts = normalize_memo_ts(&ts);
-        let date = extract_memo_date(&normalized_ts);
-        let conn = self.connect()?;
-        insert_entry(
-            &conn,
-            MemoKind::Date.table(),
-            &normalized_ts,
-            &date,
-            &speaker,
-            trimmed,
-        )?;
-        Ok(())
-    }
-
     pub fn read_last_entry(&self, kind: MemoKind) -> Result<Option<String>> {
         let conn = self.connect()?;
         let sql = format!(
@@ -123,47 +124,6 @@ impl MemoDb {
         let mut stmt = conn.prepare(&sql)?;
         let row = stmt.query_row([], |r| r.get::<_, String>(0)).optional()?;
         Ok(row)
-    }
-
-    #[allow(dead_code)]
-    pub fn table_stats(&self, kind: MemoKind) -> Result<MemoStats> {
-        let conn = self.connect()?;
-        table_stats(&conn, kind.table())
-    }
-
-    #[allow(dead_code)]
-    pub fn read_by_index(
-        &self,
-        kind: MemoKind,
-        start_line: usize,
-        max_lines: usize,
-    ) -> Result<(Vec<MemoRow>, MemoStats)> {
-        let conn = self.connect()?;
-        let stats = table_stats(&conn, kind.table())?;
-        if stats.total_rows == 0 {
-            return Ok((Vec::new(), stats));
-        }
-        let start_line = start_line.max(1);
-        let end_line = start_line.saturating_add(max_lines.saturating_sub(1));
-        let sql = format!(
-            "SELECT rownum, content FROM (\
-                SELECT row_number() OVER (ORDER BY id) AS rownum, content \
-                FROM {}\
-            ) WHERE rownum BETWEEN ?1 AND ?2 ORDER BY rownum",
-            kind.table()
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = Vec::new();
-        let iter = stmt.query_map(params![start_line as i64, end_line as i64], |r| {
-            Ok(MemoRow {
-                rownum: r.get::<_, i64>(0)? as usize,
-                content: r.get(1)?,
-            })
-        })?;
-        for row in iter {
-            rows.push(row?);
-        }
-        Ok((rows, stats))
     }
 
     pub fn read_by_date(
@@ -371,20 +331,20 @@ impl MemoDb {
         let conn = self.connect()?;
         let (mut clauses, date_params) = build_date_clause(start, end);
 
-        // 若无关键词，直接返回空（调用方应当先校验）。
+        //（1）若无关键词，直接返回空（调用方应当先校验）。
         if keywords.is_empty() {
             return Ok(Vec::new());
         }
 
-        // WHERE：OR 关键词（仅拉取命中过至少 1 个关键词的日记条目）。
+        //（1）WHERE：OR 关键词（仅拉取命中过至少 1 个关键词的日记条目）。
         let mut ors: Vec<String> = Vec::new();
         for _ in keywords {
             ors.push("LOWER(content) LIKE ?".to_string());
         }
         clauses.push(format!("({})", ors.join(" OR ")));
 
-        // SELECT：对每个关键词做一个按日的存在性标记（0/1）。
-        // 这里也用参数占位，避免拼接 kw 到 SQL 中。
+        //（1）SELECT：对每个关键词做一个按日的存在性标记（0/1）。
+        //（2）这里也用参数占位，避免拼接 kw 到 SQL 中。
         let mut kw_cols: Vec<String> = Vec::new();
         for (i, _) in keywords.iter().enumerate() {
             kw_cols.push(format!(
@@ -406,10 +366,10 @@ impl MemoDb {
             where_sql
         );
 
-        // 参数顺序必须与 SQL 中 `?` 的出现顺序一致：
-        // 1) SELECT: 每个 kw 的 CASE WHEN ... LIKE ?
-        // 2) WHERE: date_clause 的参数（start/end）
-        // 3) WHERE: OR 关键词参数（LOWER(content) LIKE ?）
+        //（1）参数顺序必须与 SQL 中 `?` 的出现顺序一致：
+        //（2）SELECT: 每个 kw 的 CASE WHEN ... LIKE ?
+        //（3）WHERE: date_clause 的参数（start/end）
+        //（4）WHERE: OR 关键词参数（LOWER(content) LIKE ?）
         let mut params: Vec<Value> = Vec::new();
         for kw in keywords {
             params.push(Value::from(format!("%{}%", kw.to_ascii_lowercase())));
@@ -425,7 +385,7 @@ impl MemoDb {
             let latest_ts: String = r.get(1)?;
             let entries: i64 = r.get(2)?;
             let mut kw_hits: usize = 0;
-            // k0..kN
+            //（1）k0..kN
             for i in 0..keywords.len() {
                 let v: i64 = r.get(3 + i)?;
                 if v != 0 {
@@ -489,7 +449,7 @@ impl MemoDb {
         }
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("打开记忆数据库失败：{}", self.db_path.display()))?;
-        // 可靠性：避免并发写入/索引迁移时短暂锁定导致工具直接失败。
+        //（1）可靠性：避免并发写入/索引迁移时短暂锁定导致工具直接失败。
         let _ = conn.busy_timeout(Duration::from_millis(1200));
         init_schema(&conn)?;
         Ok(conn)
@@ -565,7 +525,9 @@ pub fn normalize_memo_ts(raw: &str) -> String {
             .to_string();
     }
     if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        let dt = date.and_hms_opt(0, 0, 0).unwrap();
+        let Some(dt) = date.and_hms_opt(0, 0, 0) else {
+            return Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        };
         return Local
             .from_local_datetime(&dt)
             .single()
@@ -600,7 +562,9 @@ pub fn normalize_memo_ts(raw: &str) -> String {
                         .format("%Y-%m-%d %H:%M:%S")
                         .to_string();
                 }
-                let dt = date.and_hms_opt(0, 0, 0).unwrap();
+                let Some(dt) = date.and_hms_opt(0, 0, 0) else {
+                    return Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                };
                 return Local
                     .from_local_datetime(&dt)
                     .single()

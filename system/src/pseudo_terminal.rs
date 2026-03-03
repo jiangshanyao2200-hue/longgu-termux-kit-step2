@@ -2,6 +2,27 @@ use super::*;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::sync::Mutex;
 
+// ===== 注释链（PTY：交互终端与长任务）=====
+//
+//（1）A 工具入口
+//（2）mcp 工具 pty 只负责解析；实际执行在 core 主线程：
+//（3）core.rs:spawn_tool_execution（tool=pty）
+//（4）-> AsyncEvent::PtyToolRequest
+//（5）-> pseudo_terminal.rs:handle_pty_tool_request -> spawn
+//（6）-> AsyncEvent::PtyReady
+//
+//（1）B 输出与结束
+//（2）AsyncEvent::PtyOutput -> handle_async_event_pty_output
+//（3）-> vt100 parser
+//（4）AsyncEvent::PtyJobDone ->
+//（5）handle_async_event_pty_job_done -> 导出/摘要 ->（可选）回灌模型上下文
+//
+//（1）C 渲染与交互
+//（2）ui.rs:draw_chat（主聊天）
+//（3）pseudo_terminal.rs:draw_pty_panel（Terminal 面板）
+//（4）handle_pty_view_key / touch drag / mouse wheel：只影响 PTY
+//（5）面板滚动与焦点
+
 static PTY_JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_PTY_COUNT: AtomicU64 = AtomicU64::new(0);
 static PTY_DONE_EXPORT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -11,7 +32,7 @@ pub(super) fn next_pty_job_id() -> u64 {
 }
 
 pub(super) fn active_pty_count() -> u64 {
-    ACTIVE_PTY_COUNT.load(Ordering::Relaxed).max(0)
+    ACTIVE_PTY_COUNT.load(Ordering::Relaxed)
 }
 
 fn next_pty_done_export_id() -> u64 {
@@ -71,26 +92,39 @@ pub(super) struct PtyUiState {
     pub(super) started_at: Instant,
     pub(super) pid: Option<i32>,
     pub(super) pgrp: Option<i32>,
-    // 按用户决策：交互输入也记录并回传给 AI（含敏感信息）。
+    //（1）按用户决策：交互输入也记录并回传给 AI（含敏感信息）。
     pub(super) input_log: String,
-    // 用户在终端里主动生成的快照（Alt+↑）。用于暂存到输入框；旧链路 final 回传会优先用它。
+    //（1）用户在终端里主动生成的快照（Alt+↑）。用于暂存到输入框；旧链路 final 回传会优先用它。
     pub(super) last_user_snapshot: Option<String>,
     pub(super) screen_lines: Vec<String>,
     pub(super) dirty: bool,
 }
 
+pub(super) struct PtyUiStateNewArgs {
+    pub(super) ctrl_tx: mpsc::Sender<PtyControl>,
+    pub(super) cols: u16,
+    pub(super) rows: u16,
+    pub(super) owner: MindKind,
+    pub(super) job_id: u64,
+    pub(super) cmd: String,
+    pub(super) saved_path: String,
+    pub(super) status_path: String,
+}
+
 impl PtyUiState {
-    pub(super) fn new(
-        ctrl_tx: mpsc::Sender<PtyControl>,
-        cols: u16,
-        rows: u16,
-        owner: MindKind,
-        job_id: u64,
-        cmd: String,
-        saved_path: String,
-        status_path: String,
-    ) -> Self {
-        // scrollback 给一个较大的默认值，保证交互期可回看。
+    pub(super) fn new(args: PtyUiStateNewArgs) -> Self {
+        let PtyUiStateNewArgs {
+            ctrl_tx,
+            cols,
+            rows,
+            owner,
+            job_id,
+            cmd,
+            saved_path,
+            status_path,
+        } = args;
+
+        //（1）scrollback 给一个较大的默认值，保证交互期可回看。
         let parser = vt100::Parser::new(rows, cols, PTY_SCROLLBACK_MAX as usize);
         Self {
             ctrl_tx,
@@ -122,10 +156,11 @@ impl PtyUiState {
             return;
         }
         self.parser.process(bytes);
-        // 终端模拟（最小集）：响应 Cursor Position Report (CPR) 查询 `ESC[6n`。
-        // 一些 TUI（例如 codex/crossterm）会向 stdout 写入 `ESC[6n`，并期待终端回写 `ESC[{row};{col}R` 到 stdin。
-        // 在我们的“PTY + vt100 parser”架构中，若不响应，应用会报类似：
-        // "Error: The cursor position could not be read..."
+        //（1）终端模拟（最小集）：响应 Cursor Position Report (CPR) 查询 `ESC[6n`。
+        //（2）一些 TUI（例如 codex/crossterm）会向 stdout 写入 `ESC[6n`，
+        //（3）并期待终端回写 `ESC[{row};{col}R` 到 stdin。
+        //（4）在我们的“PTY + vt100 parser”架构中，若不响应，应用会报类似：
+        //（5）"Error: The cursor position could not be read..."
         const CPR: [u8; 4] = [0x1B, b'[', b'6', b'n'];
         const SR: [u8; 4] = [0x1B, b'[', b'5', b'n']; // Status Report
         const DA1: [u8; 2] = [0x1B, b'c']; // Device Attributes
@@ -152,7 +187,7 @@ impl PtyUiState {
         if bytes.is_empty() {
             return;
         }
-        // 只做最小可读化记录：可打印字符保留，其它控制字符用占位。
+        //（1）只做最小可读化记录：可打印字符保留，其它控制字符用占位。
         for &b in bytes {
             match b {
                 b'\r' | b'\n' => self.input_log.push('\n'),
@@ -177,8 +212,8 @@ impl PtyUiState {
             self.pending_rows = rows;
             self.pending_since = Some(Instant::now());
         }
-        // 约束：光标必须稳定显示在终端尾部；键盘弹出/收回会导致尺寸变化，
-        // 若 debounce 过长会造成“光标漂移/错位”观感。因此这里选择立即 resize。
+        //（1）约束：光标必须稳定显示在终端尾部；键盘弹出/收回会导致尺寸变化，
+        //（2）若 debounce 过长会造成“光标漂移/错位”观感。因此这里选择立即 resize。
         self.cols = self.pending_cols;
         self.rows = self.pending_rows;
         self.pending_since = None;
@@ -199,12 +234,13 @@ impl PtyUiState {
         self.scroll = applied;
         self.scroll_applied = applied;
         let text = self.parser.screen().contents().to_string();
-        // vt100 的 contents 可能带末尾 '\n'，split('\n') 会多出一个空行导致行数漂移。
-        // 这里统一用 split_terminator 并严格 pad/truncate 到 rows，保证光标坐标与渲染一致。
+        //（1）vt100 的 contents 可能带末尾 '\n'，split('\n') 会多出一个空行导致行数漂移。
+        //（2）这里统一用 split_terminator 并严格 pad/truncate 到 rows，
+        //（3）保证光标坐标与渲染一致。
         let mut lines: Vec<String> = text.split_terminator('\n').map(|s| s.to_string()).collect();
         let want = self.rows.max(1) as usize;
         if lines.len() < want {
-            lines.extend(std::iter::repeat(String::new()).take(want - lines.len()));
+            lines.extend(std::iter::repeat_n(String::new(), want - lines.len()));
         } else if lines.len() > want {
             lines.truncate(want);
         }
@@ -233,8 +269,8 @@ pub(super) fn key_to_pty_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<
         KeyCode::Esc => out.push(0x1B),
         KeyCode::Char(ch) => {
             if ctrl {
-                // 按常规定义：Ctrl + ASCII('@'..='_') => codepoint & 0x1F
-                // 这也覆盖了常用的 Ctrl+[ == ESC (0x1B) 等组合。
+                //（1）按常规定义：Ctrl + ASCII('@'..='_') => codepoint & 0x1F
+                //（2）这也覆盖了常用的 Ctrl+[ == ESC (0x1B) 等组合。
                 if ch.is_ascii() {
                     let c = ch.to_ascii_uppercase() as u8;
                     if (b'@'..=b'_').contains(&c) {
@@ -352,8 +388,9 @@ pub(super) struct PtyDoneBatches {
     pub(super) main: PtyDoneBatch,
     pub(super) sub: PtyDoneBatch,
     pub(super) memory: PtyDoneBatch,
-    // pty.kill 会导致随后到达的 PtyJobDone 与工具回执重复/冲突。
-    // 这里记录“应当抑制 DONE 聚合回执”的 job_id：被 kill 的任务只由 pty.kill 工具回执汇报。
+    //（1）pty.kill 会导致随后到达的 PtyJobDone 与工具回执重复/冲突。
+    //（2）这里记录“应当抑制 DONE 聚合回执”的 job_id：被 kill 的任务只由 pty.kill
+    //（3）工具回执汇报。
     pub(super) suppress_main: BTreeSet<u64>,
     pub(super) suppress_sub: BTreeSet<u64>,
     pub(super) suppress_memory: BTreeSet<u64>,
@@ -382,8 +419,8 @@ impl PtyDoneBatches {
         }
         let set = self.suppress_set_mut(owner);
         if set.insert(job_id) {
-            // 从“本批总 started”里剔除：否则会出现 completed 永远达不到 total_started，
-            // 导致剩余任务无法触发 DONE 汇总。
+            //（1）从“本批总 started”里剔除：否则会出现 completed 永远达不到 total_started，
+            //（2）导致剩余任务无法触发 DONE 汇总。
             let b = self.batch_mut(owner);
             b.total_started = b.total_started.saturating_sub(1);
             return true;
@@ -572,11 +609,11 @@ pub(super) fn export_pty_done_batch_summary(
     let id = next_pty_done_export_id();
     let file = format!("pty_done_batch_{owner:?}_{stamp}_{id}.txt");
     let path = dir.join(file);
-    if std::fs::write(&path, tool_text.as_bytes()).is_ok() {
+    if std::fs::write(&path, tool_text).is_ok() {
         let bytes = std::fs::metadata(&path)
             .ok()
             .map(|m| m.len())
-            .unwrap_or(tool_text.as_bytes().len() as u64);
+            .unwrap_or(tool_text.len() as u64);
         let lines = tool_text.lines().count();
         return Some(ExportedBatchMeta {
             path: path.to_string_lossy().to_string(),
@@ -602,17 +639,31 @@ fn format_bytes_short(bytes: usize) -> String {
     }
 }
 
-pub(super) fn write_pty_status_file(
-    path: &str,
-    phase: PtyStatusPhase,
-    owner: MindKind,
-    job_id: u64,
-    cmd: &str,
-    saved_path: &str,
-    bytes: usize,
-    lines: usize,
-    exit_code: Option<i32>,
-) {
+pub(super) struct PtyStatusFileArgs<'a> {
+    pub(super) path: &'a str,
+    pub(super) phase: PtyStatusPhase,
+    pub(super) owner: MindKind,
+    pub(super) job_id: u64,
+    pub(super) cmd: &'a str,
+    pub(super) saved_path: &'a str,
+    pub(super) bytes: usize,
+    pub(super) lines: usize,
+    pub(super) exit_code: Option<i32>,
+}
+
+pub(super) fn write_pty_status_file(args: PtyStatusFileArgs<'_>) {
+    let PtyStatusFileArgs {
+        path,
+        phase,
+        owner,
+        job_id,
+        cmd,
+        saved_path,
+        bytes,
+        lines,
+        exit_code,
+    } = args;
+
     let phase_label = match phase {
         PtyStatusPhase::Starting => "starting",
         PtyStatusPhase::Running => "running",
@@ -655,7 +706,7 @@ pub(super) fn render_pty_help_prompt(template: &str, double_esc_ms: u64) -> Stri
     tpl.replace("{DOUBLE_ESC_MS}", &double_esc_ms.to_string())
 }
 
-// PTY 自动超时：避免后台会话永久占用资源。
+//（1）PTY 自动超时：避免后台会话永久占用资源。
 const PTY_AUTO_TIMEOUT_SECS: u64 = 30 * 60;
 
 const DEFAULT_PTY_STARTED_NOTICE_PROMPT: &str = "PTY 已启动（后台运行）。\njob_id:{JOB_ID} | owner:{OWNER}\ncwd:{CWD}\ncmd:\n```sh\n{CMD}\n```\nlog:{LOG_PATH}\nstatus:{STATUS_PATH}\n\n说明：终端在后台运行，期间可继续对话。\n如需提前结束：pty.kill(job_id)。\n自动超时：30 分钟（到点自动结束）。\n\n{INITIAL_PREVIEW_BLOCK}\n";
@@ -741,10 +792,10 @@ pub(super) struct PendingPtySnapshot {
 }
 
 pub(super) fn prune_pending_pty_snapshot(input: &str, pending: &mut Option<PendingPtySnapshot>) {
-    if let Some(p) = pending.as_ref() {
-        if !input.contains(p.placeholder.as_str()) {
-            *pending = None;
-        }
+    if let Some(p) = pending.as_ref()
+        && !input.contains(p.placeholder.as_str())
+    {
+        *pending = None;
     }
 }
 
@@ -851,9 +902,9 @@ pub(super) fn spawn_interactive_bash_execution(
     pty_started_model_note_template: String,
     send_started_receipt: bool,
 ) -> PtySpawnInfo {
-    // cwd 展示：
-    // - 在 $HOME 下：显示 `~` 或 `~/<rel>`
-    // - 不在 $HOME 下：显示真实绝对路径
+    //（1）cwd 展示：
+    //（2）在 $HOME 下：显示 `~` 或 `~/<rel>`
+    //（3）不在 $HOME 下：显示真实绝对路径
     fn short_cwd_display(raw: &str) -> String {
         let path = raw.trim();
         if path.is_empty() {
@@ -928,7 +979,7 @@ pub(super) fn spawn_interactive_bash_execution(
             if let Some(rest) = s.strip_prefix("~/") {
                 return format!("{project}/{rest}");
             }
-            // 工程根别名：home -> ~/AItermux
+            //（1）工程根别名：home -> ~/AItermux
             if s == "home" {
                 return project;
             }
@@ -944,7 +995,8 @@ pub(super) fn spawn_interactive_bash_execution(
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            // 与 bash/adb/termux_api 对齐：默认 cwd 指向工程目录（~/AItermux/system），避免从其它目录启动时相对路径失效。
+            //（1）与 bash/adb/termux_api 对齐：默认 cwd 指向工程目录（~/AItermux/system）
+            //（2），避免从其它目录启动时相对路径失效。
             None => {
                 let abs = crate::mcp::default_workdir();
                 let disp = short_cwd_display(&abs);
@@ -983,21 +1035,21 @@ pub(super) fn spawn_interactive_bash_execution(
             .timeout_secs
             .or(call.timeout_ms.map(|ms| ms.saturating_add(999) / 1000))
             .unwrap_or(PTY_AUTO_TIMEOUT_SECS);
-        write_pty_status_file(
-            &status_path,
-            PtyStatusPhase::Starting,
+        write_pty_status_file(PtyStatusFileArgs {
+            path: &status_path,
+            phase: PtyStatusPhase::Starting,
             owner,
             job_id,
-            &cmd,
-            &saved_path,
-            0,
-            0,
-            None,
-        );
+            cmd: &cmd,
+            saved_path: &saved_path,
+            bytes: 0,
+            lines: 0,
+            exit_code: None,
+        });
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<PtyControl>();
-        // 初始尺寸：尽量贴近当前 TUI 的 PTY 面板内层（inner rect），避免首屏解析/渲染错位。
-        // 后续 UI 每帧会用 ensure_size 精确同步，但首屏错位会在“键盘弹出/收回”时更明显。
+        //（1）初始尺寸：尽量贴近当前 TUI 的 PTY 面板内层（inner rect），避免首屏解析/渲染错位。
+        //（2）后续 UI 每帧会用 ensure_size 精确同步，但首屏错位会在“键盘弹出/收回”时更明显。
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let init_cols = term_cols.saturating_sub(2).max(20); // 面板左右边框
         let fixed = 6u16; // header + header-sep + spacer + status + sep + ctx（与 core.rs 一致）
@@ -1031,17 +1083,17 @@ pub(super) fn spawn_interactive_bash_execution(
                 });
             }
             let elapsed_ms = started.elapsed().as_millis();
-            write_pty_status_file(
-                &status_path,
-                PtyStatusPhase::Done,
+            write_pty_status_file(PtyStatusFileArgs {
+                path: &status_path,
+                phase: PtyStatusPhase::Done,
                 owner,
                 job_id,
-                &cmd,
-                &saved_path,
-                0,
-                0,
-                Some(exit_code),
-            );
+                cmd: &cmd,
+                saved_path: &saved_path,
+                bytes: 0,
+                lines: 0,
+                exit_code: Some(exit_code),
+            });
             let _ = tx.send(AsyncEvent::PtyJobDone {
                 owner,
                 job_id,
@@ -1075,8 +1127,8 @@ pub(super) fn spawn_interactive_bash_execution(
             }
         };
 
-        // 默认关闭 echoctl，避免用户在终端里误触 Esc/控制键时输出出现 `^[` 等“噪音”。
-        // 这不影响程序收到的按键，只影响控制字符的回显方式。
+        //（1）默认关闭 echoctl，避免用户在终端里误触 Esc/控制键时输出出现 `^[` 等“噪音”。
+        //（2）这不影响程序收到的按键，只影响控制字符的回显方式。
         let mut cmd_exec = "stty -echoctl 2>/dev/null || true\n".to_string();
         if let Some(cwd_exec) = cwd_exec.as_deref() {
             cmd_exec.push_str(&format!(
@@ -1113,16 +1165,18 @@ pub(super) fn spawn_interactive_bash_execution(
         let _pty_guard = ActivePtyGuard::new();
         let pid = child.process_id().map(|v| v as i32);
 
-        // master：拆出 reader/writer，并保留 master 以处理 resize。
+        //（1）master：拆出 reader/writer，并保留 master 以处理 resize。
         let master = pair.master;
-        let pgrp = master.process_group_leader().map(|v| v as i32);
+        let pgrp = master.process_group_leader();
         let _ = tx.send(AsyncEvent::PtySpawned { job_id, pid, pgrp });
 
-        // 为了让 “Kill / 超时” 能可靠打断 reader.read()，把 master fd 设为 nonblocking。
-        // portable-pty 的 try_clone_reader() 通常基于 dup；O_NONBLOCK 属于 open-file-description，
-        // 对 dup 后的 reader 同样生效。
+        //（1）为了让 “Kill / 超时” 能可靠打断 reader.read()，
+        //（2）把 master fd 设为 nonblocking。
+        //（3）portable-pty 的 try_clone_reader() 通常基于 dup；
+        //（4）O_NONBLOCK 属于 open-file-description，
+        //（5）对 dup 后的 reader 同样生效。
         #[cfg(unix)]
-        if let Some(fd) = master.as_raw_fd().map(|v| v as i32) {
+        if let Some(fd) = master.as_raw_fd() {
             set_fd_nonblocking(fd, true);
         }
 
@@ -1134,7 +1188,7 @@ pub(super) fn spawn_interactive_bash_execution(
                     log_lines: vec![format!("状态:pty_reader_failed | cwd:{cwd_display}")],
                 };
                 #[cfg(unix)]
-                if let Some(pgrp) = master.process_group_leader().map(|v| v as i32) {
+                if let Some(pgrp) = master.process_group_leader() {
                     unsafe { libc::kill(-pgrp, libc::SIGKILL) };
                 }
                 let _ = child.kill();
@@ -1150,7 +1204,7 @@ pub(super) fn spawn_interactive_bash_execution(
                     log_lines: vec![format!("状态:pty_writer_failed | cwd:{cwd_display}")],
                 };
                 #[cfg(unix)]
-                if let Some(pgrp) = master.process_group_leader().map(|v| v as i32) {
+                if let Some(pgrp) = master.process_group_leader() {
                     unsafe { libc::kill(-pgrp, libc::SIGKILL) };
                 }
                 let _ = child.kill();
@@ -1159,7 +1213,7 @@ pub(super) fn spawn_interactive_bash_execution(
             }
         };
 
-        // 子进程与控制线程共享：支持 Kill / Wait。
+        //（1）子进程与控制线程共享：支持 Kill / Wait。
         let child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>> =
             Arc::new(Mutex::new(Some(child)));
         let done = Arc::new(AtomicBool::new(false));
@@ -1168,11 +1222,13 @@ pub(super) fn spawn_interactive_bash_execution(
         let timed_out = Arc::new(AtomicBool::new(false));
         let user_aborted = Arc::new(AtomicBool::new(false));
         let user_aborted2 = user_aborted.clone();
-        // 注意：portable_pty::Child::try_wait() 可能会“回收”子进程；若后续再 wait() 会得到 ECHILD。
-        // 因此一旦任何线程通过 try_wait() 观察到退出，就把 exit_code 记录下来，finalize 阶段优先使用它。
+        //（1）注意：portable_pty::Child::try_wait() 可能会“回收”子进程；若后续再 wait()
+        //（2）会得到 ECHILD。
+        //（3）因此一旦任何线程通过 try_wait() 观察到退出，就把 exit_code 记录下来，
+        //（4）finalize 阶段优先使用它。
         let exit_code_seen: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
 
-        // ctrl 线程：stdin / resize / kill
+        //（1）ctrl 线程：stdin / resize / kill
         let ctrl_handle = thread::spawn(move || {
             'ctrl: while !done2.load(Ordering::Relaxed) {
                 let msg = match ctrl_rx.recv_timeout(Duration::from_millis(120)) {
@@ -1195,31 +1251,30 @@ pub(super) fn spawn_interactive_bash_execution(
                     }
                     PtyControl::Kill => {
                         user_aborted2.store(true, Ordering::Relaxed);
-                        if let Ok(mut guard) = child2.lock() {
-                            if let Some(ch) = guard.as_mut() {
-                                // 尽力“杀整棵树”：避免只杀 bash 父进程导致子进程（如 codex/python）残留，
-                                // 从而读端不 EOF、界面看起来一直“还在跑”。
-                                #[cfg(unix)]
-                                if let Some(pgrp) = master.process_group_leader().map(|v| v as i32)
-                                {
-                                    // kill process group
-                                    unsafe { libc::kill(-pgrp, libc::SIGKILL) };
-                                }
-                                if let Some(pid) = ch.process_id().map(|v| v as i32) {
-                                    kill_process_tree(pid, libc::SIGKILL, 0);
-                                }
-                                let _ = ch.kill();
+                        if let Ok(mut guard) = child2.lock()
+                            && let Some(ch) = guard.as_mut()
+                        {
+                            //（1）尽力“杀整棵树”：避免只杀 bash 父进程导致子进程（如 codex/python）残留，
+                            //（2）从而读端不 EOF、界面看起来一直“还在跑”。
+                            #[cfg(unix)]
+                            if let Some(pgrp) = master.process_group_leader() {
+                                //（1）kill process group
+                                unsafe { libc::kill(-pgrp, libc::SIGKILL) };
                             }
+                            if let Some(pid) = ch.process_id().map(|v| v as i32) {
+                                kill_process_tree(pid, libc::SIGKILL, 0);
+                            }
+                            let _ = ch.kill();
                         }
-                        // 重要：立即退出 ctrl 线程，drop writer/master，给 slave 侧制造 EOF/HUP，
-                        // 以提升“退出 PTY 后工具能快速收尾”的确定性。
+                        //（1）重要：立即退出 ctrl 线程，drop writer/master，给 slave 侧制造 EOF/HUP，
+                        //（2）以提升“退出 PTY 后工具能快速收尾”的确定性。
                         break 'ctrl;
                     }
                 }
             }
         });
 
-        // PTY 自动超时：30min 到点 kill（仍允许用户双击 Esc 提前结束）。
+        //（1）PTY 自动超时：30min 到点 kill（仍允许用户双击 Esc 提前结束）。
         if timeout_secs > 0 {
             let tx_kill = ctrl_tx.clone();
             let timed_out2 = timed_out.clone();
@@ -1257,7 +1312,7 @@ pub(super) fn spawn_interactive_bash_execution(
             });
         }
 
-        // reader：持续刷出增量（同时落盘到 bash-cache）
+        //（1）reader：持续刷出增量（同时落盘到 bash-cache）
         let mut buf = [0u8; 8192];
         let mut bytes_written: usize = 0;
         let mut lines_written: usize = 0;
@@ -1294,17 +1349,17 @@ pub(super) fn spawn_interactive_bash_execution(
                         >= Duration::from_secs(2)
                     {
                         last_status_flush_at = Instant::now();
-                        write_pty_status_file(
-                            &status_path,
-                            PtyStatusPhase::Running,
+                        write_pty_status_file(PtyStatusFileArgs {
+                            path: &status_path,
+                            phase: PtyStatusPhase::Running,
                             owner,
                             job_id,
-                            &cmd,
-                            &saved_path,
-                            bytes_written,
-                            lines_written,
-                            None,
-                        );
+                            cmd: &cmd,
+                            saved_path: &saved_path,
+                            bytes: bytes_written,
+                            lines: lines_written,
+                            exit_code: None,
+                        });
                     }
                     if send_started_receipt
                         && !started_notice_sent
@@ -1430,20 +1485,20 @@ pub(super) fn spawn_interactive_bash_execution(
                         >= Duration::from_secs(2)
                     {
                         last_status_flush_at = Instant::now();
-                        write_pty_status_file(
-                            &status_path,
-                            PtyStatusPhase::Running,
+                        write_pty_status_file(PtyStatusFileArgs {
+                            path: &status_path,
+                            phase: PtyStatusPhase::Running,
                             owner,
                             job_id,
-                            &cmd,
-                            &saved_path,
-                            bytes_written,
-                            lines_written,
-                            None,
-                        );
+                            cmd: &cmd,
+                            saved_path: &saved_path,
+                            bytes: bytes_written,
+                            lines: lines_written,
+                            exit_code: None,
+                        });
                     }
-                    // 重要：某些平台/实现下，子进程退出后 reader.read() 可能长期返回 WouldBlock，
-                    // 导致 PTY “看起来还在跑”。这里定期 try_wait()，一旦观察到退出就收敛退出。
+                    //（1）重要：某些平台/实现下，子进程退出后 reader.read() 可能长期返回 WouldBlock，
+                    //（2）导致 PTY “看起来还在跑”。这里定期 try_wait()，一旦观察到退出就收敛退出。
                     if Instant::now().saturating_duration_since(last_try_wait_at)
                         >= Duration::from_millis(240)
                     {
@@ -1452,23 +1507,22 @@ pub(super) fn spawn_interactive_bash_execution(
                         if already_seen {
                             break;
                         }
-                        if let Ok(mut guard) = child.lock() {
-                            if let Some(ch) = guard.as_mut() {
-                                if let Ok(Some(status)) = ch.try_wait() {
-                                    if let Ok(mut g) = exit_code_seen.lock() {
-                                        *g = Some(status.exit_code() as i32);
-                                    }
-                                    break;
-                                }
+                        if let Ok(mut guard) = child.lock()
+                            && let Some(ch) = guard.as_mut()
+                            && let Ok(Some(status)) = ch.try_wait()
+                        {
+                            if let Ok(mut g) = exit_code_seen.lock() {
+                                *g = Some(status.exit_code() as i32);
                             }
+                            break;
                         }
                     }
-                    // nonblocking：没有数据时让出 CPU，并在 kill/timeout 后做 bounded 收尾。
+                    //（1）nonblocking：没有数据时让出 CPU，并在 kill/timeout 后做 bounded 收尾。
                     if user_aborted.load(Ordering::Relaxed) || timed_out.load(Ordering::Relaxed) {
                         if kill_grace_started_at.is_none() {
                             kill_grace_started_at = Some(Instant::now());
                         }
-                        // 若子进程已退出（try_wait），或 kill grace 超时，则退出 reader loop。
+                        //（1）若子进程已退出（try_wait），或 kill grace 超时，则退出 reader loop。
                         let exited = if let Ok(mut guard) = child.lock() {
                             if let Some(ch) = guard.as_mut() {
                                 ch.try_wait().ok().flatten().is_some()
@@ -1549,7 +1603,7 @@ pub(super) fn spawn_interactive_bash_execution(
             });
         }
 
-        // wait + 收尾
+        //（1）wait + 收尾
         let code_from_try_wait = exit_code_seen.lock().ok().and_then(|g| *g);
         let code = if let Some(code) = code_from_try_wait {
             if let Ok(mut guard) = child.lock() {
@@ -1558,7 +1612,7 @@ pub(super) fn spawn_interactive_bash_execution(
             code
         } else if let Ok(mut guard) = child.lock() {
             if let Some(mut ch) = guard.take() {
-                // 若已触发 kill/timeout：bounded wait，避免卡死在 .wait()
+                //（1）若已触发 kill/timeout：bounded wait，避免卡死在 .wait()
                 if user_aborted.load(Ordering::Relaxed) || timed_out.load(Ordering::Relaxed) {
                     let started_wait = Instant::now();
                     let mut status = None;
@@ -1587,9 +1641,9 @@ pub(super) fn spawn_interactive_bash_execution(
 
         let elapsed_ms = started.elapsed().as_millis();
         let user_exit = user_aborted.load(Ordering::Relaxed);
-        write_pty_status_file(
-            &status_path,
-            if timed_out.load(Ordering::Relaxed) {
+        write_pty_status_file(PtyStatusFileArgs {
+            path: &status_path,
+            phase: if timed_out.load(Ordering::Relaxed) {
                 PtyStatusPhase::Timeout
             } else if user_exit {
                 PtyStatusPhase::UserExit
@@ -1598,12 +1652,12 @@ pub(super) fn spawn_interactive_bash_execution(
             },
             owner,
             job_id,
-            &cmd,
-            &saved_path,
-            bytes_written,
-            lines_written,
-            Some(code),
-        );
+            cmd: &cmd,
+            saved_path: &saved_path,
+            bytes: bytes_written,
+            lines: lines_written,
+            exit_code: Some(code),
+        });
         let _ = tx.send(AsyncEvent::PtyJobDone {
             owner,
             job_id,
@@ -1674,7 +1728,7 @@ pub(super) fn handle_async_event_pty_ready(args: HandleAsyncEventPtyReadyArgs<'_
     let rows = rows.max(1);
     let was_empty = pty_tabs.is_empty();
     pty_handles.insert(job_id, ctrl_tx.clone());
-    pty_tabs.push(PtyUiState::new(
+    pty_tabs.push(PtyUiState::new(PtyUiStateNewArgs {
         ctrl_tx,
         cols,
         rows,
@@ -1683,11 +1737,11 @@ pub(super) fn handle_async_event_pty_ready(args: HandleAsyncEventPtyReadyArgs<'_
         cmd,
         saved_path,
         status_path,
-    ));
+    }));
     *pty_active_idx = pty_tabs.len().saturating_sub(1);
-    // 将 PTY 快捷操作提示放进聊天界面（system role）：
-    // - 简约态：严格一行（避免刷屏）
-    // - 详情态：按 “工具详情展开”(Alt+Tab) 才显示完整键位说明（UI 折叠负责）
+    //（1）将 PTY 快捷操作提示放进聊天界面（system role）：
+    //（2）简约态：严格一行（避免刷屏）
+    //（3）详情态：按 “工具详情展开”(Alt+Tab) 才显示完整键位说明（UI 折叠负责）
     let header = "♡ · 系统信息 · Terminal（PTY）已启动";
     let details = if was_empty {
         render_pty_help_prompt(pty_help_prompt_text, PTY_DOUBLE_ESC_MS)
@@ -1701,11 +1755,11 @@ pub(super) fn handle_async_event_pty_ready(args: HandleAsyncEventPtyReadyArgs<'_
     };
     core.push_system(&help);
     render_cache.invalidate(core.history.len().saturating_sub(1));
-    // AI 启动 PTY 时自动弹出 Terminal 视图；用户随时可按 Home 返回聊天。
+    //（1）AI 启动 PTY 时自动弹出 Terminal 视图；用户随时可按 Home 返回聊天。
     *pty_view = true;
     let batch = pty_done_batches.batch_mut(owner);
     batch.total_started = batch.total_started.saturating_add(1);
-    // 不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
+    //（1）不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
 }
 
 pub(super) fn handle_async_event_pty_output(
@@ -1820,10 +1874,10 @@ pub(super) fn handle_async_event_pty_job_done(args: HandleAsyncEventPtyJobDoneAr
             *pending_pty_snapshot = Some(snap);
         }
     }
-    // pty.kill 的任务：仅通过 kill 工具回执汇报，避免和 PTY Done 聚合回执冲突。
-    // 注意：kill 时已经从 total_started 中剔除，因此这里不再参与 completed/汇总计算。
+    //（1）pty.kill 的任务：仅通过 kill 工具回执汇报，避免和 PTY Done 聚合回执冲突。
+    //（2）注意：kill 时已经从 total_started 中剔除，因此这里不再参与 completed/汇总计算。
     if pty_done_batches.take_suppressed_done(owner, job_id) {
-        // 收尾：移除对应 tab；若不存在则忽略（可能已被 kill handler 先移除）。
+        //（1）收尾：移除对应 tab；若不存在则忽略（可能已被 kill handler 先移除）。
         if let Some(pos) = pty_tabs.iter().position(|s| s.job_id == job_id) {
             pty_tabs.remove(pos);
             if pty_tabs.is_empty() {
@@ -1835,9 +1889,9 @@ pub(super) fn handle_async_event_pty_job_done(args: HandleAsyncEventPtyJobDoneAr
         }
         return;
     }
-    // DONE 先“缓存聚合”，避免多 tab 结束时连发多条 Tool result。
+    //（1）DONE 先“缓存聚合”，避免多 tab 结束时连发多条 Tool result。
     let status = if timed_out {
-        // timeout 属于“结束方式”，不一定是错误：用 ok_ 前缀避免 UI 显示“执行失败：timeout”。
+        //（1）timeout 属于“结束方式”，不一定是错误：用 ok_ 前缀避免 UI 显示“执行失败：timeout”。
         "ok_timeout".to_string()
     } else if user_exit {
         "user_exit".to_string()
@@ -1889,7 +1943,7 @@ pub(super) fn handle_async_event_pty_job_done(args: HandleAsyncEventPtyJobDoneAr
         render_cache.invalidate(core.history.len().saturating_sub(1));
     }
 
-    // 收尾：移除对应 tab；若不存在则忽略（可能已被用户提前 Kill）。
+    //（1）收尾：移除对应 tab；若不存在则忽略（可能已被用户提前 Kill）。
     if let Some(pos) = pty_tabs.iter().position(|s| s.job_id == job_id) {
         pty_tabs.remove(pos);
         if pty_tabs.is_empty() {
@@ -1899,7 +1953,7 @@ pub(super) fn handle_async_event_pty_job_done(args: HandleAsyncEventPtyJobDoneAr
             *pty_active_idx = (*pty_active_idx).min(pty_tabs.len().saturating_sub(1));
         }
     }
-    // 不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
+    //（1）不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
 }
 
 pub(super) struct HandleAsyncEventPtyToolRequestArgs<'a> {
@@ -1967,10 +2021,11 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             )];
         }
         "kill" => {
-            // kill 回执：对模型侧要“可重试/可验证”，对 UI 侧要“可观察且不噪音”。
-            // 约定：
-            // - 成功：返回 kill 状态 + 对应任务的日志（尽量 inline；过大则导出并返回 saved/size/lines）。
-            // - 失败：只返回失败原因（例如 job_id 不存在）。
+            //（1）kill 回执：对模型侧要“可重试/可验证”，对 UI 侧要“可观察且不噪音”。
+            //（2）约定：
+            //（3）成功：返回 kill 状态 + 对应任务的日志（尽量 inline；
+            //（4）过大则导出并返回 saved/size/lines）。
+            //（5）失败：只返回失败原因（例如 job_id 不存在）。
             const KILL_INLINE_LOG_MAX_BYTES: u64 = 120_000;
             const KILL_INLINE_LOG_MAX_CHARS: usize = 6000;
             const KILL_EXPORT_THRESHOLD_BYTES: usize = crate::mcp::EXPORT_SAVE_THRESHOLD_BYTES;
@@ -2002,7 +2057,7 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             }
 
             fn export_if_needed(text: &str) -> Option<crate::mcp::ExportedOutputMeta> {
-                let bytes = text.as_bytes().len();
+                let bytes = text.len();
                 let lines = text.lines().count();
                 let chars = text.chars().count();
                 if bytes <= KILL_EXPORT_THRESHOLD_BYTES
@@ -2051,17 +2106,17 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
                     }
                 }
             }
-            // 兼容模型把 pid/job_id 放进 input 字符串（例如 input:"pid=7" / "7"）。
+            //（1）兼容模型把 pid/job_id 放进 input 字符串（例如 input:"pid=7" / "7"）。
             if job_ids.is_empty() {
                 for part in call.input.split(|c: char| !c.is_ascii_digit()) {
                     let t = part.trim();
                     if t.is_empty() {
                         continue;
                     }
-                    if let Ok(n) = t.parse::<u64>() {
-                        if n > 0 {
-                            job_ids.push(n);
-                        }
+                    if let Ok(n) = t.parse::<u64>()
+                        && n > 0
+                    {
+                        job_ids.push(n);
                     }
                 }
             }
@@ -2083,7 +2138,7 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             lines_out.push(format!("pty.kill jobs={}", job_ids.len()));
             for job_id in &job_ids {
                 let mut hit = false;
-                // 捕获任务信息（在移除前），用于 kill 回执里返回“被 kill 的终端任务是谁”。
+                //（1）捕获任务信息（在移除前），用于 kill 回执里返回“被 kill 的终端任务是谁”。
                 let info = pty_tabs.iter().find(|s| &s.job_id == job_id).map(|s| {
                     let elapsed = now.saturating_duration_since(s.started_at).as_secs();
                     let os_pid = s
@@ -2107,8 +2162,8 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
                 }
                 if hit {
                     found = found.saturating_add(1);
-                    // 重要：抑制随后到来的 PtyJobDone 的 DONE 聚合回执（避免与 kill 回执冲突）。
-                    // 同时从 total_started 中剔除，保证剩余任务还能正确触发 DONE 汇总。
+                    //（1）重要：抑制随后到来的 PtyJobDone 的 DONE 聚合回执（避免与 kill 回执冲突）。
+                    //（2）同时从 total_started 中剔除，保证剩余任务还能正确触发 DONE 汇总。
                     pty_done_batches.suppress_done_for_killed_job(owner, *job_id);
                 }
                 if let Some((elapsed, os_pid, pgrp, cmd, log_path)) = info {
@@ -2141,7 +2196,7 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             } else {
                 *pty_active_idx = (*pty_active_idx).min(pty_tabs.len().saturating_sub(1));
             }
-            // 不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
+            //（1）不向模型注入 PTY 索引：模型仅通过 PTY Done / PTY 审计获知后台状态。
             lines_out.push(format!(
                 "summary: killed={found} failed={failed} total={}",
                 job_ids.len()
@@ -2177,12 +2232,12 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             }
         }
         "input" => {
-            // 向指定 PTY 任务写入 stdin（用于继续自动化：确认/下一条命令等）。
+            //（1）向指定 PTY 任务写入 stdin（用于继续自动化：确认/下一条命令等）。
             //
-            // 约定：
-            // - 需要显式 pid/pids（或 job_id/job_ids），避免误发到错误终端。
-            // - payload 优先取 commands（逐条追加换行）；其次 content；最后 input。
-            // - 默认不强制切换到 Terminal 视图（由用户决定是否打开观察）。
+            //（1）约定：
+            //（2）需要显式 pid/pids（或 job_id/job_ids），避免误发到错误终端。
+            //（3）payload 优先取 commands（逐条追加换行）；其次 content；最后 input。
+            //（4）默认不强制切换到 Terminal 视图（由用户决定是否打开观察）。
             const SEND_LOG_TAIL_BYTES: u64 = 48_000;
             const SEND_INLINE_LOG_MAX_CHARS: usize = 2400;
             const SEND_EXPORT_THRESHOLD_BYTES: usize = crate::mcp::EXPORT_SAVE_THRESHOLD_BYTES;
@@ -2201,7 +2256,7 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             }
 
             fn export_if_needed(text: &str) -> Option<crate::mcp::ExportedOutputMeta> {
-                let bytes = text.as_bytes().len();
+                let bytes = text.len();
                 let lines = text.lines().count();
                 let chars = text.chars().count();
                 if bytes <= SEND_EXPORT_THRESHOLD_BYTES
@@ -2249,17 +2304,17 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
                     }
                 }
             }
-            // 兼容模型把 pid/job_id 放进 input 字符串（例如 input:"pid=7" / "7"）。
+            //（1）兼容模型把 pid/job_id 放进 input 字符串（例如 input:"pid=7" / "7"）。
             if job_ids.is_empty() {
                 for part in call.input.split(|c: char| !c.is_ascii_digit()) {
                     let t = part.trim();
                     if t.is_empty() {
                         continue;
                     }
-                    if let Ok(n) = t.parse::<u64>() {
-                        if n > 0 {
-                            job_ids.push(n);
-                        }
+                    if let Ok(n) = t.parse::<u64>()
+                        && n > 0
+                    {
+                        job_ids.push(n);
                     }
                 }
             }
@@ -2277,7 +2332,7 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             }
 
             let payload = if let Some(cmds) = call.commands.as_ref().filter(|v| !v.is_empty()) {
-                // commands：逐条发送，默认追加换行，方便“像输入命令一样”执行。
+                //（1）commands：逐条发送，默认追加换行，方便“像输入命令一样”执行。
                 let mut joined = cmds.join("\n");
                 if !joined.ends_with('\n') {
                     joined.push('\n');
@@ -2310,7 +2365,11 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             let mut sent = 0usize;
             let mut failed = 0usize;
             let mut lines_out: Vec<String> = Vec::new();
-            lines_out.push(format!("pty.input jobs={} bytes={}", job_ids.len(), bytes_len));
+            lines_out.push(format!(
+                "pty.input jobs={} bytes={}",
+                job_ids.len(),
+                bytes_len
+            ));
             for job_id in &job_ids {
                 let info = pty_tabs.iter().find(|s| &s.job_id == job_id).map(|s| {
                     let elapsed = now.saturating_duration_since(s.started_at).as_secs();
@@ -2384,11 +2443,11 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             }
         }
         "run" => {
-            // 统一策略：PTY 任务默认保持会话（不自动退出），避免“跑完就关”导致输出来不及观察/复用环境。
-            // 若用户需要结束任务：用 pty.kill(pid) 或在 Terminal 视图 350ms 内双击 Esc。
+            //（1）统一策略：PTY 任务默认保持会话（不自动退出），避免“跑完就关”导致输出来不及观察/复用环境。
+            //（2）若用户需要结束任务：用 pty.kill(pid) 或在 Terminal 视图 350ms 内双击 Esc。
             let keep_session = true;
-            // 注意：此处是在事件循环中“快速回执”，新 PTY 的 PtyReady 事件尚未被消费，
-            // pty_tabs 里的 running 数量可能还未包含本次启动的任务；因此这里用估算值。
+            //（1）注意：此处是在事件循环中“快速回执”，新 PTY 的 PtyReady 事件尚未被消费，
+            //（2）pty_tabs 里的 running 数量可能还未包含本次启动的任务；因此这里用估算值。
             let running_before = pty_tabs.iter().filter(|s| s.owner == owner).count();
             let mut cmds: Vec<String> = Vec::new();
             if let Some(list) = call.commands.clone() {
@@ -2416,12 +2475,12 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
                 let _ = tx.send(AsyncEvent::ToolStreamEnd { outcome, sys_msg });
                 return;
             }
-            // 单次 pty.run 最多接收 3 条命令：避免模型一次性启动过多后台任务。
+            //（1）单次 pty.run 最多接收 3 条命令：避免模型一次性启动过多后台任务。
             let max = 3usize;
             let total = cmds.len();
             cmds.truncate(max);
-            // 背景 PTY 任务上限：避免 UI/模型陷入“多任务风暴”。
-            // 运行时允许更多（用于意外情况/用户手动启动多个），但提示词仍要求模型最多使用 3 个。
+            //（1）背景 PTY 任务上限：避免 UI/模型陷入“多任务风暴”。
+            //（2）运行时允许更多（用于意外情况/用户手动启动多个），但提示词仍要求模型最多使用 3 个。
             const PTY_TASKS_MAX: usize = 10;
             let running_now = pty_tabs.len();
             if running_now + cmds.len() > PTY_TASKS_MAX {
@@ -2457,8 +2516,8 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
                     brief: Some("pty.run".to_string()),
                     interactive: Some(true),
                     cwd: call.cwd.clone(),
-                    // 统一策略：PTY 默认 30min 自动超时；避免后台会话永久占用。
-                    // 结束任务也可用 Terminal 视图双击 Esc / pty.kill(pid)。
+                    //（1）统一策略：PTY 默认 30min 自动超时；避免后台会话永久占用。
+                    //（2）结束任务也可用 Terminal 视图双击 Esc / pty.kill(pid)。
                     timeout_secs: Some(PTY_AUTO_TIMEOUT_SECS),
                     timeout_ms: None,
                     ..ToolCall::default()
@@ -2473,8 +2532,8 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
                 );
                 spawns.push(spawn);
             }
-            // 延迟约 2s：给后台任务一点时间输出头部日志，便于模型看到“已启动并在跑”的证据。
-            // 不能阻塞 UI 线程：用后台线程在 2s 后发送 ToolStreamEnd。
+            //（1）延迟约 2s：给后台任务一点时间输出头部日志，便于模型看到“已启动并在跑”的证据。
+            //（2）不能阻塞 UI 线程：用后台线程在 2s 后发送 ToolStreamEnd。
             const PTY_RUN_SNAPSHOT_DELAY_MS: u64 = 2000;
             const PTY_RUN_LOG_TAIL_BYTES: u64 = 48_000;
             const PTY_RUN_INLINE_LOG_MAX_CHARS: usize = 3200;
@@ -2493,7 +2552,7 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             }
 
             fn export_if_needed(text: &str) -> Option<crate::mcp::ExportedOutputMeta> {
-                let bytes = text.as_bytes().len();
+                let bytes = text.len();
                 let lines = text.lines().count();
                 let chars = text.chars().count();
                 if bytes <= PTY_RUN_EXPORT_THRESHOLD_BYTES
@@ -2710,17 +2769,31 @@ pub(super) fn apply_touch_drag_to_pty_view(
     false
 }
 
-pub(super) fn try_show_pty_view_on_home(
-    key: crossterm::event::KeyEvent,
-    ctrl: bool,
-    alt: bool,
-    pty_view: &mut bool,
-    pty_tabs: &[PtyUiState],
-    pty_focus: &mut PtyFocus,
-    selected_msg_idx: Option<usize>,
-    send_queue_closed: bool,
-    menu_open: bool,
-) -> bool {
+pub(super) struct TryShowPtyViewOnHomeArgs<'a> {
+    pub(super) key: crossterm::event::KeyEvent,
+    pub(super) ctrl: bool,
+    pub(super) alt: bool,
+    pub(super) pty_view: &'a mut bool,
+    pub(super) pty_tabs: &'a [PtyUiState],
+    pub(super) pty_focus: &'a mut PtyFocus,
+    pub(super) selected_msg_idx: Option<usize>,
+    pub(super) send_queue_closed: bool,
+    pub(super) menu_open: bool,
+}
+
+pub(super) fn try_show_pty_view_on_home(args: TryShowPtyViewOnHomeArgs<'_>) -> bool {
+    let TryShowPtyViewOnHomeArgs {
+        key,
+        ctrl,
+        alt,
+        pty_view,
+        pty_tabs,
+        pty_focus,
+        selected_msg_idx,
+        send_queue_closed,
+        menu_open,
+    } = args;
+
     if *pty_view
         || pty_tabs.is_empty()
         || !matches!(key.code, KeyCode::Home)
@@ -2755,7 +2828,7 @@ pub(super) struct HandlePtyViewKeyArgs<'a> {
     pub(super) last_esc_at: &'a mut Option<Instant>,
     pub(super) sys_log: &'a mut VecDeque<String>,
     pub(super) sys_log_limit: usize,
-    // 状态栏右侧动作提示（短暂显示）：仅用于人类观测。
+    //（1）状态栏右侧动作提示（短暂显示）：仅用于人类观测。
     pub(super) action_hint: &'a mut Option<(Instant, String)>,
 }
 
@@ -2787,34 +2860,33 @@ pub(super) fn handle_pty_view_key(args: HandlePtyViewKeyArgs<'_>) -> bool {
     if !matches!(key.code, KeyCode::Esc) {
         *last_esc_at = None;
     }
-    // PgUp/PgDn：仅在“PTY 焦点”下切换不同终端任务。
-    // 焦点切换必须由用户手动点击（避免 PgUp/PgDn 抢走聊天区的“选消息”语义）。
+    //（1）PgUp/PgDn：仅在“PTY 焦点”下切换不同终端任务。
+    //（2）焦点切换必须由用户手动点击（避免 PgUp/PgDn 抢走聊天区的“选消息”语义）。
     if !ctrl
         && !alt
         && (matches!(key.code, KeyCode::PageUp) || matches!(key.code, KeyCode::PageDown))
+        && matches!(*pty_focus, PtyFocus::Terminal)
     {
-        if matches!(*pty_focus, PtyFocus::Terminal) {
-            let n = pty_tabs.len().max(1);
-            let mut idx = (*pty_active_idx).min(n.saturating_sub(1));
-            if matches!(key.code, KeyCode::PageDown) {
-                idx = (idx + 1) % n;
-            } else {
-                idx = (idx + n - 1) % n;
-            }
-            *pty_active_idx = idx;
-            *action_hint = Some((now, format!("PTY: Tab {}/{}", idx.saturating_add(1), n)));
-            *last_esc_at = None;
-            runlog_event(
-                "INFO",
-                "pty.ui.tab",
-                json!({"active_idx":pty_active_idx,"tabs":n}),
-            );
-            return true;
+        let n = pty_tabs.len().max(1);
+        let mut idx = (*pty_active_idx).min(n.saturating_sub(1));
+        if matches!(key.code, KeyCode::PageDown) {
+            idx = (idx + 1) % n;
+        } else {
+            idx = (idx + n - 1) % n;
         }
-        // 焦点在聊天区：不拦截，让 core.rs 的 PgUp/PgDn 消息选择逻辑生效。
+        *pty_active_idx = idx;
+        *action_hint = Some((now, format!("PTY: Tab {}/{}", idx.saturating_add(1), n)));
+        *last_esc_at = None;
+        runlog_event(
+            "INFO",
+            "pty.ui.tab",
+            json!({"active_idx":pty_active_idx,"tabs":n}),
+        );
+        return true;
+        //（1）焦点在聊天区：不拦截，让 core.rs 的 PgUp/PgDn 消息选择逻辑生效。
     }
-    // 终端内程序常用 Esc（vim/less/cancel 等），因此默认透传 Esc；
-    // 若用户快速连按两次 Esc，则将第二次视为“结束当前终端任务”（终止 PTY）。
+    //（1）终端内程序常用 Esc（vim/less/cancel 等），因此默认透传 Esc；
+    //（2）若用户快速连按两次 Esc，则将第二次视为“结束当前终端任务”（终止 PTY）。
     if matches!(*pty_focus, PtyFocus::Terminal) && !ctrl && !alt && matches!(key.code, KeyCode::Esc)
     {
         if let Some(t0) = *last_esc_at
@@ -2836,7 +2908,7 @@ pub(super) fn handle_pty_view_key(args: HandlePtyViewKeyArgs<'_>) -> bool {
             } else {
                 *pty_active_idx = (*pty_active_idx).min(pty_tabs.len().saturating_sub(1));
             }
-            // 不向模型注入 PTY 索引：避免“启动/终止 PTY”造成额外上下文噪声。
+            //（1）不向模型注入 PTY 索引：避免“启动/终止 PTY”造成额外上下文噪声。
             push_sys_log(
                 sys_log,
                 sys_log_limit,
@@ -2870,7 +2942,7 @@ pub(super) fn handle_pty_view_key(args: HandlePtyViewKeyArgs<'_>) -> bool {
         }
         *last_esc_at = Some(now);
     }
-    // Home：隐藏终端视图（后台继续运行）。
+    //（1）Home：隐藏终端视图（后台继续运行）。
     if !ctrl && !alt && matches!(key.code, KeyCode::Home) {
         *pty_view = false;
         *last_esc_at = None;
@@ -2878,9 +2950,9 @@ pub(super) fn handle_pty_view_key(args: HandlePtyViewKeyArgs<'_>) -> bool {
         runlog_event("INFO", "pty.ui.home", json!({"action":"hide"}));
         return true;
     }
-    // End/Ins：仅在“终端焦点”时用于快速滚动。
-    // - End：回到底部（实时输出）
-    // - Ins：跳到最前（最大回看）
+    //（1）End/Ins：仅在“终端焦点”时用于快速滚动。
+    //（2）End：回到底部（实时输出）
+    //（3）Ins：跳到最前（最大回看）
     if matches!(*pty_focus, PtyFocus::Terminal) && !ctrl && !alt {
         if matches!(key.code, KeyCode::End) {
             let active = (*pty_active_idx).min(pty_tabs.len().saturating_sub(1));
@@ -2912,8 +2984,8 @@ pub(super) fn handle_pty_view_key(args: HandlePtyViewKeyArgs<'_>) -> bool {
             };
             state.last_user_snapshot = Some(snap.clone());
 
-            // Alt+↑：把快照“暂存到聊天输入框”，由用户决定是否发送给 AI。
-            // 若上一次快照仍未发送且仍在输入框中，则先移除旧快照块，避免堆叠。
+            //（1）Alt+↑：把快照“暂存到聊天输入框”，由用户决定是否发送给 AI。
+            //（2）若上一次快照仍未发送且仍在输入框中，则先移除旧快照块，避免堆叠。
             if let Some(old) = pending_pty_snapshot.take()
                 && let Some(pos) = input.find(old.placeholder.as_str())
             {
@@ -2942,11 +3014,11 @@ pub(super) fn handle_pty_view_key(args: HandlePtyViewKeyArgs<'_>) -> bool {
         }
         return true;
     }
-    // Chat 焦点时：不拦截其它按键，让聊天滚动/其它快捷键继续工作。
+    //（1）Chat 焦点时：不拦截其它按键，让聊天滚动/其它快捷键继续工作。
     if matches!(*pty_focus, PtyFocus::Chat) {
-        // 终端面板展开时，输入框仍可见：允许用户在输入框里编辑文本，
-        // 并由 core.rs 决定“Enter 发送到 AI 还是发送到 Terminal”。
-        // 因此这里不再吞掉会修改 input 的按键。
+        //（1）终端面板展开时，输入框仍可见：允许用户在输入框里编辑文本，
+        //（2）并由 core.rs 决定“Enter 发送到 AI 还是发送到 Terminal”。
+        //（3）因此这里不再吞掉会修改 input 的按键。
         return false;
     }
 

@@ -768,7 +768,6 @@ fn settings_field_hint(section: SettingsSection, kind: SettingsFieldKind) -> &'s
             SettingsFieldKind::DateKbLimit => "Diary trigger threshold (KB, 0=off)",
             SettingsFieldKind::HeartbeatMinutes => "Heartbeat interval (min, 0=off)",
             SettingsFieldKind::SseEnabled => "Toggle SSE",
-            SettingsFieldKind::ChatTarget => "Switch tab (Matrix/Dog/Memory)",
             SettingsFieldKind::ExecPermission => "Tool execution permission (safe/full)",
             SettingsFieldKind::DogPrompt => "Edit DOG prompt",
             SettingsFieldKind::MainPrompt => "Edit MAIN prompt",
@@ -1830,7 +1829,6 @@ fn load_system_config() -> (SystemConfig, Option<String>, PathBuf) {
     if cfg.welcome_shortcuts_prompt_path.trim().is_empty() {
         cfg.welcome_shortcuts_prompt_path = "config/Documents/Systemwelcome.txt".to_string();
     }
-    cfg.chat_target = normalize_chat_target_value(&cfg.chat_target);
     cfg = normalize_system_config_paths(cfg, &path_buf);
     (cfg, err, path_buf)
 }
@@ -1868,28 +1866,10 @@ fn normalize_common_api_fields(
     }
 }
 
-fn normalize_chat_target_value(raw: &str) -> String {
-    let lower = raw.trim().to_ascii_lowercase();
-    match lower.as_str() {
-        "main" | "m" => "main".to_string(),
-        "dog" | "sub" | "s" => "dog".to_string(),
-        "memory" | "mem" => "memory".to_string(),
-        _ => "main".to_string(),
-    }
-}
-
 fn normalize_heartbeat_minutes(value: usize) -> usize {
     match value {
         0 | 5 | 10 | 30 | 60 => value,
         _ => 5,
-    }
-}
-
-fn parse_chat_target(raw: &str) -> MindKind {
-    match normalize_chat_target_value(raw).as_str() {
-        "main" => MindKind::Main,
-        "memory" => MindKind::Memory,
-        _ => MindKind::Sub,
     }
 }
 
@@ -2121,14 +2101,6 @@ fn record_request_in_tokens(
         .saturating_add(token_totals.total_out_tokens);
     token_totals.context_tokens = context_usage.tokens() as u64;
     let _ = store_token_totals(token_total_path, token_totals);
-}
-
-fn format_chat_target(raw: &str) -> String {
-    match normalize_chat_target_value(raw).as_str() {
-        "main" => "MAIN".to_string(),
-        "memory" => "MEMORY".to_string(),
-        _ => "DOG".to_string(),
-    }
 }
 
 fn store_prompt_file(path: &Path, text: &str) -> anyhow::Result<()> {
@@ -2911,7 +2883,6 @@ enum SettingsFieldKind {
     DateKbLimit,
     HeartbeatMinutes,
     SseEnabled,
-    ChatTarget,
     ExecPermission,
     DogPrompt,
     MainPrompt,
@@ -3226,9 +3197,8 @@ fn drain_input_for_send(args: DrainInputForSendArgs<'_>) -> DrainedSendText {
     }
 }
 
-fn sync_system_toggles(sys_cfg: &SystemConfig, sse_enabled: &mut bool, chat_target: &mut MindKind) {
+fn sync_system_toggles(sys_cfg: &SystemConfig, sse_enabled: &mut bool) {
     *sse_enabled = sys_cfg.sse_enabled;
-    *chat_target = parse_chat_target(&sys_cfg.chat_target);
 }
 
 struct CommitSettingsInputArgs<'a> {
@@ -3261,7 +3231,6 @@ struct CommitSettingsInputArgs<'a> {
     context_prompts: &'a mut ContextPromptConfig,
     context_prompt_path: &'a Path,
     sse_enabled: &'a mut bool,
-    chat_target: &'a mut MindKind,
 }
 
 fn commit_settings_input(args: CommitSettingsInputArgs<'_>) {
@@ -3295,7 +3264,6 @@ fn commit_settings_input(args: CommitSettingsInputArgs<'_>) {
         context_prompts,
         context_prompt_path,
         sse_enabled,
-        chat_target,
     } = args;
 
     apply_settings_with_notice(ApplySettingsWithNoticeArgs {
@@ -3328,7 +3296,7 @@ fn commit_settings_input(args: CommitSettingsInputArgs<'_>) {
         context_prompts,
         context_prompt_path,
     });
-    sync_system_toggles(sys_cfg, sse_enabled, chat_target);
+    sync_system_toggles(sys_cfg, sse_enabled);
     settings.focus = SettingsFocus::Fields;
     reset_settings_edit(settings);
 }
@@ -3745,12 +3713,6 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 api_kind: None,
             },
             SettingsFieldSpec {
-                label: "Chat target",
-                value: format_chat_target(&sys_cfg.chat_target),
-                kind: SettingsFieldKind::ChatTarget,
-                api_kind: None,
-            },
-            SettingsFieldSpec {
                 label: "Exec perm",
                 value: if sys_cfg.tool_full_access {
                     "Full".to_string()
@@ -3912,7 +3874,6 @@ fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
                 "off".to_string()
             }
         }
-        SettingsFieldKind::ChatTarget => sys_cfg.chat_target.clone(),
         SettingsFieldKind::ExecPermission => {
             if sys_cfg.tool_full_access {
                 "full".to_string()
@@ -4415,19 +4376,6 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
                 }
             };
             sys_cfg.tool_full_access = next;
-            store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
-        }
-        SettingsFieldKind::ChatTarget => {
-            let next = if trimmed.is_empty() {
-                match normalize_chat_target_value(&sys_cfg.chat_target).as_str() {
-                    "main" => "dog".to_string(),
-                    "dog" => "memory".to_string(),
-                    _ => "main".to_string(),
-                }
-            } else {
-                normalize_chat_target_value(trimmed)
-            };
-            sys_cfg.chat_target = next;
             store_config_file(sys_cfg_path, sys_cfg).map_err(|e| e.to_string())?;
         }
         SettingsFieldKind::DogPrompt => {
@@ -7215,8 +7163,10 @@ fn run_loop(
     let mut active_cancel: Option<Arc<AtomicBool>> = None;
     let mut active_request_in_tokens: Option<u64> = None;
     let mut spinner_tick: usize = 0;
-    let mut chat_target = parse_chat_target(&sys_cfg.chat_target);
-    let mut active_kind = chat_target;
+    //（1）启动默认 Tab：Matrix（Main）。
+    //（2）Tab 仅影响“下一条消息发给哪个 API”，不做持久化（避免把 UI 状态写进系统配置）。
+    let mut chat_target = MindKind::Main;
+    let mut active_kind = MindKind::Main;
     let run_started_at = Instant::now();
     let mut last_run_secs: u64 = 0;
     let mut heartbeat_minutes_cache = sys_cfg.heartbeat_minutes;
@@ -8218,7 +8168,7 @@ fn run_loop(
             && matches!(help_ui, HelpUiState::Closed)
             && !is_pty_panel_active(screen, pty_view, pty_tabs.as_slice())
         {
-            filter_commands_for_input(&input, sse_enabled, chat_target)
+            filter_commands_for_input(&input, sse_enabled)
         } else {
             Vec::new()
         };
@@ -8394,9 +8344,7 @@ fn run_loop(
                             | SettingsFieldKind::ReasoningEffort => {
                                 format!("{} (Enter)", settings_field_hint(settings_section, kind))
                             }
-                            SettingsFieldKind::SseEnabled
-                            | SettingsFieldKind::ChatTarget
-                            | SettingsFieldKind::ExecPermission => {
+                            SettingsFieldKind::SseEnabled | SettingsFieldKind::ExecPermission => {
                                 format!("{} (Enter)", settings_field_hint(settings_section, kind))
                             }
                             SettingsFieldKind::DogPrompt
@@ -9409,13 +9357,6 @@ fn run_loop(
                                 };
                                 if chat_target != new_target {
                                     chat_target = new_target;
-                                    sys_cfg.chat_target = match new_target {
-                                        MindKind::Main => "main",
-                                        MindKind::Sub => "dog",
-                                        MindKind::Memory => "memory",
-                                    }
-                                    .to_string();
-                                    let _ = store_config_file(sys_cfg_path.as_path(), &sys_cfg);
                                     //（1）切 tab：不改变 active_kind，不重置上下文；只影响“下一条用户消息”发给谁。
                                     selected_msg_idx = None;
                                     follow_bottom = true;
@@ -9635,13 +9576,6 @@ fn run_loop(
                     };
                     if next != chat_target {
                         chat_target = next;
-                        sys_cfg.chat_target = match next {
-                            MindKind::Main => "main",
-                            MindKind::Sub => "dog",
-                            MindKind::Memory => "memory",
-                        }
-                        .to_string();
-                        let _ = store_config_file(sys_cfg_path.as_path(), &sys_cfg);
                         selected_msg_idx = None;
                         follow_bottom = true;
                         scroll = u16::MAX;
@@ -9851,21 +9785,11 @@ fn run_loop(
                                     if matches!(
                                         spec.kind,
                                         SettingsFieldKind::SseEnabled
-                                            | SettingsFieldKind::ChatTarget
                                             | SettingsFieldKind::ExecPermission
                                     ) {
                                         let value = match spec.kind {
                                             SettingsFieldKind::SseEnabled => {
                                                 if sys_cfg.sse_enabled { "off" } else { "on" }
-                                            }
-                                            SettingsFieldKind::ChatTarget => {
-                                                if normalize_chat_target_value(&sys_cfg.chat_target)
-                                                    == "main"
-                                                {
-                                                    "dog"
-                                                } else {
-                                                    "main"
-                                                }
                                             }
                                             SettingsFieldKind::ExecPermission => {
                                                 if sys_cfg.tool_full_access {
@@ -9906,16 +9830,7 @@ fn run_loop(
                                             context_prompts: &mut context_prompts,
                                             context_prompt_path: &context_prompt_path,
                                         });
-                                        sync_system_toggles(
-                                            &sys_cfg,
-                                            &mut sse_enabled,
-                                            &mut chat_target,
-                                        );
-                                        if matches!(spec.kind, SettingsFieldKind::ChatTarget)
-                                            && is_idle_like(mode)
-                                        {
-                                            active_kind = chat_target;
-                                        }
+                                        sync_system_toggles(&sys_cfg, &mut sse_enabled);
                                         continue;
                                     }
 
@@ -9994,7 +9909,6 @@ fn run_loop(
                                         context_prompts: &mut context_prompts,
                                         context_prompt_path: &context_prompt_path,
                                         sse_enabled: &mut sse_enabled,
-                                        chat_target: &mut chat_target,
                                     });
                                 }
                                 KeyCode::Enter => {
@@ -10029,7 +9943,6 @@ fn run_loop(
                                         context_prompts: &mut context_prompts,
                                         context_prompt_path: &context_prompt_path,
                                         sse_enabled: &mut sse_enabled,
-                                        chat_target: &mut chat_target,
                                     });
                                 }
                                 KeyCode::Backspace => {
@@ -10730,7 +10643,7 @@ fn run_loop(
                 }
 
                 if is_idle_like(mode) && menu_open && !ctrl {
-                    let items_now = filter_commands_for_input(&input, sse_enabled, chat_target);
+                    let items_now = filter_commands_for_input(&input, sse_enabled);
                     if !items_now.is_empty() && command_menu_selected >= items_now.len() {
                         command_menu_selected = items_now.len().saturating_sub(1);
                     }
@@ -16532,7 +16445,6 @@ mod types {
 }
 
 mod commands {
-    use super::MindKind;
     #[derive(Debug, Clone, Copy)]
     pub struct CommandSpec {
         pub cmd: &'static str,
@@ -16550,11 +16462,7 @@ mod commands {
         !after.chars().any(|c| c.is_whitespace())
     }
 
-    pub fn filter_commands_for_input(
-        input: &str,
-        sse_enabled: bool,
-        _chat_target: MindKind,
-    ) -> Vec<CommandSpec> {
+    pub fn filter_commands_for_input(input: &str, sse_enabled: bool) -> Vec<CommandSpec> {
         if !should_show_command_menu(input) {
             return Vec::new();
         }
@@ -16716,8 +16624,6 @@ mod config {
         pub welcome_shortcuts_prompt_path: String,
         #[serde(default)]
         pub pty_audit_enabled: bool,
-        #[serde(default)]
-        pub chat_target: String,
     }
 
     fn default_true() -> bool {
@@ -16942,7 +16848,6 @@ mod config {
                 pty_help_prompt_path: default_pty_help_prompt_path(),
                 welcome_shortcuts_prompt_path: default_welcome_shortcuts_prompt_path(),
                 pty_audit_enabled: false,
-                chat_target: "main".to_string(),
             }
         }
     }

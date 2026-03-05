@@ -1161,7 +1161,7 @@ fn build_cursor_map(text: &str, width: usize) -> Vec<(usize, usize, usize)> {
             map.push((idx.saturating_add(ch.len_utf8()), x, y));
             continue;
         }
-        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
         if x.saturating_add(w) > width {
             y = y.saturating_add(1);
             x = 0;
@@ -1218,6 +1218,53 @@ fn move_prompt_cursor_vertical(text: &str, width: usize, cursor: usize, delta: i
         cy.saturating_add(delta as usize)
     };
     cursor_index_for_xy(&map, cx, target_y)
+}
+
+fn cursor_for_click_scrolled(
+    text: &str,
+    width: usize,
+    scroll_y: usize,
+    click_x: usize,
+    click_y_visible: usize,
+) -> usize {
+    if text.is_empty() || width == 0 {
+        return 0;
+    }
+    let map = build_cursor_map(text, width);
+    let target_y = scroll_y.saturating_add(click_y_visible);
+    cursor_index_for_xy(&map, click_x.min(width), target_y)
+}
+
+fn prompt_max_scroll_y(text: &str, width: usize, height: usize) -> usize {
+    if text.is_empty() || width == 0 || height == 0 {
+        return 0;
+    }
+    let map = build_cursor_map(text, width);
+    let last_y = map.last().map(|(_, _, y)| *y).unwrap_or(0);
+    let total_lines = last_y.saturating_add(1);
+    total_lines.saturating_sub(height)
+}
+
+fn ensure_prompt_cursor_visible(
+    text: &str,
+    width: usize,
+    height: usize,
+    cursor: usize,
+    scroll_y: &mut usize,
+) {
+    if text.is_empty() || width == 0 || height == 0 {
+        *scroll_y = 0;
+        return;
+    }
+    let map = build_cursor_map(text, width);
+    let (_cx, cy) = cursor_xy_from_map(&map, cursor.min(text.len()));
+    if cy < *scroll_y {
+        *scroll_y = cy;
+    } else if cy >= (*scroll_y).saturating_add(height) {
+        *scroll_y = cy.saturating_sub(height.saturating_sub(1));
+    }
+    let max_scroll = prompt_max_scroll_y(text, width, height);
+    *scroll_y = (*scroll_y).min(max_scroll);
 }
 
 fn input_cursor_for_click(
@@ -2872,6 +2919,7 @@ enum ApiConfigKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum SettingsFieldKind {
     Static,
     Provider,
@@ -2923,6 +2971,8 @@ struct SettingsState {
     edit_buffer: String,
     edit_original: String,
     edit_cursor: usize,
+    // Prompt editor viewport (0-based wrapped line index).
+    edit_scroll_y: usize,
     confirm: Option<ConfirmDialogState>,
     notice: Option<(Instant, String)>,
 }
@@ -2940,6 +2990,7 @@ impl SettingsState {
             edit_buffer: String::new(),
             edit_original: String::new(),
             edit_cursor: 0,
+            edit_scroll_y: 0,
             confirm: None,
             notice: None,
         }
@@ -2957,6 +3008,7 @@ fn reset_settings_edit(settings: &mut SettingsState) {
     settings.edit_buffer.clear();
     settings.edit_original.clear();
     settings.edit_cursor = 0;
+    settings.edit_scroll_y = 0;
     settings.confirm = None;
 }
 
@@ -3502,6 +3554,7 @@ fn parse_toggle_input(value: &str) -> Option<bool> {
     }
 }
 
+#[allow(dead_code)]
 fn summarize_prompt(text: &str) -> String {
     let lines = text.lines().count().max(1);
     let chars = text.chars().count();
@@ -3514,9 +3567,6 @@ struct BuildSettingsFieldsArgs<'a> {
     main_cfg: &'a MainApiConfig,
     memory_cfg: &'a MainApiConfig,
     sys_cfg: &'a SystemConfig,
-    dog_prompt_text: &'a str,
-    main_prompt_text: &'a str,
-    context_prompts: &'a ContextPromptConfig,
 }
 
 fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsFieldSpec> {
@@ -3526,9 +3576,6 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
         main_cfg,
         memory_cfg,
         sys_cfg,
-        dog_prompt_text,
-        main_prompt_text,
-        context_prompts,
     } = args;
     match section {
         SettingsSection::Api => {
@@ -3845,7 +3892,6 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
         },
     }
 }
-
 struct FieldRawValueArgs<'a> {
     kind: SettingsFieldKind,
     section: SettingsSection,
@@ -8387,9 +8433,6 @@ fn run_loop(
             main_cfg: &main_cfg,
             memory_cfg: &memory_cfg,
             sys_cfg: &sys_cfg,
-            dog_prompt_text: &dog_state.prompt,
-            main_prompt_text: &main_prompt_text,
-            context_prompts: &context_prompts,
         });
         if !settings_fields.is_empty() && settings.field_index >= settings_fields.len() {
             settings.field_index = settings_fields.len().saturating_sub(1);
@@ -9093,7 +9136,7 @@ ui::draw_header(
                         .collect();
                     let visible_selected = settings.field_index.saturating_sub(scroll);
                     let prompt_editor = if matches!(settings.focus, SettingsFocus::Prompt) {
-                        Some((settings.edit_buffer.as_str(), settings.edit_cursor))
+                        Some((settings.edit_buffer.as_str(), settings.edit_cursor, settings.edit_scroll_y))
                     } else {
                         None
                     };
@@ -9396,14 +9439,33 @@ ui::draw_header(
                                 command_menu_suppress = false;
                             }
                         } else if matches!(screen, Screen::Settings) {
-                            let delta: usize = 1;
-                            if up {
-                                settings.field_index = settings.field_index.saturating_sub(delta);
+                            // 提示词编辑器：滚轮只滚动编辑器视口，不滚动设置字段列表。
+                            if settings.confirm.is_none()
+                                && matches!(settings.focus, SettingsFocus::Prompt)
+                            {
+                                if !settings.edit_buffer.is_empty() {
+                                    let w = settings_editor_width_cache.max(1);
+                                    let h = settings_editor_rect_cache
+                                        .map(|r| r.height.max(1) as usize)
+                                        .unwrap_or(1);
+                                    let max = prompt_max_scroll_y(&settings.edit_buffer, w, h);
+                                    let step: usize = 2;
+                                    if up {
+                                        settings.edit_scroll_y = settings.edit_scroll_y.saturating_sub(step);
+                                    } else {
+                                        settings.edit_scroll_y = (settings.edit_scroll_y + step).min(max);
+                                    }
+                                }
                             } else {
-                                let max = settings_fields.len().saturating_sub(1);
-                                settings.field_index = (settings.field_index + delta).min(max);
+                                let delta: usize = 1;
+                                if up {
+                                    settings.field_index = settings.field_index.saturating_sub(delta);
+                                } else {
+                                    let max = settings_fields.len().saturating_sub(1);
+                                    settings.field_index = (settings.field_index + delta).min(max);
+                                }
+                                settings.focus = SettingsFocus::Fields;
                             }
-                            settings.focus = SettingsFocus::Fields;
                         } else if matches!(screen, Screen::Chat) {
                             if up {
                                 scroll = scroll.saturating_sub(delta);
@@ -9437,15 +9499,48 @@ ui::draw_header(
                                     if settings_confirm_yes_rect_cache.is_some_and(contains) {
                                         settings.focus = SettingsFocus::Fields;
                                         reset_settings_edit(&mut settings);
-                                        changed = true;
+                                        needs_redraw = true;
                                         continue;
                                     }
                                     if settings_confirm_no_rect_cache.is_some_and(contains) {
                                         settings.confirm = None;
                                         settings.focus = SettingsFocus::Prompt;
-                                        changed = true;
+                                        needs_redraw = true;
                                         continue;
                                     }
+                                    //（1）弹窗打开时屏蔽其它区域点击。
+                                    continue;
+                                }
+
+                                //（1）提示词编辑：锁定焦点。
+                                //（2）除非 Esc 退出，否则不允许通过触控切换标签页/字段。
+                                if matches!(settings.focus, SettingsFocus::Prompt) {
+                                    if let Some(r) =
+                                        settings_editor_rect_cache.filter(|r| contains(*r))
+                                    {
+                                        let click_x = col.saturating_sub(r.x) as usize;
+                                        let click_y = row.saturating_sub(r.y) as usize;
+                                        let w = r.width.max(1) as usize;
+                                        let h = r.height.max(1) as usize;
+                                        if !settings.edit_buffer.is_empty() {
+                                            settings.edit_cursor = cursor_for_click_scrolled(
+                                                &settings.edit_buffer,
+                                                w,
+                                                settings.edit_scroll_y,
+                                                click_x,
+                                                click_y,
+                                            );
+                                            ensure_prompt_cursor_visible(
+                                                &settings.edit_buffer,
+                                                w,
+                                                h,
+                                                settings.edit_cursor,
+                                                &mut settings.edit_scroll_y,
+                                            );
+                                        }
+                                        needs_redraw = true;
+                                    }
+                                    continue;
                                 }
 
                                 if let Some(r) = settings_editor_rect_cache.filter(|r| contains(*r)) {
@@ -9456,13 +9551,19 @@ ui::draw_header(
                                     let w = r.width.max(1) as usize;
                                     let h = r.height.max(1) as usize;
                                     if !settings.edit_buffer.is_empty() {
-                                        settings.edit_cursor = input_cursor_for_click(
+                                        settings.edit_cursor = cursor_for_click_scrolled(
+                                            &settings.edit_buffer,
+                                            w,
+                                            settings.edit_scroll_y,
+                                            click_x,
+                                            click_y,
+                                        );
+                                        ensure_prompt_cursor_visible(
                                             &settings.edit_buffer,
                                             w,
                                             h,
                                             settings.edit_cursor,
-                                            click_x,
-                                            click_y,
+                                            &mut settings.edit_scroll_y,
                                         );
                                     }
                                     changed = true;
@@ -9767,6 +9868,26 @@ ui::draw_header(
                         }
                     }
                     MouseEventKind::Up(_) => {
+                        // Termux 触控有时只上报 Up：确认弹窗也要支持 Up 命中。
+                        if matches!(screen, Screen::Settings) && settings.confirm.is_some() {
+                            let col = me.column;
+                            let row = me.row;
+                            let contains = |r: ratatui::layout::Rect| {
+                                col >= r.x
+                                    && col < r.x.saturating_add(r.width)
+                                    && row >= r.y
+                                    && row < r.y.saturating_add(r.height)
+                            };
+                            if settings_confirm_yes_rect_cache.is_some_and(contains) {
+                                settings.focus = SettingsFocus::Fields;
+                                reset_settings_edit(&mut settings);
+                                needs_redraw = true;
+                            } else if settings_confirm_no_rect_cache.is_some_and(contains) {
+                                settings.confirm = None;
+                                settings.focus = SettingsFocus::Prompt;
+                                needs_redraw = true;
+                            }
+                        }
                         touch_drag_last_row = None;
                         touch_drag_last_col = None;
                         touch_drag_anchor_row = None;
@@ -10196,12 +10317,7 @@ ui::draw_header(
                                         &mut settings.edit_cursor,
                                     );
                                 }
-                                KeyCode::Delete => {
-                                    edit_buffer_delete(
-                                        &mut settings.edit_buffer,
-                                        &mut settings.edit_cursor,
-                                    );
-                                }
+                                KeyCode::Delete => {}
                                 KeyCode::Left => {
                                     edit_buffer_left(
                                         &settings.edit_buffer,
@@ -10234,9 +10350,6 @@ ui::draw_header(
                             }
                         }
                         SettingsFocus::Prompt => {
-                            if handle_settings_tab_nav(key.code, &mut settings) {
-                                continue;
-                            }
                             let Some(kind) = settings.edit_kind else {
                                 settings.focus = SettingsFocus::Fields;
                                 continue;
@@ -10256,6 +10369,7 @@ ui::draw_header(
                                         settings.confirm = Some(dlg);
                                         continue;
                                     }
+                                    KeyCode::Tab | KeyCode::BackTab | KeyCode::PageUp | KeyCode::PageDown => {},
                                     KeyCode::Esc => {
                                         settings.confirm = None;
                                         continue;
@@ -10286,10 +10400,8 @@ ui::draw_header(
                                         reset_settings_edit(&mut settings);
                                     }
                                 }
-                                KeyCode::Char('s')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    if matches!(kind, SettingsFieldKind::PromptFile) {
+                                KeyCode::End => {
+                                    if true {
                                         if let Some(path) = settings.edit_prompt_path.clone() {
                                             let text = settings.edit_buffer.clone();
                                             match store_prompt_file(&path, &text) {
@@ -10404,23 +10516,32 @@ ui::draw_header(
                                         1,
                                     );
                                 }
-                                KeyCode::Home => {
-                                    edit_buffer_home(&mut settings.edit_cursor);
-                                }
-                                KeyCode::End => {
-                                    edit_buffer_end(
-                                        &settings.edit_buffer,
-                                        &mut settings.edit_cursor,
-                                    );
-                                }
                                 KeyCode::Char(ch) => {
-                                    edit_buffer_insert_char(
-                                        &mut settings.edit_buffer,
-                                        &mut settings.edit_cursor,
-                                        ch,
-                                    );
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        || key.modifiers.contains(KeyModifiers::ALT)
+                                    {
+                                    } else {
+                                        edit_buffer_insert_char(
+                                            &mut settings.edit_buffer,
+                                            &mut settings.edit_cursor,
+                                            ch,
+                                        );
+                                    }
                                 }
                                 _ => {}
+                            }
+                            if !settings.edit_buffer.is_empty() {
+                                let w = settings_editor_width_cache.max(1);
+                                let h = settings_editor_rect_cache
+                                    .map(|r| r.height.max(1) as usize)
+                                    .unwrap_or(1);
+                                ensure_prompt_cursor_visible(
+                                    &settings.edit_buffer,
+                                    w,
+                                    h,
+                                    settings.edit_cursor,
+                                    &mut settings.edit_scroll_y,
+                                );
                             }
                         }
                     }

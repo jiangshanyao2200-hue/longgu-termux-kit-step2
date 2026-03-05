@@ -2376,7 +2376,7 @@ pub struct DrawSettingsArgs<'a> {
     pub fields: &'a [(String, String)],
     pub field_selected: usize,
     pub focus: SettingsFocus,
-    pub prompt_editor: Option<(&'a str, usize)>,
+    pub prompt_editor: Option<(&'a str, usize, usize)>,
     pub tick: usize,
 }
 
@@ -2473,18 +2473,21 @@ pub fn draw_settings(f: &mut ratatui::Frame, args: DrawSettingsArgs<'_>) -> Sett
                 .bg(theme.bg)
                 .add_modifier(Modifier::BOLD),
         ))
+        .title_alignment(ratatui::layout::Alignment::Center)
         .style(Style::default().bg(theme.bg));
     let panel_inner = panel_block.inner(body_area);
     f.render_widget(panel_block, body_area);
 
-    if let Some((text, cursor)) = prompt_editor {
+    if let Some((text, cursor, scroll_y)) = prompt_editor {
         let width = panel_inner.width.max(1) as usize;
         let height = panel_inner.height.max(1) as usize;
         let (cx, cy) = cursor_xy(width, text, cursor.min(text.len()));
-        let scroll_y = cy.saturating_sub(height.saturating_sub(1));
-        let scroll_y_u16 = scroll_y.min(u16::MAX as usize) as u16;
-        let visible_y = cy.saturating_sub(scroll_y);
         let wrapped = wrap_text_fixed(width, text);
+        let total_lines = wrapped.lines().count().max(1);
+        let max_scroll = total_lines.saturating_sub(height);
+        let scroll_y = scroll_y.min(max_scroll).min(u16::MAX as usize);
+        let scroll_y_u16 = scroll_y as u16;
+        let visible_y = cy.saturating_sub(scroll_y);
         let line = Paragraph::new(wrapped)
             .style(Style::default().fg(theme.fg).bg(theme.bg))
             .block(Block::default().borders(Borders::NONE))
@@ -6649,6 +6652,7 @@ pub fn draw_confirm_dialog(
                 .bg(theme.bg)
                 .add_modifier(Modifier::BOLD),
         ))
+        .title_alignment(ratatui::layout::Alignment::Center)
         .style(Style::default().bg(theme.bg));
     let inner = block.inner(darea);
     f.render_widget(block, darea);
@@ -6680,8 +6684,8 @@ pub fn draw_confirm_dialog(
         height: 1,
     };
 
-    let yes = " YES ";
-    let no = " NO ";
+    let yes = "[YES]";
+    let no = "[NO]";
     let yes_w = UnicodeWidthStr::width(yes);
     let no_w = UnicodeWidthStr::width(no);
     let gap = 4usize;
@@ -6724,15 +6728,15 @@ pub fn draw_confirm_dialog(
 
     Some(ConfirmDialogRects {
         yes: Rect {
-            x: yes_x,
+            x: yes_x.saturating_sub(1),
             y: btn_area.y,
-            width: (yes_w as u16).min(btn_area.width),
+            width: (yes_w as u16).saturating_add(2).min(btn_area.width),
             height: 1,
         },
         no: Rect {
-            x: no_x,
+            x: no_x.saturating_sub(1),
             y: btn_area.y,
-            width: (no_w as u16).min(btn_area.width),
+            width: (no_w as u16).saturating_add(2).min(btn_area.width),
             height: 1,
         },
     })

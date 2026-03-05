@@ -101,6 +101,7 @@ apply_patch字段：
 input：unified diff 文本
 cwd：补丁执行基准目录（默认cwd）
 apply_patch规则：先 dry-run 预检，通过才应用；自动 -p1（含 a/ b/）或 -p0。
+使用建议：先 bash 用 rg/nl 定位并读取原文，再写补丁应用。
 
 总结：
 1 需要查记忆时，先 memory_check获取准确日期信息，再 memory_read datememory，从datememory获取事件精确日期，再判断是否需要深度回忆。如果需要深度回忆，按照日期检索metamemory元数据。

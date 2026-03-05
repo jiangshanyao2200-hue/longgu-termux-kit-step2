@@ -772,6 +772,7 @@ fn settings_field_hint(section: SettingsSection, kind: SettingsFieldKind) -> &'s
             SettingsFieldKind::DogPrompt => "Edit DOG prompt",
             SettingsFieldKind::MainPrompt => "Edit MAIN prompt",
             SettingsFieldKind::ContextMainPrompt => "Edit context prompt",
+            SettingsFieldKind::PromptFile => "Edit prompt file",
         },
     }
 }
@@ -2887,6 +2888,7 @@ enum SettingsFieldKind {
     DogPrompt,
     MainPrompt,
     ContextMainPrompt,
+    PromptFile,
 }
 
 struct SettingsFieldSpec {
@@ -2894,6 +2896,20 @@ struct SettingsFieldSpec {
     value: String,
     kind: SettingsFieldKind,
     api_kind: Option<ApiConfigKind>,
+    prompt_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmChoice {
+    Yes,
+    No,
+}
+
+#[derive(Debug, Clone)]
+struct ConfirmDialogState {
+    msg: String,
+    selected: ConfirmChoice,
+    start_tick: usize,
 }
 
 struct SettingsState {
@@ -2903,8 +2919,11 @@ struct SettingsState {
     focus: SettingsFocus,
     edit_kind: Option<SettingsFieldKind>,
     edit_api_kind: Option<ApiConfigKind>,
+    edit_prompt_path: Option<PathBuf>,
     edit_buffer: String,
+    edit_original: String,
     edit_cursor: usize,
+    confirm: Option<ConfirmDialogState>,
     notice: Option<(Instant, String)>,
 }
 
@@ -2917,8 +2936,11 @@ impl SettingsState {
             focus: SettingsFocus::Tabs,
             edit_kind: None,
             edit_api_kind: None,
+            edit_prompt_path: None,
             edit_buffer: String::new(),
+            edit_original: String::new(),
             edit_cursor: 0,
+            confirm: None,
             notice: None,
         }
     }
@@ -2931,8 +2953,11 @@ fn set_settings_notice(settings: &mut SettingsState, now: Instant, msg: String) 
 fn reset_settings_edit(settings: &mut SettingsState) {
     settings.edit_kind = None;
     settings.edit_api_kind = None;
+    settings.edit_prompt_path = None;
     settings.edit_buffer.clear();
+    settings.edit_original.clear();
     settings.edit_cursor = 0;
+    settings.confirm = None;
 }
 
 fn reset_settings_to_tabs(settings: &mut SettingsState) {
@@ -3332,8 +3357,41 @@ fn is_prompt_kind(kind: SettingsFieldKind) -> bool {
         SettingsFieldKind::DogPrompt
             | SettingsFieldKind::MainPrompt
             | SettingsFieldKind::ContextMainPrompt
+            | SettingsFieldKind::PromptFile
     )
 }
+fn list_prompt_files() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("prompt") {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        let an = a.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+        let bn = b.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+        an.cmp(&bn)
+    });
+    out
+}
+
+fn summarize_prompt_path(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let bytes = m.len() as usize;
+            if bytes >= 1024 {
+                format!("{}KB", (bytes + 1023) / 1024)
+            } else {
+                format!("{bytes}B")
+            }
+        }
+        Err(_) => "missing".to_string(),
+    }
+}
+
 
 fn mask_api_key(key: Option<&str>) -> String {
     let Some(raw) = key else {
@@ -3480,7 +3538,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 value: String::new(),
                 kind: SettingsFieldKind::Static,
                 api_kind: None,
-            });
+                    prompt_path: None,
+                });
             {
                 let k = ApiConfigKind::Main;
                 let provider_raw = main_cfg.provider.as_str();
@@ -3498,24 +3557,28 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                     value: provider_label(provider_raw).to_string(),
                     kind: SettingsFieldKind::Provider,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Base URL",
                     value: base_url.to_string(),
                     kind: SettingsFieldKind::BaseUrl,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Key",
                     value: mask_api_key(api_key),
                     kind: SettingsFieldKind::ApiKey,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Model",
                     value: model_label(model).to_string(),
                     kind: SettingsFieldKind::Model,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 if caps.supports_reasoning_effort {
                     fields.push(SettingsFieldSpec {
@@ -3523,7 +3586,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_reasoning_effort(provider_raw, reasoning_effort),
                         kind: SettingsFieldKind::ReasoningEffort,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
                 if caps.supports_temperature {
                     fields.push(SettingsFieldSpec {
@@ -3531,7 +3595,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_temp(temperature),
                         kind: SettingsFieldKind::Temperature,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
                 if caps.supports_max_tokens {
                     fields.push(SettingsFieldSpec {
@@ -3539,7 +3604,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_max_tokens(max_tokens),
                         kind: SettingsFieldKind::MaxTokens,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
             }
             fields.push(SettingsFieldSpec {
@@ -3547,13 +3613,15 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 value: String::new(),
                 kind: SettingsFieldKind::Static,
                 api_kind: None,
-            });
+                    prompt_path: None,
+                });
             fields.push(SettingsFieldSpec {
                 label: "辅 API 配置",
                 value: String::new(),
                 kind: SettingsFieldKind::Static,
                 api_kind: None,
-            });
+                    prompt_path: None,
+                });
             {
                 let k = ApiConfigKind::Dog;
                 let provider_raw = dog_cfg.provider.as_str();
@@ -3571,24 +3639,28 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                     value: provider_label(provider_raw).to_string(),
                     kind: SettingsFieldKind::Provider,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Base URL",
                     value: base_url.to_string(),
                     kind: SettingsFieldKind::BaseUrl,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Key",
                     value: mask_api_key(api_key),
                     kind: SettingsFieldKind::ApiKey,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Model",
                     value: model_label(model).to_string(),
                     kind: SettingsFieldKind::Model,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 if caps.supports_reasoning_effort {
                     fields.push(SettingsFieldSpec {
@@ -3596,7 +3668,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_reasoning_effort(provider_raw, reasoning_effort),
                         kind: SettingsFieldKind::ReasoningEffort,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
                 if caps.supports_temperature {
                     fields.push(SettingsFieldSpec {
@@ -3604,7 +3677,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_temp(temperature),
                         kind: SettingsFieldKind::Temperature,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
                 if caps.supports_max_tokens {
                     fields.push(SettingsFieldSpec {
@@ -3612,7 +3686,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_max_tokens(max_tokens),
                         kind: SettingsFieldKind::MaxTokens,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
             }
             fields.push(SettingsFieldSpec {
@@ -3620,13 +3695,15 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 value: String::new(),
                 kind: SettingsFieldKind::Static,
                 api_kind: None,
-            });
+                    prompt_path: None,
+                });
             fields.push(SettingsFieldSpec {
                 label: "记忆 API 配置",
                 value: String::new(),
                 kind: SettingsFieldKind::Static,
                 api_kind: None,
-            });
+                    prompt_path: None,
+                });
             {
                 let k = ApiConfigKind::Memory;
                 let provider_raw = memory_cfg.provider.as_str();
@@ -3644,24 +3721,28 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                     value: provider_label(provider_raw).to_string(),
                     kind: SettingsFieldKind::Provider,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Base URL",
                     value: base_url.to_string(),
                     kind: SettingsFieldKind::BaseUrl,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Key",
                     value: mask_api_key(api_key),
                     kind: SettingsFieldKind::ApiKey,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 fields.push(SettingsFieldSpec {
                     label: "Model",
                     value: model_label(model).to_string(),
                     kind: SettingsFieldKind::Model,
                     api_kind: Some(k),
+                    prompt_path: None,
                 });
                 if caps.supports_reasoning_effort {
                     fields.push(SettingsFieldSpec {
@@ -3669,7 +3750,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_reasoning_effort(provider_raw, reasoning_effort),
                         kind: SettingsFieldKind::ReasoningEffort,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
                 if caps.supports_temperature {
                     fields.push(SettingsFieldSpec {
@@ -3677,7 +3759,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_temp(temperature),
                         kind: SettingsFieldKind::Temperature,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
                 if caps.supports_max_tokens {
                     fields.push(SettingsFieldSpec {
@@ -3685,7 +3768,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                         value: format_max_tokens(max_tokens),
                         kind: SettingsFieldKind::MaxTokens,
                         api_kind: Some(k),
-                    });
+                    prompt_path: None,
+                });
                 }
             }
 
@@ -3701,7 +3785,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 },
                 kind: SettingsFieldKind::DateKbLimit,
                 api_kind: None,
-            },
+                    prompt_path: None,
+                },
             SettingsFieldSpec {
                 label: "Heartbeat",
                 value: if sys_cfg.heartbeat_minutes == 0 {
@@ -3711,7 +3796,8 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 },
                 kind: SettingsFieldKind::HeartbeatMinutes,
                 api_kind: None,
-            },
+                    prompt_path: None,
+                },
             SettingsFieldSpec {
                 label: "Exec perm",
                 value: if sys_cfg.tool_full_access {
@@ -3721,34 +3807,42 @@ fn build_settings_fields(args: BuildSettingsFieldsArgs<'_>) -> Vec<SettingsField
                 },
                 kind: SettingsFieldKind::ExecPermission,
                 api_kind: None,
-            },
+                    prompt_path: None,
+                },
             SettingsFieldSpec {
                 label: "SSE",
                 value: format_toggle(sys_cfg.sse_enabled),
                 kind: SettingsFieldKind::SseEnabled,
                 api_kind: None,
-            },
+                    prompt_path: None,
+                },
         ],
-        SettingsSection::PromptCenter => vec![
-            SettingsFieldSpec {
-                label: "1 DOG prompt",
-                value: summarize_prompt(dog_prompt_text),
-                kind: SettingsFieldKind::DogPrompt,
-                api_kind: None,
-            },
-            SettingsFieldSpec {
-                label: "2 MAIN prompt",
-                value: summarize_prompt(main_prompt_text),
-                kind: SettingsFieldKind::MainPrompt,
-                api_kind: None,
-            },
-            SettingsFieldSpec {
-                label: "3 MAIN Context",
-                value: summarize_prompt(&context_prompts.main_prompt),
-                kind: SettingsFieldKind::ContextMainPrompt,
-                api_kind: None,
-            },
-        ],
+        SettingsSection::PromptCenter => {
+            let files = list_prompt_files();
+            if files.is_empty() {
+                vec![SettingsFieldSpec {
+                    label: "Prompt",
+                    value: "prompt/ 为空".to_string(),
+                    kind: SettingsFieldKind::Static,
+                    api_kind: None,
+                    prompt_path: None,
+                }]
+            } else {
+                let mut out: Vec<SettingsFieldSpec> = Vec::new();
+                for (i, p) in files.into_iter().enumerate() {
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
+                    let value = format!("{:02} {name}  {}", i + 1, summarize_prompt_path(&p));
+                    out.push(SettingsFieldSpec {
+                        label: "Prompt",
+                        value,
+                        kind: SettingsFieldKind::PromptFile,
+                        api_kind: None,
+                        prompt_path: Some(p),
+                    });
+                }
+                out
+            }
+        },
     }
 }
 
@@ -3882,6 +3976,7 @@ fn field_raw_value(args: FieldRawValueArgs<'_>) -> String {
             }
         }
         SettingsFieldKind::ContextMainPrompt => context_prompts.main_prompt.to_string(),
+        SettingsFieldKind::PromptFile => String::new(),
     }
 }
 
@@ -4381,7 +4476,7 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
         SettingsFieldKind::DogPrompt => {
             let text = value.to_string();
             store_prompt_file(Path::new(&dog_cfg.prompt_path), &text).map_err(|e| e.to_string())?;
-            dog_state.prompt = text;
+            dog_state.prompt = text.clone();
             dog_state.reset_context();
         }
         SettingsFieldKind::MainPrompt => {
@@ -4397,6 +4492,7 @@ fn apply_settings_edit(args: ApplySettingsEditArgs<'_>) -> Result<String, String
             store_prompt_file(context_prompt_path, &context_prompts.main_prompt)
                 .map_err(|e| e.to_string())?;
         }
+        SettingsFieldKind::PromptFile => {}
     }
 
     if matches!(section, SettingsSection::Api)
@@ -4651,20 +4747,6 @@ fn send_queue_find_id(
     None
 }
 
-fn send_queue_remove_id(
-    high: &mut VecDeque<QueuedUserMessage>,
-    low: &mut VecDeque<QueuedUserMessage>,
-    id: u64,
-) -> Option<QueuedUserMessage> {
-    if let Some((is_high, idx)) = send_queue_find_id(high, low, id) {
-        if is_high {
-            return high.remove(idx);
-        }
-        return low.remove(idx);
-    }
-    None
-}
-
 fn send_queue_update_text_id(
     high: &mut VecDeque<QueuedUserMessage>,
     low: &mut VecDeque<QueuedUserMessage>,
@@ -4687,24 +4769,6 @@ fn send_queue_update_text_id(
     false
 }
 
-fn send_queue_move_to_low_tail_id(
-    high: &mut VecDeque<QueuedUserMessage>,
-    low: &mut VecDeque<QueuedUserMessage>,
-    id: u64,
-    updated_text: Option<String>,
-) -> bool {
-    let mut msg = match send_queue_remove_id(high, low, id) {
-        Some(m) => m,
-        None => return false,
-    };
-    if let Some(t) = updated_text {
-        msg.ui_text = t.clone();
-        msg.model_text = t;
-    }
-    low.push_back(msg);
-    true
-}
-
 fn spawn_tool_execution(
     call: ToolCall,
     owner: MindKind,
@@ -4724,17 +4788,18 @@ fn spawn_tool_execution(
         });
         return;
     }
-    if call.tool == "bash" && call.interactive.unwrap_or(false) {
-        let _spawn = spawn_interactive_bash_execution(
-            call,
-            owner,
-            tx,
-            pty_started_notice_prompt_text,
-            pty_started_model_note_template,
-            true,
-        );
-        return;
-    }
+	    if call.tool == "bash" && call.interactive.unwrap_or(false) {
+	        let _spawn = spawn_interactive_bash_execution(
+	            call,
+	            owner,
+	            tx,
+	            pty_started_notice_prompt_text,
+	            pty_started_model_note_template,
+	            true,
+	            false,
+	        );
+	        return;
+	    }
     thread::spawn(move || {
         let outcome = handle_tool_call_with_retry(&call, 3);
         let _ = tx.send(AsyncEvent::ToolStreamEnd {
@@ -4870,16 +4935,14 @@ fn start_user_chat_request(args: StartUserChatRequestArgs<'_>) -> anyhow::Result
         ui_text.trim().is_empty() && crate::context::is_role_needed_user_placeholder(&model_text);
     *active_request_is_internal_placeholder = internal_role_needed_placeholder;
 
-    //（1）Memory 专属聊天：用户输入写入 Memory 频道。
-    //（2）不进入主聊天时间线，避免污染。
-    if target == MindKind::Memory && !ui_text.trim().is_empty() {
+    //（1）用户输入：写入对应 Tab 的聊天流（Main/Dog/Memory 完全隔离显示）。
+    //（2）ui_text 为空表示内部占位符：UI 不显示。
+    if !ui_text.trim().is_empty() {
         core.history.push(Message {
             role: Role::User,
             text: ui_text.clone(),
-            mind: Some(MindKind::Memory),
+            mind: Some(target),
         });
-    } else {
-        core.push_user(ui_text.clone());
     }
     thinking_text.clear();
     thinking_full_text.clear();
@@ -5612,8 +5675,8 @@ fn push_tool_stream_chunk(state: &mut ToolStreamState, chunk: &str) {
     }
 }
 
-const THINK_OUTPUT_MAX_LINES: usize = 240;
-const THINK_OUTPUT_MAX_CHARS: usize = 12_000;
+const THINK_OUTPUT_MAX_LINES: usize = 1200;
+const THINK_OUTPUT_MAX_CHARS: usize = 80_000;
 
 fn truncate_thinking_payload(text: &str, max_lines: usize, max_chars: usize) -> String {
     if text.is_empty() {
@@ -6396,6 +6459,7 @@ enum AsyncEvent {
         cols: u16,
         rows: u16,
         owner: MindKind,
+        user_initiated: bool,
         job_id: u64,
         cmd: String,
         saved_path: String,
@@ -6412,6 +6476,7 @@ enum AsyncEvent {
     },
     PtyJobDone {
         owner: MindKind,
+        user_initiated: bool,
         job_id: u64,
         cmd: String,
         saved_path: String,
@@ -7155,6 +7220,8 @@ fn run_loop(
     let status_width_cache: usize = 0;
     let mut settings_editor_width_cache: usize = 0;
     let mut settings_editor_rect_cache: Option<ratatui::layout::Rect> = None;
+    let mut settings_confirm_yes_rect_cache: Option<ratatui::layout::Rect> = None;
+    let mut settings_confirm_no_rect_cache: Option<ratatui::layout::Rect> = None;
     let mut input_width_cache: usize = 0;
     let mut mode = Mode::Idle;
     let mut sse_enabled = sys_cfg.sse_enabled;
@@ -7558,7 +7625,7 @@ fn run_loop(
     //（2）仅影响界面，不进入上下文与协议层。
     let mut action_hint: Option<(Instant, String)> = None;
     //（1）大粘贴占位符缓存：pending_pastes 非空表示存在占位符。
-    //（2）为避免误触 Enter 提交，仅 Alt+Enter 允许发送。
+    //（2）为避免误触 Enter 提交，粘贴期间 Enter 一律视为换行（不发送）。
     let mut pending_pastes: Vec<(String, String)> = Vec::new();
     let max_input_chars = config.max_input_chars;
     let paste_capture_max_bytes = config.paste_capture_max_bytes;
@@ -7953,14 +8020,15 @@ fn run_loop(
                             timeout_secs: Some(30 * 60),
                             ..ToolCall::default()
                         };
-                        let _ = spawn_interactive_bash_execution(
-                            call,
-                            MindKind::Main,
-                            tx.clone(),
-                            String::new(),
-                            String::new(),
-                            false,
-                        );
+	                        let _ = spawn_interactive_bash_execution(
+	                            call,
+	                            MindKind::Main,
+	                            tx.clone(),
+	                            String::new(),
+	                            String::new(),
+	                            false,
+	                            true,
+	                        );
                     }
                     if should_exit {
                         break;
@@ -8163,7 +8231,7 @@ fn run_loop(
         let menu_items = if screen == Screen::Chat
             && !command_menu_suppress
             && is_idle_like(mode)
-            && matches!(chat_focus, ChatFocus::Input)
+            && (matches!(chat_focus, ChatFocus::Input) || input.starts_with('/'))
             && matches!(send_queue_ui, SendQueueUiState::Closed)
             && matches!(help_ui, HelpUiState::Closed)
             && !is_pty_panel_active(screen, pty_view, pty_tabs.as_slice())
@@ -8414,7 +8482,7 @@ fn run_loop(
                 input_line = format!("Queue / {queue_waiting} 条待发 · ↑↓选择 Enter编辑 Home退出");
             }
             SendQueueUiState::Editing { id } => {
-                input_line = format!("Queue edit #{id} · Alt+↓保存 Alt+Enter置底");
+                input_line = format!("Queue edit #{id} · Alt+↓保存 Home退出");
             }
             SendQueueUiState::Closed => {}
         }
@@ -8634,33 +8702,42 @@ fn run_loop(
                 } else {
                     (input.as_str(), cursor)
                 };
-                let pty_panel_active = is_pty_panel_active(screen, pty_view, pty_tabs.as_slice());
-                let input_inner_w = size.width.saturating_sub(2).max(1) as usize;
-                let input_lines = ui::wrapped_line_count(input_inner_w, input_text);
-                //（1）PTY 展开时仍显示输入框：输入框固定较小高度，避免把终端窗口挤没。
-                let desired_input_h = if pty_panel_active {
-                    2
-                } else {
-                    input_lines.clamp(4, 10) as u16
-                };
-                let fixed = 1 + 1 + 1 + 1 + 1 + 1; // header + tabs + header-sep + status + sep + ctx
-                let avail = size.height.saturating_sub(fixed).max(2); // 至少给 chat+bottom 留 2 行
-                let max_input_h = avail.saturating_sub(1); // 给 chat 至少 1 行
-                let input_h = desired_input_h.min(max_input_h.max(1));
-                let bottom_h = pty_bottom_height(avail, input_h, pty_panel_active);
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(1), // tabs
-                        Constraint::Length(1), // header-sep
-                        Constraint::Min(1),    // body
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Length(bottom_h),
-                        Constraint::Length(1),
-                    ])
-                    .split(size);
+	                let pty_panel_active = is_pty_panel_active(screen, pty_view, pty_tabs.as_slice());
+	                let input_inner_w = size.width.saturating_sub(2).max(1) as usize;
+	                let input_lines = ui::wrapped_line_count(input_inner_w, input_text);
+								let input_cursor_x = if input_active {
+									let map = build_cursor_map(input_text, input_inner_w);
+									let (cx, _cy) = cursor_xy_from_map(&map, input_cursor.min(input_text.len()));
+									Some(cx.saturating_add(1))
+								} else {
+									None
+								};
+	                //（1）PTY 展开时仍显示输入框：输入框固定较小高度，避免把终端窗口挤没。
+	                let desired_input_h = if pty_panel_active {
+	                    2
+	                } else {
+	                    // 输入框默认加高 1 行：更适合手机小屏编辑（尤其是带工具 JSON/多行提示）。
+	                    (input_lines.clamp(4, 10) as u16).saturating_add(1)
+	                };
+			                let fixed = 1 + 1 + 1 + 1 + 1 + 1 + 1; // top-sep + header + status + header-sep + tabs + input-sep + ctx
+			                let avail = size.height.saturating_sub(fixed).max(2); // 至少给 chat+bottom 留 2 行
+			                let max_input_h = avail.saturating_sub(1); // 给 chat 至少 1 行
+			                let input_h = desired_input_h.min(max_input_h.max(1));
+			                let bottom_h = pty_bottom_height(avail, input_h, pty_panel_active);
+			                let chunks = Layout::default()
+			                    .direction(Direction::Vertical)
+			                    .constraints([
+			                        Constraint::Length(1), // top-sep
+			                        Constraint::Length(1), // header
+			                        Constraint::Length(1), // status (Ready/read)
+			                        Constraint::Length(1), // header-sep
+			                        Constraint::Min(1),    // body
+			                        Constraint::Length(1), // tabs
+			                        Constraint::Length(1), // input-sep
+			                        Constraint::Length(bottom_h),
+			                        Constraint::Length(1),
+			                    ])
+			                    .split(size);
 
                 let main_mode = match mode {
                     Mode::Generating => match active_kind {
@@ -8714,11 +8791,27 @@ fn run_loop(
                     _ => Mode::Idle,
                 };
 
-                ui::draw_header(
-                    f,
-                    ui::DrawHeaderArgs {
-                        theme: &theme,
-                        area: chunks[0],
+		                // Top separator line.
+ui::draw_separator(
+    f,
+    ui::DrawSeparatorArgs {
+        theme: &theme,
+        area: chunks[0],
+        mode,
+        active_kind,
+        user_active: false,
+        highlight: matches!(chat_focus, ChatFocus::Chat),
+        tick: spinner_tick,
+        cursor_x: None,
+        hint: "",
+    },
+);
+
+ui::draw_header(
+		                    f,
+		                    ui::DrawHeaderArgs {
+		                        theme: &theme,
+		                        area: chunks[1],
                         center: "",
                         main_mode,
                         dog_mode,
@@ -8727,75 +8820,116 @@ fn run_loop(
                         pulse_dir,
                         tick: spinner_tick,
                         run_secs,
-                    },
-                );
+                        right: {
+                            let p = match chat_target {
+                                MindKind::Main => selected_provider(
+                                    ApiConfigKind::Main,
+                                    &dog_cfg,
+                                    &main_cfg,
+                                    &memory_cfg,
+                                ),
+                                MindKind::Sub => selected_provider(
+                                    ApiConfigKind::Dog,
+                                    &dog_cfg,
+                                    &main_cfg,
+                                    &memory_cfg,
+                                ),
+                                MindKind::Memory => selected_provider(
+                                    ApiConfigKind::Memory,
+                                    &dog_cfg,
+                                    &main_cfg,
+                                    &memory_cfg,
+                                ),
+                            };
+                            provider_label(&p)
+		                        },
+		                    },
+		                );
 
-                tabs_rect_cache = Some(chunks[1]);
-                ui::draw_chat_tabs(
-                    f,
-                    ui::DrawChatTabsArgs {
-                        theme: &theme,
-                        area: chunks[1],
-                        active_tab: chat_target,
-                        main_busy: !is_idle_like(main_mode),
-                        dog_busy: !is_idle_like(dog_mode),
-                        memory_busy: !is_idle_like(memory_mode),
-                        tick: spinner_tick,
-                    },
-                );
+		                //（1）read/Ready 状态栏：放到顶栏区域（位于 AItermux 顶栏与横杠之间）。
+		                //（2）Settings 也复用这一行显示状态提示。
+		                if screen == Screen::Chat {
+		                    ui::draw_hint_line(
+		                        f,
+		                        ui::DrawHintLineArgs {
+		                            theme: &theme,
+		                            area: chunks[2],
+		                            hint: &input_line,
+		                            right_hint: action_hint_text.as_str(),
+		                            mode,
+		                            active_kind,
+		                            user_active: input_active,
+		                            tick: spinner_tick,
+		                            anim_tick: hint_anim_tick,
+		                            anim_seed: hint_anim_seed,
+		                        },
+		                    );
+		                } else if screen == Screen::Settings {
+		                    ui::draw_settings_status(
+		                        f,
+		                        &theme,
+		                        chunks[2],
+		                        settings.focus,
+		                        spinner_tick,
+		                        &settings_line,
+		                        action_hint_text.as_str(),
+		                    );
+		                }
 
-                //（1）顶部横杠：用于把“标题栏”和主体隔离开。
-                ui::draw_separator(
-                    f,
-                    ui::DrawSeparatorArgs {
-                        theme: &theme,
-                        area: chunks[2],
-                        mode,
-                        active_kind,
-                        //（1）顶栏横杠：只在 API 活跃时动画（避免“输入中也在动”造成噪声）。
-                        user_active: false,
-                        highlight: if pty_panel_active {
-                            matches!(screen, Screen::Chat) && matches!(pty_focus, PtyFocus::Chat)
-                        } else {
-                            matches!(screen, Screen::Chat) && matches!(chat_focus, ChatFocus::Chat)
-                        },
-                        tick: spinner_tick,
-                        hint: "",
-                    },
-                );
-                if screen == Screen::Chat {
-                    //（1）Chat 始终可见：PTY 仅占用底部面板（半屏），不再“整块替换聊天区”。
-                    chat_rect_cache = Some(chunks[3]);
-                    if pty_panel_active {
+		                //（1）顶栏横杠：固定在顶部（标题与正文的分隔）。
+		                ui::draw_separator(
+		                    f,
+		                    ui::DrawSeparatorArgs {
+		                        theme: &theme,
+		                        area: chunks[3],
+		                        mode,
+		                        active_kind,
+		                        user_active: false,
+		                        highlight: matches!(chat_focus, ChatFocus::Chat),
+	                        tick: spinner_tick,
+        cursor_x: None,
+        hint: "",
+	                    },
+		                );
+		                if screen == Screen::Chat {
+		                    //（1）Chat 始终可见：PTY 仅占用底部面板（半屏），不再“整块替换聊天区”。
+		                    chat_rect_cache = Some(chunks[4]);
+	                    if pty_panel_active {
                         //（1）底部区域：上方终端 + 下方输入框
-                        let ih = input_h.min(chunks[6].height.saturating_sub(3).max(1));
-                        let input_area = ratatui::layout::Rect {
-                            x: chunks[6].x,
-                            y: chunks[6]
-                                .y
-                                .saturating_add(chunks[6].height.saturating_sub(ih)),
-                            width: chunks[6].width,
+	                        let ih = input_h.min(chunks[7].height.saturating_sub(3).max(1));
+	                        let input_area = ratatui::layout::Rect {
+	                            x: chunks[7].x,
+	                            y: chunks[7]
+	                                .y
+	                                .saturating_add(chunks[7].height.saturating_sub(ih)),
+                            width: chunks[7].width,
                             height: ih,
                         };
-                        let pty_area = ratatui::layout::Rect {
-                            x: chunks[6].x,
-                            y: chunks[6].y,
-                            width: chunks[6].width,
-                            height: chunks[6].height.saturating_sub(ih),
-                        };
-                        input_rect_cache = Some(input_area);
-                        pty_rect_cache = Some(pty_area);
-                    } else {
-                        input_rect_cache = Some(chunks[6]);
-                        pty_rect_cache = None;
-                    }
-                    settings_rect_cache = None;
-                    let chat_width = chunks[3].width.max(1) as usize;
-                    if chat_anim_fast_forward {
-                        render_cache.prepare(chat_width, core.history.len());
-                        render_cache.fast_forward_all_animations_to_tail(&core);
-                        chat_anim_fast_forward = false;
-                    }
+	                        let pty_area = ratatui::layout::Rect {
+	                            x: chunks[7].x,
+	                            y: chunks[7].y,
+	                            width: chunks[7].width,
+	                            height: chunks[7].height.saturating_sub(ih),
+	                        };
+	                        input_rect_cache = Some(input_area);
+	                        pty_rect_cache = Some(pty_area);
+		                    } else {
+		                        input_rect_cache = Some(chunks[7]);
+		                        pty_rect_cache = None;
+		                    }
+		                    settings_rect_cache = None;
+		                    								let chat_area = ratatui::layout::Rect {
+								    x: chunks[4].x,
+								    y: chunks[4].y,
+								    width: chunks[4].width,
+								    height: chunks[4].height.saturating_sub(1).max(1),
+								};
+								let chat_width = chat_area.width.max(1) as usize;
+	                    if chat_anim_fast_forward {
+	                        render_cache.prepare(chat_width, core.history.len());
+	                        render_cache.fast_forward_all_animations_to_tail(&core);
+	                        chat_anim_fast_forward = false;
+	                    }
                     let layout = ui::build_chat_layout(ui::BuildChatLinesArgs {
                         theme: &theme,
                         core: &core,
@@ -8899,8 +9033,8 @@ fn run_loop(
                     msg_line_ranges_cache = layout.msg_line_ranges;
                     let chat_lines = layout.lines;
                     chat_width_cache = chat_width;
-                    let chat_height = chunks[3].height.max(1) as usize;
-                    chat_height_cache = chat_height;
+		                    let chat_height = chat_area.height.max(1) as usize;
+		                    chat_height_cache = chat_height;
                     let total_lines = chat_lines.len();
                     let max_scroll = total_lines.saturating_sub(chat_height) as u16;
                     max_scroll_cache = max_scroll as usize;
@@ -8916,34 +9050,18 @@ fn run_loop(
                     if follow_bottom || scroll > max_scroll {
                         scroll = max_scroll;
                     }
-                    ui::draw_chat(f, &theme, chunks[3], chat_lines, scroll);
-
-                    ui::draw_hint_line(
-                        f,
-                        ui::DrawHintLineArgs {
-                            theme: &theme,
-                            area: chunks[4],
-                            hint: &input_line,
-                            right_hint: action_hint_text.as_str(),
-                            mode,
-                            active_kind,
-                            user_active: input_active,
-                            tick: spinner_tick,
-                            anim_tick: hint_anim_tick,
-                            anim_seed: hint_anim_seed,
-                        },
-                    );
+		                    ui::draw_chat(f, &theme, chat_area, chat_lines, scroll);
                     //（1）（已移除弹窗/窗口栈：不在此处绘制“思考窗”）
 
                     //（1）（已移除弹窗/窗口栈：不在此处绘制“工具/正文弹窗”与“思考置顶窗”）
-                } else {
-                    chat_rect_cache = None;
-                    input_rect_cache = None;
-                    pty_rect_cache = None;
-                    settings_rect_cache = Some(chunks[3]);
-                    let menu_items = settings_menu_items();
-                    let settings_area = chunks[3];
-                    let max_fields = settings_area.height.saturating_sub(5).max(1) as usize;
+		                } else {
+		                    chat_rect_cache = None;
+		                    input_rect_cache = None;
+		                    pty_rect_cache = None;
+		                    settings_rect_cache = Some(chunks[4]);
+		                    let menu_items = settings_menu_items();
+		                    let settings_area = chunks[4];
+		                    let max_fields = settings_area.height.saturating_sub(5).max(1) as usize;
                     let total = settings_fields.len();
                     let scroll = if total > max_fields {
                         let max_scroll = total.saturating_sub(max_fields);
@@ -8979,65 +9097,92 @@ fn run_loop(
                     } else {
                         None
                     };
-                    settings_draw = ui::draw_settings(
-                        f,
-                        ui::DrawSettingsArgs {
-                            theme: &theme,
-                            area: chunks[3],
-                            title: settings_section_title(settings_section),
-                            menu_items: &menu_items,
-                            menu_selected: settings.menu_index,
-                            fields: &visible_pairs,
+		                    settings_draw = ui::draw_settings(
+		                        f,
+		                        ui::DrawSettingsArgs {
+		                            theme: &theme,
+		                            area: chunks[4],
+		                            title: settings_section_title(settings_section),
+		                            menu_items: &menu_items,
+		                            menu_selected: settings.menu_index,
+		                            fields: &visible_pairs,
                             field_selected: visible_selected,
                             focus: settings.focus,
                             prompt_editor,
-                            tick: spinner_tick,
-                        },
-                    );
-                    ui::draw_settings_status(
-                        f,
-                        &theme,
-                        chunks[4],
-                        settings.focus,
-                        spinner_tick,
-                        &settings_line,
-                        action_hint_text.as_str(),
-                    );
-                }
+		                            tick: spinner_tick,
+		                        },
+		                    );
+					//（1）未保存确认弹窗：Settings 内部使用。
+					settings_confirm_yes_rect_cache = None;
+					settings_confirm_no_rect_cache = None;
+					if let Some(dlg) = settings.confirm.as_ref() {
+					    let anim = spinner_tick.wrapping_sub(dlg.start_tick);
+					    if let Some(r) = ui::draw_confirm_dialog(
+					        f,
+					        &theme,
+					        settings_area,
+					        dlg.msg.as_str(),
+					        matches!(dlg.selected, ConfirmChoice::Yes),
+					        anim,
+					    ) {
+					        settings_confirm_yes_rect_cache = Some(r.yes);
+					        settings_confirm_no_rect_cache = Some(r.no);
+					    }
+					}
+		                }
 
-                ui::draw_separator(
-                    f,
-                    ui::DrawSeparatorArgs {
-                        theme: &theme,
-                        area: chunks[5],
-                        mode,
-                        active_kind,
-                        user_active: input_active,
-                        highlight: if pty_panel_active {
-                            matches!(screen, Screen::Chat)
-                                && matches!(pty_focus, PtyFocus::Terminal)
-                        } else {
-                            matches!(screen, Screen::Chat) && matches!(chat_focus, ChatFocus::Input)
-                        },
-                        tick: spinner_tick,
-                        hint: "",
-                    },
-                );
-                if matches!(screen, Screen::Chat) && pty_panel_active {
-                    let ih = input_h.min(chunks[6].height.saturating_sub(3).max(1));
-                    let input_area = ratatui::layout::Rect {
-                        x: chunks[6].x,
-                        y: chunks[6]
+		                //（1）标签页：位于输入框上方（status 下方）。
+		                tabs_rect_cache = Some(chunks[5]);
+		                ui::draw_chat_tabs(
+		                    f,
+		                    ui::DrawChatTabsArgs {
+		                        theme: &theme,
+		                        area: chunks[5],
+		                        active_tab: chat_target,
+		                        main_busy: !is_idle_like(main_mode),
+		                        dog_busy: !is_idle_like(dog_mode),
+		                        memory_busy: !is_idle_like(memory_mode),
+		                        tick: spinner_tick,
+		                        sse_enabled,
+		                    },
+		                );
+
+		                let mode_input_sep = if input_active { mode } else { Mode::Idle };
+		                ui::draw_separator(
+		                    f,
+		                    ui::DrawSeparatorArgs {
+		                        theme: &theme,
+		                        area: chunks[6],
+		                        mode: mode_input_sep,
+		                        active_kind,
+		                        user_active: input_active,
+		                        highlight: if pty_panel_active {
+		                            matches!(screen, Screen::Chat)
+		                                && matches!(pty_focus, PtyFocus::Terminal)
+		                        } else {
+		                            matches!(screen, Screen::Chat) && (matches!(chat_focus, ChatFocus::Input) || input.starts_with('/'))
+		                        },
+		                        tick: spinner_tick,
+        cursor_x: input_cursor_x,
+        hint: "",
+		                    },
+		                );
+
+	                if matches!(screen, Screen::Chat) && pty_panel_active {
+	                    let ih = input_h.min(chunks[7].height.saturating_sub(3).max(1));
+	                    let input_area = ratatui::layout::Rect {
+	                        x: chunks[7].x,
+                        y: chunks[7]
                             .y
-                            .saturating_add(chunks[6].height.saturating_sub(ih)),
-                        width: chunks[6].width,
+                            .saturating_add(chunks[7].height.saturating_sub(ih)),
+                        width: chunks[7].width,
                         height: ih,
                     };
                     let pty_area = ratatui::layout::Rect {
-                        x: chunks[6].x,
-                        y: chunks[6].y,
-                        width: chunks[6].width,
-                        height: chunks[6].height.saturating_sub(ih),
+                        x: chunks[7].x,
+                        y: chunks[7].y,
+                        width: chunks[7].width,
+                        height: chunks[7].height.saturating_sub(ih),
                     };
                     draw_pty_panel(
                         f,
@@ -9066,49 +9211,49 @@ fn run_loop(
                         f,
                         ui::DrawInputArgs {
                             theme: &theme,
-                            area: chunks[6],
+                            area: chunks[7],
                             input: input_text,
                             cursor: input_cursor,
                             focused: matches!(screen, Screen::Chat),
                         },
                     );
                 }
-                if let Some(pos) = settings_draw.cursor {
-                    f.set_cursor_position(pos);
-                }
+	                if let Some(pos) = settings_draw.cursor {
+	                    f.set_cursor_position(pos);
+	                }
                 //（1）底部菜单（与聊天区域互斥覆盖）：Help > “/”命令 > 发送队列。
-                let help_open = matches!(help_ui, HelpUiState::Selecting { .. });
-                if help_open && matches!(screen, Screen::Chat) {
-                    let items = help_menu_items();
-                    let available = chunks[3].height.max(1) as usize;
-                    let menu_h = items.len().min(available).max(1) as u16;
-                    let menu_area = ratatui::layout::Rect {
-                        x: chunks[3].x,
-                        y: chunks[4].y.saturating_sub(menu_h),
-                        width: chunks[3].width,
-                        height: menu_h,
-                    };
+		                let help_open = matches!(help_ui, HelpUiState::Selecting { .. });
+		                if help_open && matches!(screen, Screen::Chat) {
+		                    let items = help_menu_items();
+		                    let available = chunks[4].height.saturating_sub(1).max(1) as usize;
+		                    let menu_h = items.len().min(available).max(1) as u16;
+		                    let menu_area = ratatui::layout::Rect {
+		                        x: chunks[4].x,
+		                        y: chunks[5].y.saturating_sub(menu_h),
+		                        width: chunks[4].width,
+		                        height: menu_h,
+		                    };
                     let sel = match help_ui {
                         HelpUiState::Selecting { selected } => selected,
                         HelpUiState::Closed => 0,
                     };
                     ui::draw_owned_menu(f, &theme, menu_area, &items, sel);
-                } else if menu_open && matches!(screen, Screen::Chat) {
-                    //（1）“/”命令菜单：以横杠为基准向上展开（占用聊天区域底部），避免遮挡提示/解释行。
-                    let available = chunks[3].height.max(1) as usize;
-                    let menu_h = menu_items.len().min(available).max(1) as u16;
-                    let menu_area = ratatui::layout::Rect {
-                        x: chunks[3].x,
-                        y: chunks[4].y.saturating_sub(menu_h),
-                        width: chunks[3].width,
-                        height: menu_h,
-                    };
-                    ui::draw_command_menu(f, &theme, menu_area, &menu_items, command_menu_selected);
-                } else if matches!(screen, Screen::Chat)
-                    && matches!(send_queue_ui, SendQueueUiState::Selecting { .. })
-                {
+		                } else if menu_open && matches!(screen, Screen::Chat) {
+		                    //（1）“/”命令菜单：以横杠为基准向上展开（占用聊天区域底部），避免遮挡提示/解释行。
+		                    let available = chunks[4].height.saturating_sub(1).max(1) as usize;
+		                    let menu_h = menu_items.len().min(available).max(1) as u16;
+		                    let menu_area = ratatui::layout::Rect {
+		                        x: chunks[4].x,
+		                        y: chunks[5].y.saturating_sub(menu_h),
+		                        width: chunks[4].width,
+		                        height: menu_h,
+		                    };
+	                    ui::draw_command_menu(f, &theme, menu_area, &menu_items, command_menu_selected);
+		                } else if matches!(screen, Screen::Chat)
+		                    && matches!(send_queue_ui, SendQueueUiState::Selecting { .. })
+		                {
                     //（1）发送队列菜单（Alt+↑ 打开）：与 “/” 菜单互斥，避免同时覆盖同一块区域。
-                    let available = chunks[3].height.max(1) as usize;
+		                    let available = chunks[4].height.saturating_sub(1).max(1) as usize;
                     let mut items: Vec<ui::OwnedMenuItem> = Vec::new();
                     for m in send_queue_high.iter() {
                         let mut right = m.model_text.trim().replace('\n', " ⏎ ");
@@ -9132,14 +9277,14 @@ fn run_loop(
                             right,
                         });
                     }
-                    if !items.is_empty() {
-                        let menu_h = items.len().min(available).max(1) as u16;
-                        let menu_area = ratatui::layout::Rect {
-                            x: chunks[3].x,
-                            y: chunks[4].y.saturating_sub(menu_h),
-                            width: chunks[3].width,
-                            height: menu_h,
-                        };
+		                    if !items.is_empty() {
+		                        let menu_h = items.len().min(available).max(1) as u16;
+		                        let menu_area = ratatui::layout::Rect {
+		                            x: chunks[4].x,
+		                            y: chunks[5].y.saturating_sub(menu_h),
+		                            width: chunks[4].width,
+		                            height: menu_h,
+		                        };
                         let sel = match send_queue_ui {
                             SendQueueUiState::Selecting { selected } => selected,
                             _ => 0,
@@ -9175,9 +9320,9 @@ fn run_loop(
                     heartbeat_count,
                     response_count,
                 };
-                ui::draw_context_bar(f, &theme, chunks[7], context_line);
-                input_width_cache = chunks[6].width.saturating_sub(2).max(1) as usize;
-            })?;
+	                ui::draw_context_bar(f, &theme, chunks[8], context_line);
+	                input_width_cache = chunks[6].width.saturating_sub(2).max(1) as usize;
+	            })?;
             settings_editor_width_cache = settings_draw
                 .editor_rect
                 .map(|r| r.width.max(1) as usize)
@@ -9239,7 +9384,7 @@ fn run_loop(
                             )
                         {
                         } else if matches!(screen, Screen::Chat)
-                            && matches!(chat_focus, ChatFocus::Input)
+                            && (matches!(chat_focus, ChatFocus::Input) || input.starts_with('/'))
                         {
                             //（1）输入焦点：滚轮用于移动输入光标。
                             //（2）不滚动聊天。
@@ -9287,8 +9432,39 @@ fn run_loop(
                                     && row < r.y.saturating_add(r.height)
                             };
                             if let Some(area) = settings_rect_cache.filter(|r| contains(*r)) {
-                                if settings_editor_rect_cache.is_some_and(contains) {
+                                //（1）未保存确认弹窗：优先处理触控点击（YES/NO）。
+                                if settings.confirm.is_some() {
+                                    if settings_confirm_yes_rect_cache.is_some_and(contains) {
+                                        settings.focus = SettingsFocus::Fields;
+                                        reset_settings_edit(&mut settings);
+                                        changed = true;
+                                        continue;
+                                    }
+                                    if settings_confirm_no_rect_cache.is_some_and(contains) {
+                                        settings.confirm = None;
+                                        settings.focus = SettingsFocus::Prompt;
+                                        changed = true;
+                                        continue;
+                                    }
+                                }
+
+                                if let Some(r) = settings_editor_rect_cache.filter(|r| contains(*r)) {
                                     settings.focus = SettingsFocus::Prompt;
+                                    //（1）提示词编辑：触控点击移动光标。
+                                    let click_x = col.saturating_sub(r.x) as usize;
+                                    let click_y = row.saturating_sub(r.y) as usize;
+                                    let w = r.width.max(1) as usize;
+                                    let h = r.height.max(1) as usize;
+                                    if !settings.edit_buffer.is_empty() {
+                                        settings.edit_cursor = input_cursor_for_click(
+                                            &settings.edit_buffer,
+                                            w,
+                                            h,
+                                            settings.edit_cursor,
+                                            click_x,
+                                            click_y,
+                                        );
+                                    }
                                     changed = true;
                                 } else if row >= area.y && row < area.y.saturating_add(2) {
                                     let rel_row = row.saturating_sub(area.y);
@@ -9343,27 +9519,77 @@ fn run_loop(
                                     && row >= r.y
                                     && row < r.y.saturating_add(r.height)
                             };
-                            //（1）标签页：单击切换发送目标（Matrix/WatchDog/Memory）。
-                            if let Some(tabs_area) = tabs_rect_cache.filter(|r| contains(*r)) {
-                                let rel_col = col.saturating_sub(tabs_area.x);
-                                let w = tabs_area.width.max(1);
-                                let seg = (w / 3).max(1);
-                                let new_target = if rel_col < seg {
-                                    MindKind::Main
-                                } else if rel_col < seg.saturating_mul(2) {
-                                    MindKind::Sub
-                                } else {
-                                    MindKind::Memory
-                                };
-                                if chat_target != new_target {
-                                    chat_target = new_target;
-                                    //（1）切 tab：不改变 active_kind，不重置上下文；只影响“下一条用户消息”发给谁。
-                                    selected_msg_idx = None;
-                                    follow_bottom = true;
-                                    scroll = u16::MAX;
-                                    action_hint =
-                                        Some((now, format!("Tab: {}", mind_label(new_target))));
-                                    changed = true;
+	                            //（1）标签页：单击切换发送目标（Matrix/WatchDog/Memory）。
+	                            if let Some(tabs_area) = tabs_rect_cache.filter(|r| contains(*r)) {
+	                                let rel_col = col.saturating_sub(tabs_area.x) as usize;
+	                                let labels = ["Matrix", "WatchDog", "Memory"];
+	                                let kinds = [MindKind::Main, MindKind::Sub, MindKind::Memory];
+	
+	                                // 触控更友好：不要求精确点中“文字”，而是按“最近 tab 中心”命中。
+	                                // 同时避免误点右侧的 "/ SSE" 状态区。
+	                                let tabs_w = tabs_area.width.max(1) as usize;
+	                                let right = if sse_enabled { "/ SSE" } else { "" };
+	                                let right_w = unicode_width::UnicodeWidthStr::width(right);
+	                                let right_start = if right_w > 0 {
+	                                    tabs_w
+	                                        .saturating_sub(2) // "▓░"
+	                                        .saturating_sub(1 + right_w) // gap + text
+	                                } else {
+	                                    tabs_w
+	                                };
+	
+	                                let mut segs: Vec<(MindKind, usize, usize, usize)> = Vec::new();
+	                                let mut x = 3usize; // left border (2) + leading space (1)
+	                                for i in 0..3 {
+	                                    let label_w =
+	                                        unicode_width::UnicodeWidthStr::width(labels[i]);
+	                                    let w = 1usize // edge
+	                                        + 1usize // space
+	                                        + label_w
+	                                        + 1usize // space
+	                                        + 1usize; // edge
+	                                    let start = x;
+	                                    let end = x.saturating_add(w);
+	                                    let center = start.saturating_add(w / 2);
+	                                    segs.push((kinds[i], start, end, center));
+	                                    x = end.saturating_add(2); // gap between tabs
+	                                }
+
+	                                let mut hit: Option<MindKind> = None;
+	                                if rel_col < right_start {
+	                                    if let (Some(first), Some(last)) = (segs.first(), segs.last()) {
+	                                        let left = first.1.saturating_sub(3);
+	                                        let right = last.2.saturating_add(3);
+	                                        if rel_col >= left && rel_col < right {
+	                                            let mut best = segs[0].0;
+	                                            let mut best_dist = usize::MAX;
+	                                            for (k, _s, _e, c) in segs.iter().copied() {
+	                                                let dist = if rel_col >= c {
+	                                                    rel_col - c
+	                                                } else {
+	                                                    c - rel_col
+	                                                };
+	                                                if dist < best_dist {
+	                                                    best_dist = dist;
+	                                                    best = k;
+	                                                }
+	                                            }
+	                                            hit = Some(best);
+	                                        }
+	                                    }
+	                                }
+
+	                                if let Some(new_target) = hit {
+	                                    if chat_target != new_target {
+	                                        chat_target = new_target;
+	                                        //（1）切 tab：不改变 active_kind，不重置上下文；只影响“下一条用户消息”发给谁。
+	                                        selected_msg_idx = None;
+	                                        follow_bottom = true;
+                                        scroll = u16::MAX;
+                                        action_hint =
+                                            Some((now, format!("Tab: {}", mind_label(new_target))));
+                                        changed = true;
+                                    }
                                 }
                             }
                             //（1）PTY 面板：单击切换焦点到终端（用于终端滚动/交互）。
@@ -9474,7 +9700,7 @@ fn run_loop(
                         let dx = prev_col as i32 - me.column as i32;
                         touch_drag_last_row = Some(me.row);
                         touch_drag_last_col = Some(me.column);
-                        if matches!(screen, Screen::Chat) && matches!(chat_focus, ChatFocus::Input)
+                        if matches!(screen, Screen::Chat) && (matches!(chat_focus, ChatFocus::Input) || input.starts_with('/'))
                         {
                             //（1）输入焦点：手势滑动用于移动输入光标（↑↓←→）。
                             let step_x = dx.unsigned_abs().min(8) as usize;
@@ -9834,20 +10060,39 @@ fn run_loop(
                                         continue;
                                     }
 
+                                    settings.edit_kind = Some(spec.kind);
                                     settings.edit_api_kind = spec.api_kind;
-                                    settings.edit_buffer = field_raw_value(FieldRawValueArgs {
-                                        kind: spec.kind,
-                                        section,
-                                        api_kind,
-                                        dog_cfg: &dog_cfg,
-                                        main_cfg: &main_cfg,
-                                        memory_cfg: &memory_cfg,
-                                        sys_cfg: &sys_cfg,
-                                        dog_prompt_text: &dog_state.prompt,
-                                        main_prompt_text: &main_prompt_text,
-                                        context_prompts: &context_prompts,
-                                    });
+                                    settings.edit_prompt_path = match spec.kind {
+                                        SettingsFieldKind::PromptFile => spec.prompt_path.clone(),
+                                        SettingsFieldKind::DogPrompt => Some(PathBuf::from(&dog_cfg.prompt_path)),
+                                        SettingsFieldKind::MainPrompt => Some(PathBuf::from(&main_cfg.prompt_path)),
+                                        SettingsFieldKind::ContextMainPrompt => Some(context_prompt_path.to_path_buf()),
+                                        _ => None,
+                                    };
+
+                                    settings.edit_buffer = if matches!(spec.kind, SettingsFieldKind::PromptFile) {
+                                        if let Some(path) = spec.prompt_path.as_ref() {
+                                            std::fs::read_to_string(path).unwrap_or_default()
+                                        } else {
+                                            String::new()
+                                        }
+                                    } else {
+                                        field_raw_value(FieldRawValueArgs {
+                                            kind: spec.kind,
+                                            section,
+                                            api_kind,
+                                            dog_cfg: &dog_cfg,
+                                            main_cfg: &main_cfg,
+                                            memory_cfg: &memory_cfg,
+                                            sys_cfg: &sys_cfg,
+                                            dog_prompt_text: &dog_state.prompt,
+                                            main_prompt_text: &main_prompt_text,
+                                            context_prompts: &context_prompts,
+                                        })
+                                    };
+                                    settings.edit_original = settings.edit_buffer.clone();
                                     settings.edit_cursor = settings.edit_buffer.len();
+                                    settings.confirm = None;
                                     if is_prompt_kind(spec.kind) {
                                         settings.focus = SettingsFocus::Prompt;
                                     } else {
@@ -10000,45 +10245,115 @@ fn run_loop(
                                 settings.focus = SettingsFocus::Fields;
                                 continue;
                             }
+                            if let Some(mut dlg) = settings.confirm.clone() {
+                                match key.code {
+                                    KeyCode::Left | KeyCode::Right => {
+                                        dlg.selected = if matches!(dlg.selected, ConfirmChoice::Yes) {
+                                            ConfirmChoice::No
+                                        } else {
+                                            ConfirmChoice::Yes
+                                        };
+                                        settings.confirm = Some(dlg);
+                                        continue;
+                                    }
+                                    KeyCode::Esc => {
+                                        settings.confirm = None;
+                                        continue;
+                                    }
+                                    KeyCode::Enter => {
+                                        if matches!(dlg.selected, ConfirmChoice::Yes) {
+                                            settings.focus = SettingsFocus::Fields;
+                                            reset_settings_edit(&mut settings);
+                                        } else {
+                                            settings.confirm = None;
+                                        }
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                                settings.confirm = Some(dlg);
+                            }
                             match key.code {
                                 KeyCode::Esc => {
-                                    settings.focus = SettingsFocus::Fields;
-                                    reset_settings_edit(&mut settings);
+                                    if settings.edit_buffer != settings.edit_original {
+                                        settings.confirm = Some(ConfirmDialogState {
+                                            msg: "当前改动未保存，是否退出".to_string(),
+                                            selected: ConfirmChoice::No,
+                                            start_tick: spinner_tick,
+                                        });
+                                    } else {
+                                        settings.focus = SettingsFocus::Fields;
+                                        reset_settings_edit(&mut settings);
+                                    }
                                 }
                                 KeyCode::Char('s')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
-                                    let buffer = settings.edit_buffer.clone();
-                                    apply_settings_with_notice(ApplySettingsWithNoticeArgs {
-                                        kind,
-                                        section,
-                                        api_kind: settings.api_kind,
-                                        value: &buffer,
-                                        settings: &mut settings,
-                                        now,
-                                        dog_cfg: &mut dog_cfg,
-                                        main_cfg: &mut main_cfg,
-                                        memory_cfg: &mut memory_cfg,
-                                        sys_cfg: &mut sys_cfg,
-                                        dog_cfg_path: &dog_cfg_path,
-                                        main_cfg_path: &main_cfg_path,
-                                        memory_cfg_path: &memory_cfg_path,
-                                        sys_cfg_path: &sys_cfg_path,
-                                        dog_state: &mut dog_state,
-                                        main_state: &mut main_state,
-                                        memory_state: &mut memory_state,
-                                        mind_ctx_idx_main: &mut mind_ctx_idx_main,
-                                        mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
-                                        mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
-                                        main_prompt_text: &mut main_prompt_text,
-                                        dog_client: &mut dog_client,
-                                        main_client: &mut main_client,
-                                        memory_client: &mut memory_client,
-                                        sys_log: &mut sys_log,
-                                        sys_log_limit: config.sys_log_limit,
-                                        context_prompts: &mut context_prompts,
-                                        context_prompt_path: &context_prompt_path,
-                                    });
+                                    if matches!(kind, SettingsFieldKind::PromptFile) {
+                                        if let Some(path) = settings.edit_prompt_path.clone() {
+                                            let text = settings.edit_buffer.clone();
+                                            match store_prompt_file(&path, &text) {
+                                                Ok(()) => {
+                                                    settings.edit_original = text.clone();
+                                                    if path == PathBuf::from(&dog_cfg.prompt_path) {
+                                                        dog_state.prompt = text.clone();
+                                                        dog_state.reset_context();
+                                                    }
+                                                    if path == PathBuf::from(&main_cfg.prompt_path) {
+                                                        main_prompt_text = text.clone();
+                                                        main_state.prompt = main_prompt_text.clone();
+                                                        main_state.reset_context();
+                                                    }
+                                                    if path == PathBuf::from(&memory_cfg.prompt_path) {
+                                                        memory_state.prompt = text.clone();
+                                                        memory_state.reset_context();
+                                                    }
+                                                    if path == context_prompt_path.to_path_buf() {
+                                                        context_prompts.main_prompt = text.clone();
+                                                    }
+                                                    set_settings_notice(&mut settings, now, "已保存".to_string());
+                                                }
+                                                Err(e) => {
+                                                    set_settings_notice(&mut settings, now, format!("保存失败：{e}"));
+                                                }
+                                            }
+                                        } else {
+                                            set_settings_notice(&mut settings, now, "保存失败：path 为空".to_string());
+                                        }
+                                    } else {
+                                        let buffer = settings.edit_buffer.clone();
+                                        apply_settings_with_notice(ApplySettingsWithNoticeArgs {
+                                            kind,
+                                            section,
+                                            api_kind: settings.api_kind,
+                                            value: &buffer,
+                                            settings: &mut settings,
+                                            now,
+                                            dog_cfg: &mut dog_cfg,
+                                            main_cfg: &mut main_cfg,
+                                            memory_cfg: &mut memory_cfg,
+                                            sys_cfg: &mut sys_cfg,
+                                            dog_cfg_path: &dog_cfg_path,
+                                            main_cfg_path: &main_cfg_path,
+                                            memory_cfg_path: &memory_cfg_path,
+                                            sys_cfg_path: &sys_cfg_path,
+                                            dog_state: &mut dog_state,
+                                            main_state: &mut main_state,
+                                            memory_state: &mut memory_state,
+                                            mind_ctx_idx_main: &mut mind_ctx_idx_main,
+                                            mind_ctx_idx_dog: &mut mind_ctx_idx_dog,
+                                            mind_ctx_idx_memory: &mut mind_ctx_idx_memory,
+                                            main_prompt_text: &mut main_prompt_text,
+                                            dog_client: &mut dog_client,
+                                            main_client: &mut main_client,
+                                            memory_client: &mut memory_client,
+                                            sys_log: &mut sys_log,
+                                            sys_log_limit: config.sys_log_limit,
+                                            context_prompts: &mut context_prompts,
+                                            context_prompt_path: &context_prompt_path,
+                                        });
+                                        settings.edit_original = settings.edit_buffer.clone();
+                                    }
                                 }
                                 KeyCode::Enter => {
                                     edit_buffer_insert_char(
@@ -10332,49 +10647,6 @@ fn run_loop(
                                 );
                                 continue;
                             }
-                            if alt && !ctrl && matches!(key.code, KeyCode::Enter) {
-                                finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-                                    force: true,
-                                    now,
-                                    config: &config,
-                                    paste_capture: &mut paste_capture,
-                                    input: &mut input,
-                                    cursor: &mut cursor,
-                                    input_chars: &mut input_chars,
-                                    pending_pastes: &mut pending_pastes,
-                                    toast: &mut toast,
-                                    max_input_chars,
-                                    burst_count: &mut burst_count,
-                                    burst_last_at: &mut burst_last_at,
-                                    burst_started_at: &mut burst_started_at,
-                                    burst_start_cursor: &mut burst_start_cursor,
-                                    paste_drop_until: &mut paste_drop_until,
-                                    paste_guard_until: &mut paste_guard_until,
-                                });
-                                let ok = send_queue_move_to_low_tail_id(
-                                    &mut send_queue_high,
-                                    &mut send_queue_low,
-                                    id,
-                                    Some(input.clone()),
-                                );
-                                reset_input_buffer(
-                                    &mut input,
-                                    &mut cursor,
-                                    &mut input_chars,
-                                    &mut last_input_at,
-                                );
-                                send_queue_ui = SendQueueUiState::Closed;
-                                push_sys_log(
-                                    &mut sys_log,
-                                    config.sys_log_limit,
-                                    if ok {
-                                        format!("队列消息已置底：#{id}")
-                                    } else {
-                                        format!("队列消息不存在：#{id}")
-                                    },
-                                );
-                                continue;
-                            }
                         }
                         SendQueueUiState::Closed => {}
                     }
@@ -10416,7 +10688,7 @@ fn run_loop(
                 //（1）输入焦点快捷键：允许在输入框里一键切到聊天区进行“浏览/展开/置底”。
                 //（2）目的：提升单手/触控操作效率，同时不破坏“按键按焦点区域生效”的主规则。
                 if matches!(screen, Screen::Chat)
-                    && matches!(chat_focus, ChatFocus::Input)
+                    && (matches!(chat_focus, ChatFocus::Input) || input.starts_with('/'))
                     && matches!(send_queue_ui, SendQueueUiState::Closed)
                     && !ctrl
                     && !pty_view
@@ -10773,14 +11045,15 @@ fn run_loop(
                                                 timeout_secs: Some(30 * 60),
                                                 ..ToolCall::default()
                                             };
-                                            let _ = spawn_interactive_bash_execution(
-                                                call,
-                                                MindKind::Main,
-                                                tx.clone(),
-                                                String::new(),
-                                                String::new(),
-                                                false,
-                                            );
+	                                            let _ = spawn_interactive_bash_execution(
+	                                                call,
+	                                                MindKind::Main,
+	                                                tx.clone(),
+	                                                String::new(),
+	                                                String::new(),
+	                                                false,
+	                                                true,
+	                                            );
                                             needs_redraw = true;
                                         }
                                         if should_exit {
@@ -11528,6 +11801,235 @@ fn run_loop(
                             && !menu_open
                             && matches!(send_queue_ui, SendQueueUiState::Closed)
                             && !(matches!(screen, Screen::Chat) && pty_view);
+                        let input_force_keys = matches!(chat_focus, ChatFocus::Input)
+                            && !menu_open
+                            && matches!(send_queue_ui, SendQueueUiState::Closed)
+                            && (!pty_view || matches!(pty_focus, PtyFocus::Chat));
+                        if input_force_keys && shift {
+                            //（1）强制发送：Shift+↑
+                            //（2）空闲：直接发送；忙碌：入队（高优先级）
+                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+                                force: true,
+                                now,
+                                config: &config,
+                                paste_capture: &mut paste_capture,
+                                input: &mut input,
+                                cursor: &mut cursor,
+                                input_chars: &mut input_chars,
+                                pending_pastes: &mut pending_pastes,
+                                toast: &mut toast,
+                                max_input_chars,
+                                burst_count: &mut burst_count,
+                                burst_last_at: &mut burst_last_at,
+                                burst_started_at: &mut burst_started_at,
+                                burst_start_cursor: &mut burst_start_cursor,
+                                paste_drop_until: &mut paste_drop_until,
+                                paste_guard_until: &mut paste_guard_until,
+                            });
+                            let send = drain_input_for_send(DrainInputForSendArgs {
+                                input: &mut input,
+                                cursor: &mut cursor,
+                                input_chars: &mut input_chars,
+                                last_input_at: &mut last_input_at,
+                                pending_pastes: &mut pending_pastes,
+                                paste_capture: &mut paste_capture,
+                                command_menu_suppress: &mut command_menu_suppress,
+                                pending_pty_snapshot: &mut pending_pty_snapshot,
+                            });
+                            if send.model_text.trim().is_empty() {
+                                continue;
+                            }
+
+                            //（1）命令：仍然先走命令解析（/Help /Settings 等）。
+                            if handle_command(HandleCommandArgs {
+                                core: &mut core,
+                                raw: send.model_text.trim_end(),
+                                meta: &mut metamemo,
+                                context_usage: &mut context_usage,
+                                mode: &mut mode,
+                                screen: &mut screen,
+                                help_ui: &mut help_ui,
+                                should_exit: &mut should_exit,
+                                sse_enabled: &mut sse_enabled,
+                                enter_cmd_shell: &mut pending_cmd_shell,
+                                open_user_terminal: &mut pending_user_terminal,
+                                exit_code: &mut exit_code,
+                                sys_cfg: &mut sys_cfg,
+                                sys_cfg_path: &sys_cfg_path,
+                                sys_log: &mut sys_log,
+                                sys_log_limit: config.sys_log_limit,
+                            })? {
+                                reset_after_command(ResetAfterCommandArgs {
+                                    core: &mut core,
+                                    render_cache: &mut render_cache,
+                                    config: &config,
+                                    reveal_idx: &mut reveal_idx,
+                                    expanded_tool_idxs: &mut expanded_tool_idxs,
+                                    collapsed_tool_idxs: &mut collapsed_tool_idxs,
+                                    expanded_user_idxs: &mut expanded_user_idxs,
+                                    collapsed_user_idxs: &mut collapsed_user_idxs,
+                                    expanded_thinking_idxs: &mut expanded_thinking_idxs,
+                                    collapsed_thinking_idxs: &mut collapsed_thinking_idxs,
+                                    selected_msg_idx: &mut selected_msg_idx,
+                                    tool_preview_chat_idx: &mut tool_preview_chat_idx,
+                                    brief_text: &mut brief_text,
+                                    brief_idx: &mut brief_idx,
+                                    brief_in_progress: &mut brief_in_progress,
+                                    brief_pending_idle: &mut brief_pending_idle,
+                                    thinking_text: &mut thinking_text,
+                                    thinking_idx: &mut thinking_idx,
+                                    thinking_in_progress: &mut thinking_in_progress,
+                                    thinking_pending_idle: &mut thinking_pending_idle,
+                                    thinking_scroll: &mut thinking_scroll,
+                                    thinking_scroll_cap: &mut thinking_scroll_cap,
+                                    thinking_full_text: &mut thinking_full_text,
+                                    thinking_started_at: &mut thinking_started_at,
+                                    tool_preview: &mut tool_preview,
+                                    tool_preview_active: &mut tool_preview_active,
+                                    tool_preview_pending_idle: &mut tool_preview_pending_idle,
+                                    streaming_state: &mut streaming_state,
+                                    active_tool_stream: &mut active_tool_stream,
+                                    screen,
+                                    settings: &mut settings,
+                                    scroll: &mut scroll,
+                                    follow_bottom: &mut follow_bottom,
+                                });
+                                if pending_cmd_shell && matches!(screen, Screen::Chat) {
+                                    pending_cmd_shell = false;
+                                    reset_input_buffer(
+                                        &mut input,
+                                        &mut cursor,
+                                        &mut input_chars,
+                                        &mut last_input_at,
+                                    );
+                                    let _ = run_native_shell(terminal);
+                                    needs_redraw = true;
+                                }
+                                if pending_user_terminal && matches!(screen, Screen::Chat) {
+                                    pending_user_terminal = false;
+                                    reset_input_buffer(
+                                        &mut input,
+                                        &mut cursor,
+                                        &mut input_chars,
+                                        &mut last_input_at,
+                                    );
+                                    core.push_system("··· Terminal 已打开（用户手动）\n- 该窗口中的命令由用户自己执行\n- 退出/关闭请在 Terminal 内自行完成\n- 这不是 AI 启动的自动化任务");
+                                    push_sys_log(
+                                        &mut sys_log,
+                                        config.sys_log_limit,
+                                        "Terminal: user session",
+                                    );
+                                    let call = ToolCall {
+                                        tool: "bash".to_string(),
+                                        input: "exec bash -li".to_string(),
+                                        brief: Some("terminal".to_string()),
+                                        interactive: Some(true),
+                                        cwd: Some("~".to_string()),
+                                        timeout_secs: Some(30 * 60),
+                                        ..ToolCall::default()
+                                    };
+	                                    let _ = spawn_interactive_bash_execution(
+	                                        call,
+	                                        MindKind::Main,
+	                                        tx.clone(),
+	                                        String::new(),
+	                                        String::new(),
+	                                        false,
+	                                        true,
+	                                    );
+                                    needs_redraw = true;
+                                }
+                                if should_exit {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            let target = chat_target;
+                            if matches!(mode, Mode::Generating | Mode::ExecutingTool) {
+                                let id = next_send_queue_id();
+                                send_queue_high.push_back(QueuedUserMessage {
+                                    id,
+                                    target,
+                                    ui_text: send.ui_text,
+                                    model_text: send.model_text,
+                                });
+                                push_sys_log(
+                                    &mut sys_log,
+                                    config.sys_log_limit,
+                                    format!("已入队（高优先级）：#{id} → {:?}", target),
+                                );
+                                continue;
+                            }
+                            if !is_idle_like(mode) {
+                                //（1）其它非空闲态（如 ApprovingTool/编辑态）：不强行发送，改为入队。
+                                let id = next_send_queue_id();
+                                send_queue_high.push_back(QueuedUserMessage {
+                                    id,
+                                    target,
+                                    ui_text: send.ui_text,
+                                    model_text: send.model_text,
+                                });
+                                push_sys_log(
+                                    &mut sys_log,
+                                    config.sys_log_limit,
+                                    format!("已入队（高优先级）：#{id} → {:?}", target),
+                                );
+                                continue;
+                            }
+
+                            clear_brief_state(ClearBriefStateArgs {
+                                brief_text: &mut brief_text,
+                                brief_idx: &mut brief_idx,
+                                brief_in_progress: &mut brief_in_progress,
+                                brief_pending_idle: &mut brief_pending_idle,
+                            });
+                            start_user_chat_request(StartUserChatRequestArgs {
+                                now,
+                                ui_text: send.ui_text,
+                                model_text: send.model_text,
+                                target,
+                                extra_system_override: None,
+                                core: &mut core,
+                                metamemo: &mut metamemo,
+                                context_usage: &mut context_usage,
+                                dog_state: &mut dog_state,
+                                main_state: &mut main_state,
+                                memory_state: &mut memory_state,
+                                sys_cfg: &sys_cfg,
+                                config: &config,
+                                tx: &tx,
+                                mode: &mut mode,
+                                active_kind: &mut active_kind,
+                                active_request_is_internal_placeholder:
+                                    &mut active_request_is_internal_placeholder,
+                                sending_until: &mut sending_until,
+                                sys_log: &mut sys_log,
+                                streaming_state: &mut streaming_state,
+                                request_seq: &mut request_seq,
+                                active_request_id: &mut active_request_id,
+                                active_cancel: &mut active_cancel,
+                                sse_enabled,
+                                next_heartbeat_at: &mut next_heartbeat_at,
+                                thinking_text: &mut thinking_text,
+                                thinking_full_text: &mut thinking_full_text,
+                                thinking_idx: &mut thinking_idx,
+                                thinking_in_progress: &mut thinking_in_progress,
+                                thinking_pending_idle: &mut thinking_pending_idle,
+                                thinking_started_at: &mut thinking_started_at,
+                                expanded_tool_idxs: &mut expanded_tool_idxs,
+                                expanded_thinking_idxs: &mut expanded_thinking_idxs,
+                                scroll: &mut scroll,
+                                follow_bottom: &mut follow_bottom,
+                                token_totals: &mut token_totals,
+                                token_total_path: &token_total_path,
+                                active_request_in_tokens: &mut active_request_in_tokens,
+                                dog_client: &dog_client,
+                                main_client: &main_client,
+                                memory_client: &memory_client,
+                            })?;
+                            continue;
+                        }
                         if input_focused {
                             //（1）输入焦点：↑↓一律用于光标移动（即使输入为空也不滚动聊天）。
                             if !input.is_empty() {
@@ -11568,6 +12070,43 @@ fn run_loop(
                             && !menu_open
                             && matches!(send_queue_ui, SendQueueUiState::Closed)
                             && !(matches!(screen, Screen::Chat) && pty_view);
+                        let input_force_keys = matches!(chat_focus, ChatFocus::Input)
+                            && !menu_open
+                            && matches!(send_queue_ui, SendQueueUiState::Closed)
+                            && (!pty_view || matches!(pty_focus, PtyFocus::Chat));
+                        if input_force_keys && shift {
+                            //（1）强制换行：Shift+↓
+                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
+                                force: true,
+                                now,
+                                config: &config,
+                                paste_capture: &mut paste_capture,
+                                input: &mut input,
+                                cursor: &mut cursor,
+                                input_chars: &mut input_chars,
+                                pending_pastes: &mut pending_pastes,
+                                toast: &mut toast,
+                                max_input_chars,
+                                burst_count: &mut burst_count,
+                                burst_last_at: &mut burst_last_at,
+                                burst_started_at: &mut burst_started_at,
+                                burst_start_cursor: &mut burst_start_cursor,
+                                paste_drop_until: &mut paste_drop_until,
+                                paste_guard_until: &mut paste_guard_until,
+                            });
+                            insert_newline_limited(InsertNewlineArgs {
+                                now,
+                                input: &mut input,
+                                cursor: &mut cursor,
+                                input_chars: &mut input_chars,
+                                pending_pastes: &mut pending_pastes,
+                                pending_pty_snapshot: &mut pending_pty_snapshot,
+                                toast: &mut toast,
+                                max_input_chars,
+                                command_menu_suppress: Some(&mut command_menu_suppress),
+                            });
+                            continue;
+                        }
                         if input_focused {
                             //（1）输入焦点：↑↓一律用于光标移动（即使输入为空也不滚动聊天）。
                             if !input.is_empty() {
@@ -11987,13 +12526,6 @@ fn run_loop(
                         prune_pending_pty_snapshot(&input, &mut pending_pty_snapshot);
                     }
                     KeyCode::Enter => {
-                        //（1）输入框快捷键：
-                        //（2）Enter：发送（空闲）/ 换行（API活跃或粘贴防护）
-                        //（3）Shift+Enter：换行
-                        //（4）Ctrl+Enter：换行
-                        //（5）Alt+Enter：强制入队（最低优先级，空闲时自动出队发送）
-                        let force_newline = (shift || ctrl) && !alt;
-
                         if !ctrl
                             && !shift
                             && input.trim().is_empty()
@@ -12018,46 +12550,9 @@ fn run_loop(
                             }
                             continue;
                         }
-                        if force_newline {
-                            finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-                                force: true,
-                                now,
-                                config: &config,
-                                paste_capture: &mut paste_capture,
-                                input: &mut input,
-                                cursor: &mut cursor,
-                                input_chars: &mut input_chars,
-                                pending_pastes: &mut pending_pastes,
-                                toast: &mut toast,
-                                max_input_chars,
-                                burst_count: &mut burst_count,
-                                burst_last_at: &mut burst_last_at,
-                                burst_started_at: &mut burst_started_at,
-                                burst_start_cursor: &mut burst_start_cursor,
-                                paste_drop_until: &mut paste_drop_until,
-                                paste_guard_until: &mut paste_guard_until,
-                            });
-                            if !insert_newline_limited(InsertNewlineArgs {
-                                now,
-                                input: &mut input,
-                                cursor: &mut cursor,
-                                input_chars: &mut input_chars,
-                                pending_pastes: &mut pending_pastes,
-                                pending_pty_snapshot: &mut pending_pty_snapshot,
-                                toast: &mut toast,
-                                max_input_chars,
-                                command_menu_suppress: Some(&mut command_menu_suppress),
-                            }) {
-                                continue;
-                            }
-                            continue;
-                        }
 
                         //（1）PTY 展开且焦点在聊天输入框：Enter 作为“发送到终端”（用于测试/快速执行）。
-                        //（2）Shift+Enter 仍然强制换行（上面已处理）
-                        //（3）Alt+Enter 仍然走“入队发送给 AI”的语义（下面会处理）
-                        if !alt
-                            && matches!(screen, Screen::Chat)
+                        if matches!(screen, Screen::Chat)
                             && is_pty_panel_active(screen, pty_view, pty_tabs.as_slice())
                             && matches!(pty_focus, PtyFocus::Chat)
                         {
@@ -12109,57 +12604,6 @@ fn run_loop(
                         if matches!(mode, Mode::Generating | Mode::ExecutingTool) {
                             //（1）API 活跃：
                             //（2）默认 Enter 仅换行（避免打断当前请求）
-                            //（3）Shift/Ctrl+Enter：换行（上面已处理）
-                            //（4）Alt+Enter：入队
-
-                            //（1）其它情况：Enter 换行；Alt+Enter 入队。
-                            if alt {
-                                finalize_paste_capture_and_handle(FinalizePasteCaptureArgs {
-                                    force: true,
-                                    now,
-                                    config: &config,
-                                    paste_capture: &mut paste_capture,
-                                    input: &mut input,
-                                    cursor: &mut cursor,
-                                    input_chars: &mut input_chars,
-                                    pending_pastes: &mut pending_pastes,
-                                    toast: &mut toast,
-                                    max_input_chars,
-                                    burst_count: &mut burst_count,
-                                    burst_last_at: &mut burst_last_at,
-                                    burst_started_at: &mut burst_started_at,
-                                    burst_start_cursor: &mut burst_start_cursor,
-                                    paste_drop_until: &mut paste_drop_until,
-                                    paste_guard_until: &mut paste_guard_until,
-                                });
-                                let send = drain_input_for_send(DrainInputForSendArgs {
-                                    input: &mut input,
-                                    cursor: &mut cursor,
-                                    input_chars: &mut input_chars,
-                                    last_input_at: &mut last_input_at,
-                                    pending_pastes: &mut pending_pastes,
-                                    paste_capture: &mut paste_capture,
-                                    command_menu_suppress: &mut command_menu_suppress,
-                                    pending_pty_snapshot: &mut pending_pty_snapshot,
-                                });
-                                if send.model_text.trim().is_empty() {
-                                    continue;
-                                }
-                                let effective_target = chat_target;
-                                let id = next_send_queue_id();
-                                send_queue_low.push_back(QueuedUserMessage {
-                                    id,
-                                    target: effective_target,
-                                    ui_text: send.ui_text,
-                                    model_text: send.model_text,
-                                });
-                                push_sys_log(
-                                    &mut sys_log,
-                                    config.sys_log_limit,
-                                    format!("已入队（最低优先级）：#{id} → {:?}", effective_target),
-                                );
-                                continue;
-                            }
                             insert_newline_limited(InsertNewlineArgs {
                                 now,
                                 input: &mut input,
@@ -12411,9 +12855,7 @@ fn run_loop(
                                 || looks_like_paste
                                 || multi_line_guard
                                 || guard_active;
-                            //（1）强制发送快捷键：Alt+Enter
-                            let force_send = alt;
-                            if paste_context && !force_send {
+                            if paste_context {
                                 //（1）粘贴期间：Enter 一律视为换行（不发送），避免把注入的 Enter 误当作“提交”。
                                 last_input_at = Some(now);
                                 paste_guard_until =
@@ -12563,14 +13005,15 @@ fn run_loop(
                                         timeout_secs: Some(30 * 60),
                                         ..ToolCall::default()
                                     };
-                                    let _ = spawn_interactive_bash_execution(
-                                        call,
-                                        MindKind::Main,
-                                        tx.clone(),
-                                        String::new(),
-                                        String::new(),
-                                        false,
-                                    );
+	                                    let _ = spawn_interactive_bash_execution(
+	                                        call,
+	                                        MindKind::Main,
+	                                        tx.clone(),
+	                                        String::new(),
+	                                        String::new(),
+	                                        false,
+	                                        true,
+	                                    );
                                     needs_redraw = true;
                                 }
                                 if should_exit {
@@ -13159,6 +13602,56 @@ fn handle_model_stream_chunk(
                             render_cache.invalidate(idx);
                             *tool_preview_chat_idx = Some(idx);
                         }
+                    }
+                }
+            }
+        }
+
+        if streaming_state.tool_start.is_none()
+            && let Some(start) = streaming_state.text.find("<tool>")
+        {
+            //（1）增强：当回复前半段有自然语言、后半段开始工具 JSON 时，
+            //（2）不必等待完整 </tool> 才进入 tool stub。
+            //（3）只要能解析出 tool 名称（"tool" 字段已出现），就切换为 stub。
+            //（4）风险：若模型在正文里展示示例 <tool>，这里可能误判；用“行首 + 可解析 tool 名”做最小约束。
+            let line_prefix = streaming_state.text[..start]
+                .rsplit('\n')
+                .next()
+                .unwrap_or("");
+            if line_prefix.trim().is_empty()
+                && extract_tool_name_hint(&streaming_state.text[start..]).is_some()
+            {
+                let prefix = safe_prefix(&streaming_state.text, start);
+                streaming_state.tool_start = Some(start);
+                tool_preview.clear();
+                *tool_preview_active = false;
+                *tool_preview_pending_idle = false;
+                thinking_text.clear();
+                *thinking_in_progress = false;
+                *thinking_pending_idle = false;
+                if let Some(idx) = streaming_state.idx {
+                    let has_prefix = !prefix.trim().is_empty();
+                    let tool_name = extract_tool_name_hint(&streaming_state.text[start..])
+                        .unwrap_or_else(|| "tool".to_string());
+                    let label = crate::mcp::tool_display_label(tool_name.trim());
+                    let stub = build_tool_stream_stub_text(&label, &streaming_state.text[start..]);
+                    if has_prefix {
+                        streaming_state.assistant_idx_before_tool = Some(idx);
+                        if let Some(entry) = core.history.get_mut(idx) {
+                            entry.role = Role::Assistant;
+                            entry.text = prefix.trim_end().to_string();
+                            render_cache.invalidate(idx);
+                        }
+                        core.push_tool_mind(stub, Some(owner));
+                        let tool_idx = core.history.len().saturating_sub(1);
+                        render_cache.invalidate(tool_idx);
+                        streaming_state.idx = Some(tool_idx);
+                        *tool_preview_chat_idx = Some(tool_idx);
+                    } else if let Some(entry) = core.history.get_mut(idx) {
+                        entry.role = Role::Tool;
+                        entry.text = stub;
+                        render_cache.invalidate(idx);
+                        *tool_preview_chat_idx = Some(idx);
                     }
                 }
             }
@@ -14621,83 +15114,87 @@ fn drain_async_events(args: LoopCtx<'_>) {
                     sys_msg,
                 });
             }
-            AsyncEvent::PtyReady {
-                ctrl_tx,
-                cols,
-                rows,
-                owner,
-                job_id,
-                cmd,
-                saved_path,
-                status_path,
-            } => {
-                handle_async_event_pty_ready(HandleAsyncEventPtyReadyArgs {
-                    core,
-                    render_cache,
-                    pty_tabs,
-                    pty_active_idx,
-                    pty_handles,
-                    pty_view,
-                    pty_done_batches,
-                    pty_help_prompt_text,
-                    ctrl_tx,
-                    cols,
-                    rows,
-                    owner,
-                    job_id,
-                    cmd,
-                    saved_path,
-                    status_path,
-                });
-            }
+	            AsyncEvent::PtyReady {
+	                ctrl_tx,
+	                cols,
+	                rows,
+	                owner,
+	                user_initiated,
+	                job_id,
+	                cmd,
+	                saved_path,
+	                status_path,
+	            } => {
+	                handle_async_event_pty_ready(HandleAsyncEventPtyReadyArgs {
+	                    core,
+	                    render_cache,
+	                    pty_tabs,
+	                    pty_active_idx,
+	                    pty_handles,
+	                    pty_view,
+	                    pty_done_batches,
+	                    pty_help_prompt_text,
+	                    ctrl_tx,
+	                    cols,
+	                    rows,
+	                    owner,
+	                    user_initiated,
+	                    job_id,
+	                    cmd,
+	                    saved_path,
+	                    status_path,
+	                });
+	            }
             AsyncEvent::PtyOutput { job_id, bytes } => {
                 handle_async_event_pty_output(pty_tabs.as_mut_slice(), job_id, bytes);
             }
             AsyncEvent::PtySpawned { job_id, pid, pgrp } => {
                 handle_async_event_pty_spawned(pty_tabs.as_mut_slice(), job_id, pid, pgrp);
             }
-            AsyncEvent::PtyJobDone {
-                owner,
-                job_id,
-                cmd,
-                saved_path,
-                status_path,
-                exit_code,
-                timed_out,
-                user_exit,
-                elapsed_ms,
-                bytes,
-                lines,
-            } => {
-                handle_async_event_pty_job_done(HandleAsyncEventPtyJobDoneArgs {
-                    core,
-                    render_cache,
-                    pty_tabs,
-                    pty_active_idx,
-                    pty_handles,
-                    pty_view,
-                    pty_done_batches,
-                    pty_done_followups,
-                    pending_pty_snapshot,
-                    input,
-                    cursor,
-                    input_chars,
-                    last_input_at,
-                    sys_log,
-                    sys_log_limit,
-                    owner,
-                    job_id,
-                    cmd,
-                    saved_path,
-                    status_path,
-                    exit_code,
-                    timed_out,
-                    user_exit,
-                    elapsed_ms,
-                    bytes,
-                    lines,
-                });
-            }
+	            AsyncEvent::PtyJobDone {
+	                owner,
+	                user_initiated,
+	                job_id,
+	                cmd,
+	                saved_path,
+	                status_path,
+	                exit_code,
+	                timed_out,
+	                user_exit,
+	                elapsed_ms,
+	                bytes,
+	                lines,
+	            } => {
+	                handle_async_event_pty_job_done(HandleAsyncEventPtyJobDoneArgs {
+	                    core,
+	                    render_cache,
+	                    pty_tabs,
+	                    pty_active_idx,
+	                    pty_handles,
+	                    pty_view,
+	                    pty_done_batches,
+	                    pty_done_followups,
+	                    pending_pty_snapshot,
+	                    input,
+	                    cursor,
+	                    input_chars,
+	                    last_input_at,
+	                    sys_log,
+	                    sys_log_limit,
+	                    owner,
+	                    user_initiated,
+	                    job_id,
+	                    cmd,
+	                    saved_path,
+	                    status_path,
+	                    exit_code,
+	                    timed_out,
+	                    user_exit,
+	                    elapsed_ms,
+	                    bytes,
+	                    lines,
+	                });
+	            }
             AsyncEvent::PtyToolRequest { owner, call } => {
                 handle_async_event_pty_tool_request(HandleAsyncEventPtyToolRequestArgs {
                     pty_tabs,
@@ -14772,7 +15269,15 @@ fn drain_async_events(args: LoopCtx<'_>) {
                             parts.push(format!("[stdin]\n{stdin}"));
                         }
 
-                        outcome.user_message = parts.join("\n\n").trim_end().to_string();
+	                        let body = parts.join("\n\n").trim_end().to_string();
+	                        outcome.user_message = if state.user_initiated {
+	                            format!(
+	                                "[用户手动 Terminal]\n说明: 以下输出来自用户在 Terminal 面板执行的命令, 不是 AI 自动化任务\njob_id:{}\n\n{}",
+	                                state.job_id, body
+	                            )
+	                        } else {
+	                            body
+	                        };
                         outcome
                             .log_lines
                             .push(format!("saved:{}", state.saved_path));

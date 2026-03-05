@@ -79,6 +79,12 @@ impl DogClient {
             return Err(anyhow::anyhow!("API Key 为空"));
         }
         let http = reqwest::blocking::Client::builder()
+            // 连接复用与 keepalive：减少移动网络/短请求场景的握手开销。
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .pool_max_idle_per_host(2)
+            .connect_timeout(Duration::from_secs(20))
             .build()
             .context("创建 HTTP 客户端失败")?;
         Ok(Self { http, cfg })

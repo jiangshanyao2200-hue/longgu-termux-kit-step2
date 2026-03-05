@@ -14,7 +14,7 @@ use std::sync::Mutex;
 //（1）B 输出与结束
 //（2）AsyncEvent::PtyOutput -> handle_async_event_pty_output
 //（3）-> vt100 parser
-//（4）AsyncEvent::PtyJobDone ->
+//（4）AsyncEvent::PtyJobDone -> 
 //（5）handle_async_event_pty_job_done -> 导出/摘要 ->（可选）回灌模型上下文
 //
 //（1）C 渲染与交互
@@ -84,8 +84,9 @@ pub(super) struct PtyUiState {
     pub(super) pending_since: Option<Instant>,
     pub(super) scroll: u16,
     pub(super) scroll_applied: u16,
-    pub(super) owner: MindKind,
-    pub(super) job_id: u64,
+	pub(super) owner: MindKind,
+	pub(super) user_initiated: bool,
+	pub(super) job_id: u64,
     pub(super) cmd: String,
     pub(super) saved_path: String,
     pub(super) status_path: String,
@@ -105,6 +106,7 @@ pub(super) struct PtyUiStateNewArgs {
     pub(super) cols: u16,
     pub(super) rows: u16,
     pub(super) owner: MindKind,
+    pub(super) user_initiated: bool,
     pub(super) job_id: u64,
     pub(super) cmd: String,
     pub(super) saved_path: String,
@@ -113,11 +115,12 @@ pub(super) struct PtyUiStateNewArgs {
 
 impl PtyUiState {
     pub(super) fn new(args: PtyUiStateNewArgs) -> Self {
-        let PtyUiStateNewArgs {
+	    	        let PtyUiStateNewArgs {
             ctrl_tx,
             cols,
             rows,
             owner,
+            user_initiated,
             job_id,
             cmd,
             saved_path,
@@ -137,6 +140,7 @@ impl PtyUiState {
             scroll: 0,
             scroll_applied: 0,
             owner,
+            user_initiated,
             job_id,
             cmd,
             saved_path,
@@ -366,6 +370,7 @@ pub(super) enum PtyStatusPhase {
 pub(super) struct PtyDoneJob {
     pub(super) job_id: u64,
     pub(super) cmd: String,
+    pub(super) user_initiated: bool,
     pub(super) saved_path: String,
     pub(super) status_path: String,
     pub(super) status: String,
@@ -480,15 +485,17 @@ pub(super) fn format_pty_done_batch_tool_text_unlimited(
         }
     }
     for (idx, j) in jobs.iter().enumerate() {
+        let source = if j.user_initiated { " | 来源:用户" } else { "" };
         out.push_str(&format!("#{}\n", idx + 1));
         out.push_str(&format!(
-            "job_id:{} | 状态:{} | exit:{} | 耗时:{}ms | size:{} | lines:{}\n",
+            "job_id:{} | 状态:{} | exit:{} | 耗时:{}ms | size:{} | lines:{}{}\n",
             j.job_id,
             j.status,
             j.exit_code,
             j.elapsed_ms,
             format_bytes_short(j.bytes),
-            j.lines
+            j.lines,
+            source
         ));
         let cmd_preview = truncate_with_suffix(j.cmd.trim(), 320);
         out.push_str("cmd: ");
@@ -545,15 +552,17 @@ pub(super) fn format_pty_done_batch_tool_text(
     let mut shown = 0usize;
     let mut truncated = false;
     for (idx, j) in jobs.iter().enumerate() {
+        let source = if j.user_initiated { " | 来源:用户" } else { "" };
         out.push_str(&format!("#{}\n", idx + 1));
         out.push_str(&format!(
-            "job_id:{} | 状态:{} | exit:{} | 耗时:{}ms | size:{} | lines:{}\n",
+            "job_id:{} | 状态:{} | exit:{} | 耗时:{}ms | size:{} | lines:{}{}\n",
             j.job_id,
             j.status,
             j.exit_code,
             j.elapsed_ms,
             format_bytes_short(j.bytes),
-            j.lines
+            j.lines,
+            source
         ));
         let cmd_preview = truncate_with_suffix(j.cmd.trim(), 320);
         out.push_str("cmd: ");
@@ -901,6 +910,7 @@ pub(super) fn spawn_interactive_bash_execution(
     pty_started_notice_prompt_text: String,
     pty_started_model_note_template: String,
     send_started_receipt: bool,
+    user_initiated: bool,
 ) -> PtySpawnInfo {
     //（1）cwd 展示：
     //（2）在 $HOME 下：显示 `~` 或 `~/<rel>`
@@ -1057,16 +1067,17 @@ pub(super) fn spawn_interactive_bash_execution(
         let max_input_h = avail.saturating_sub(1).max(1); // chat 至少 1 行
         let pty_h = (avail / 2).max(6).min(max_input_h);
         let init_rows = pty_h.saturating_sub(2).max(4); // 面板上下边框；至少 4 行避免极小尺寸
-        let _ = tx.send(AsyncEvent::PtyReady {
-            ctrl_tx: ctrl_tx.clone(),
-            cols: init_cols,
-            rows: init_rows,
-            owner,
-            job_id,
-            cmd: cmd.clone(),
-            saved_path: saved_path.clone(),
-            status_path: status_path.clone(),
-        });
+	        let _ = tx.send(AsyncEvent::PtyReady {
+	            ctrl_tx: ctrl_tx.clone(),
+	            cols: init_cols,
+	            rows: init_rows,
+	            owner,
+	            user_initiated,
+	            job_id,
+	            cmd: cmd.clone(),
+	            saved_path: saved_path.clone(),
+	            status_path: status_path.clone(),
+	        });
 
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -1094,20 +1105,21 @@ pub(super) fn spawn_interactive_bash_execution(
                 lines: 0,
                 exit_code: Some(exit_code),
             });
-            let _ = tx.send(AsyncEvent::PtyJobDone {
-                owner,
-                job_id,
-                cmd: cmd.clone(),
-                saved_path: saved_path.clone(),
-                status_path: status_path.clone(),
-                exit_code,
-                timed_out: false,
-                user_exit: false,
-                elapsed_ms,
-                bytes: 0,
-                lines: 0,
-            });
-        };
+	            let _ = tx.send(AsyncEvent::PtyJobDone {
+	                owner,
+	                user_initiated,
+	                job_id,
+	                cmd: cmd.clone(),
+	                saved_path: saved_path.clone(),
+	                status_path: status_path.clone(),
+	                exit_code,
+	                timed_out: false,
+	                user_exit: false,
+	                elapsed_ms,
+	                bytes: 0,
+	                lines: 0,
+	            });
+	        };
 
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
@@ -1371,16 +1383,16 @@ pub(super) fn spawn_interactive_bash_execution(
                             s.retain(|ch| ch != '\u{0}');
                             truncate_with_suffix(s.trim(), 2200)
                         };
-                        let started_notice = build_pty_started_notice(
-                            PtyStartedNotice {
-                                owner,
-                                job_id,
-                                cmd: &cmd,
-                                saved_path: &saved_path,
-                                status_path: &status_path,
-                                cwd_display: &cwd_display,
-                                initial_preview: &initial_preview_text,
-                            },
+	                        let started_notice = build_pty_started_notice(
+	                            PtyStartedNotice {
+	                                owner,
+	                                job_id,
+	                                cmd: &cmd,
+	                                saved_path: &saved_path,
+	                                status_path: &status_path,
+	                                cwd_display: &cwd_display,
+	                                initial_preview: &initial_preview_text,
+	                            },
                             &pty_started_notice_prompt_text,
                         );
                         let started_outcome = ToolOutcome {
@@ -1432,16 +1444,16 @@ pub(super) fn spawn_interactive_bash_execution(
                             s.retain(|ch| ch != '\u{0}');
                             truncate_with_suffix(s.trim(), 2200)
                         };
-                        let started_notice = build_pty_started_notice(
-                            PtyStartedNotice {
-                                owner,
-                                job_id,
-                                cmd: &cmd,
-                                saved_path: &saved_path,
-                                status_path: &status_path,
-                                cwd_display: &cwd_display,
-                                initial_preview: &initial_preview_text,
-                            },
+	                        let started_notice = build_pty_started_notice(
+	                            PtyStartedNotice {
+	                                owner,
+	                                job_id,
+	                                cmd: &cmd,
+	                                saved_path: &saved_path,
+	                                status_path: &status_path,
+	                                cwd_display: &cwd_display,
+	                                initial_preview: &initial_preview_text,
+	                            },
                             &pty_started_notice_prompt_text,
                         );
                         let started_outcome = ToolOutcome {
@@ -1553,16 +1565,16 @@ pub(super) fn spawn_interactive_bash_execution(
                 s.retain(|ch| ch != '\u{0}');
                 truncate_with_suffix(s.trim(), 2200)
             };
-            let started_notice = build_pty_started_notice(
-                PtyStartedNotice {
-                    owner,
-                    job_id,
-                    cmd: &cmd,
-                    saved_path: &saved_path,
-                    status_path: &status_path,
-                    cwd_display: &cwd_display,
-                    initial_preview: &initial_preview_text,
-                },
+	            let started_notice = build_pty_started_notice(
+	                PtyStartedNotice {
+	                    owner,
+	                    job_id,
+	                    cmd: &cmd,
+	                    saved_path: &saved_path,
+	                    status_path: &status_path,
+	                    cwd_display: &cwd_display,
+	                    initial_preview: &initial_preview_text,
+	                },
                 &pty_started_notice_prompt_text,
             );
             let started_outcome = ToolOutcome {
@@ -1658,19 +1670,20 @@ pub(super) fn spawn_interactive_bash_execution(
             lines: lines_written,
             exit_code: Some(code),
         });
-        let _ = tx.send(AsyncEvent::PtyJobDone {
-            owner,
-            job_id,
-            cmd,
-            saved_path,
-            status_path,
-            exit_code: code,
-            timed_out: timed_out.load(Ordering::Relaxed),
-            user_exit,
-            elapsed_ms,
-            bytes: bytes_written,
-            lines: lines_written,
-        });
+	    	let _ = tx.send(AsyncEvent::PtyJobDone {
+	    	    owner,
+	    	    user_initiated,
+	    	    job_id,
+	    	    cmd,
+	    	    saved_path,
+	    	    status_path,
+	    	    exit_code: code,
+	    	    timed_out: timed_out.load(Ordering::Relaxed),
+	    	    user_exit,
+	    	    elapsed_ms,
+	    	    bytes: bytes_written,
+	    	    lines: lines_written,
+	    	});
     });
     spawn_info
 }
@@ -1688,6 +1701,7 @@ pub(super) struct HandleAsyncEventPtyReadyArgs<'a> {
     pub(super) cols: u16,
     pub(super) rows: u16,
     pub(super) owner: MindKind,
+    pub(super) user_initiated: bool,
     pub(super) job_id: u64,
     pub(super) cmd: String,
     pub(super) saved_path: String,
@@ -1708,6 +1722,7 @@ pub(super) fn handle_async_event_pty_ready(args: HandleAsyncEventPtyReadyArgs<'_
         cols,
         rows,
         owner,
+        user_initiated,
         job_id,
         cmd,
         saved_path,
@@ -1733,6 +1748,7 @@ pub(super) fn handle_async_event_pty_ready(args: HandleAsyncEventPtyReadyArgs<'_
         cols,
         rows,
         owner,
+        user_initiated,
         job_id,
         cmd,
         saved_path,
@@ -1801,6 +1817,7 @@ pub(super) struct HandleAsyncEventPtyJobDoneArgs<'a> {
     pub(super) sys_log: &'a mut VecDeque<String>,
     pub(super) sys_log_limit: usize,
     pub(super) owner: MindKind,
+    pub(super) user_initiated: bool,
     pub(super) job_id: u64,
     pub(super) cmd: String,
     pub(super) saved_path: String,
@@ -1831,6 +1848,7 @@ pub(super) fn handle_async_event_pty_job_done(args: HandleAsyncEventPtyJobDoneAr
         sys_log,
         sys_log_limit,
         owner,
+        user_initiated,
         job_id,
         cmd,
         saved_path,
@@ -1908,6 +1926,7 @@ pub(super) fn handle_async_event_pty_job_done(args: HandleAsyncEventPtyJobDoneAr
     batch.jobs.push(PtyDoneJob {
         job_id,
         cmd: cmd.clone(),
+        user_initiated,
         saved_path: saved_path.clone(),
         status_path: status_path.clone(),
         status: status.clone(),
@@ -1997,23 +2016,24 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
             items.sort_by_key(|s| s.job_id);
             let mut lines_out: Vec<String> = Vec::new();
             lines_out.push(format!("pty.list running={}", items.len()));
-            for s in items {
-                let elapsed = now.saturating_duration_since(s.started_at).as_secs();
-                let os_pid = s
-                    .pid
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "(pending)".to_string());
+	            for s in items {
+	                let elapsed = now.saturating_duration_since(s.started_at).as_secs();
+	                let src = if s.user_initiated { "user" } else { "ai" };
+	                let os_pid = s
+	                    .pid
+	                    .map(|v| v.to_string())
+	                    .unwrap_or_else(|| "(pending)".to_string());
                 let pgrp = s
                     .pgrp
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "(pending)".to_string());
                 let mut cmd = s.cmd.trim().replace('\n', " ⏎ ").replace('\t', " ");
                 cmd = truncate_with_suffix(&cmd, 72);
-                lines_out.push(format!(
-                    "- pid:{} os_pid:{} pgrp:{} {}s cmd:{}\n  log:{}\n  status:{}",
-                    s.job_id, os_pid, pgrp, elapsed, cmd, s.saved_path, s.status_path
-                ));
-            }
+	                lines_out.push(format!(
+	                    "- pid:{} os_pid:{} pgrp:{} src:{} {}s cmd:{}\n  log:{}\n  status:{}",
+	                    s.job_id, os_pid, pgrp, src, elapsed, cmd, s.saved_path, s.status_path
+	                ));
+	            }
             outcome.user_message = lines_out.join("\n");
             let elapsed_ms = started_at.elapsed().as_millis();
             outcome.log_lines = vec![format!(
@@ -2522,14 +2542,15 @@ pub(super) fn handle_async_event_pty_tool_request(args: HandleAsyncEventPtyToolR
                     timeout_ms: None,
                     ..ToolCall::default()
                 };
-                let spawn = spawn_interactive_bash_execution(
-                    job_call,
-                    owner,
-                    (*tx).clone(),
-                    pty_started_notice_prompt_text.to_string(),
-                    pty_messages.pty_started_model_note.clone(),
-                    false,
-                );
+	                let spawn = spawn_interactive_bash_execution(
+	                    job_call,
+	                    owner,
+	                    (*tx).clone(),
+	                    pty_started_notice_prompt_text.to_string(),
+	                    pty_messages.pty_started_model_note.clone(),
+	                    false,
+	                    false,
+	                );
                 spawns.push(spawn);
             }
             //（1）延迟约 2s：给后台任务一点时间输出头部日志，便于模型看到“已启动并在跑”的证据。

@@ -14,9 +14,8 @@ Project Ying（萤）
 
 输入框
 - Enter：空闲时发送；忙碌时换行
-- Shift+Enter：换行
-- Ctrl+Enter：换行
-- Alt+Enter：强制入队（发送到队列，稍后自动发送）
+- Shift+↑：强制发送（忙碌时入队）
+- Shift+↓：换行
 
 Terminal（PTY）
 当 AI 启动后台终端任务（PTY）后：

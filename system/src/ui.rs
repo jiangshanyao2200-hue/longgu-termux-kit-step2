@@ -74,24 +74,17 @@ fn rule_line_text(width: usize) -> String {
     "─".repeat(width.max(1))
 }
 
-fn stream_cursor_glyph(tick: usize) -> String {
-    if tick.is_multiple_of(2) {
-        "▋".to_string()
-    } else {
-        " ".to_string()
-    }
-}
-
-fn marquee_one_line(text: &str, max_cells: usize, tick: usize) -> String {
+fn marquee_one_line_progress(text: &str, max_cells: usize, progress: usize) -> String {
     let max_cells = max_cells.max(1);
     let t = compact_ws_inline(text);
     if UnicodeWidthStr::width(t.as_str()) <= max_cells {
         return truncate_to_width(&t, max_cells);
     }
 
+    // 跑马相位跟随“流式进度”而非 UI tick：更贴近解析/输出速度，不卡顿也不乱跳。
     let full = format!("{t}   ");
     let full_w = UnicodeWidthStr::width(full.as_str()).max(1);
-    let step = (tick / 4) % full_w;
+    let step = (progress / 4) % full_w;
 
     let mut start_byte = 0usize;
     let mut acc_w = 0usize;
@@ -124,6 +117,88 @@ fn marquee_one_line(text: &str, max_cells: usize, tick: usize) -> String {
         out
     }
 }
+
+fn stream_cursor_glyph(tick: usize) -> String {
+    if tick.is_multiple_of(2) {
+        "▋".to_string()
+    } else {
+        " ".to_string()
+    }
+}
+
+
+#[derive(Clone, Copy)]
+struct TopbarPalette {
+    bg: Color,
+    fg: Color,
+    edge_inner_fg: Color,
+}
+
+fn topbar_palette(_theme: &Theme) -> TopbarPalette {
+    // 顶栏反色：浅白不刺眼（避免纯白“亮瞎”）。
+    let bg = Color::Rgb(228, 228, 228);
+    let fg = Color::Rgb(0, 0, 0);
+    TopbarPalette {
+        bg,
+        fg,
+        edge_inner_fg: Color::Rgb(110, 110, 110),
+    }
+}
+
+fn topbar_edge_width() -> usize {
+    // 左：░▓；右：▓░（用于第一行顶栏；第二行标签页也用同宽度边框以对齐）
+    4
+}
+
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+fn take_spans_prefix(spans: &[Span<'static>], mut max_cells: usize) -> Vec<Span<'static>> {
+    if max_cells == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for s in spans {
+        if max_cells == 0 {
+            break;
+        }
+        let w = UnicodeWidthStr::width(s.content.as_ref());
+        if w <= max_cells {
+            out.push(s.clone());
+            max_cells = max_cells.saturating_sub(w);
+            continue;
+        }
+        let cut = slice_by_cells(s.content.as_ref(), 0, max_cells);
+        if !cut.is_empty() {
+            out.push(Span::styled(cut, s.style));
+        }
+        break;
+    }
+    out
+}
+
+fn take_spans_prefix_ellipsis(spans: &[Span<'static>], max_cells: usize) -> Vec<Span<'static>> {
+    if max_cells == 0 {
+        return Vec::new();
+    }
+    let total = spans_width(spans);
+    if total <= max_cells {
+        return spans.to_vec();
+    }
+    if max_cells == 1 {
+        let st = spans.last().map(|s| s.style).unwrap_or_default();
+        return vec![Span::styled("…", st)];
+    }
+    let mut out = take_spans_prefix(spans, max_cells.saturating_sub(1));
+    let st = out.last().map(|s| s.style).unwrap_or_default();
+    out.push(Span::styled("…", st));
+    out
+}
+
 
 fn truncate_to_width_ellipsis(text: &str, max_cells: usize) -> String {
     if max_cells == 0 {
@@ -503,11 +578,11 @@ fn split_user_paste_blocks(text: &str) -> (String, Vec<UserHiddenBlock>) {
 }
 
 fn render_user_preview_lines(text: &str, width: usize) -> Vec<String> {
-    const MAX_LINES: usize = 3;
+    const MAX_LINES: usize = 10;
     let width = width.max(1);
 
-    // 普通用户消息：最多显示 3 行。
-    let content_max = 3;
+    // 普通用户消息：最多显示 10 行。
+    let content_max = 10;
     let mut out: Vec<String> = Vec::new();
     let mut truncated = false;
     let mut produced = 0usize;
@@ -562,6 +637,18 @@ fn truncate_by_chars(text: &str, limit: usize) -> String {
     out
 }
 
+fn tail_by_chars(text: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    let total = text.chars().count();
+    if total <= limit {
+        return text.to_string();
+    }
+    let start = total.saturating_sub(limit);
+    text.chars().skip(start).collect()
+}
+
 fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     match (a, b) {
         (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
@@ -593,6 +680,7 @@ struct SeparatorSpansArgs<'a> {
     len: usize,
     mode: Mode,
     active_kind: MindKind,
+    cursor_x: Option<usize>,
     user_active: bool,
     highlight: bool,
     tick: usize,
@@ -604,6 +692,7 @@ fn build_separator_spans(args: SeparatorSpansArgs<'_>) -> Vec<Span<'static>> {
         len,
         mode,
         active_kind: _active_kind,
+        cursor_x,
         user_active,
         highlight,
         tick,
@@ -620,7 +709,7 @@ fn build_separator_spans(args: SeparatorSpansArgs<'_>) -> Vec<Span<'static>> {
         mode,
         Mode::Generating | Mode::ExecutingTool | Mode::ApprovingTool
     );
-    let use_user = user_active && !active;
+    let use_user = user_active;
     let base_style = Style::default()
         .fg(if highlight {
             theme.border_active
@@ -649,12 +738,17 @@ fn build_separator_spans(args: SeparatorSpansArgs<'_>) -> Vec<Span<'static>> {
         .add_modifier(Modifier::BOLD);
     if use_user {
         // 输入态“光标”更快一点：小屏上更利落，减少等待感。
-        let p = tick.saturating_mul(7) % len;
+        let p = cursor_x
+            .unwrap_or_else(|| tick.saturating_mul(7) % len)
+            .min(len.saturating_sub(1));
         let mut spans = Vec::with_capacity(3);
         if p > 0 {
             spans.push(Span::styled("─".repeat(p), base_style));
         }
-        spans.push(Span::styled("─".to_string(), hi_style_user));
+        const GLYPHS: &[&str] = &["░","▒","▓","█","▌","▐","▄","▀","·","-","━"];
+        let m = mix64((tick as u64) ^ (p as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        let ch = GLYPHS[(m as usize) % GLYPHS.len()];
+        spans.push(Span::styled(ch, hi_style_user));
         let rest = len.saturating_sub(p.saturating_add(1));
         if rest > 0 {
             spans.push(Span::styled("─".repeat(rest), base_style));
@@ -666,7 +760,7 @@ fn build_separator_spans(args: SeparatorSpansArgs<'_>) -> Vec<Span<'static>> {
         return vec![Span::styled("━".repeat(len), hi_style_focus)];
     }
     if active {
-        // “中间呼吸”：宽度在 1/3/5 之间变化，避免跑马。
+        // 活跃态：统一为轻量‘呼吸’动效，避免跑马/乱码影响阅读。
         let phase = tick % 8;
         let hi = match phase {
             0 | 1 => 1,
@@ -731,6 +825,55 @@ fn extract_tool_detail(text: &str) -> &str {
         pos = pos.saturating_add(line.len().saturating_add(1));
     }
     text
+}
+
+
+fn tool_output_slice(text: &str) -> &str {
+    // Fast path for UI-only preview: avoid allocating Vec<String> for all sections.
+    // Return the substring that belongs to the `output:` section, excluding the leading header line.
+    let mut pos = 0usize;
+    let mut start: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if start.is_none() && trimmed.eq_ignore_ascii_case("output:") {
+            // Start after the `output:` line and its trailing n (if present).
+            let after = pos
+                .saturating_add(line.len())
+                .saturating_add(1)
+                .min(text.len());
+            start = Some(after);
+            pos = pos.saturating_add(line.len().saturating_add(1));
+            continue;
+        }
+        if start.is_some() && trimmed.eq_ignore_ascii_case("meta:") {
+            let s = start.unwrap_or(text.len()).min(text.len());
+            let e = pos.min(text.len());
+            if s >= e {
+                return "";
+            }
+            return &text[s..e];
+        }
+        pos = pos.saturating_add(line.len().saturating_add(1));
+    }
+    let s = start.unwrap_or(text.len()).min(text.len());
+    if s >= text.len() {
+        return "";
+    }
+    &text[s..]
+}
+
+fn tool_output_has_text(output: &str) -> bool {
+    for line in output.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.eq_ignore_ascii_case("```text") || t == "```" {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 fn extract_tool_sections(text: &str) -> (Vec<String>, Vec<String>) {
@@ -829,6 +972,32 @@ fn extract_tool_explain(text: &str) -> Option<String> {
     }
     None
 }
+
+fn extract_tool_input_value(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("output:"))
+            || trimmed
+                .get(..5)
+                .is_some_and(|head| head.eq_ignore_ascii_case("meta:"))
+        {
+            break;
+        }
+        if trimmed
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("input:"))
+        {
+            let val = trimmed[6..].trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 
 fn extract_tool_saved_path(text: &str) -> Option<String> {
     fn extract_from_line(line: &str) -> Option<String> {
@@ -1185,6 +1354,38 @@ fn push_blank_line(out: &mut Vec<Line<'static>>) {
         return;
     }
     out.push(Line::from(""));
+}
+
+fn push_blank_line_after(out: &mut Vec<Line<'static>>, role: Role, next_role: Option<Role>) {
+    let Some(next) = next_role else {
+        return;
+    };
+
+    let blanks = if role == Role::User || next == Role::User {
+        2
+    } else if role == Role::Tool && next == Role::Tool {
+        1
+    } else if role == Role::Tool && next == Role::Assistant {
+        2
+    } else if role == Role::Assistant && next == Role::Tool {
+        2
+    } else {
+        0
+    };
+
+    if blanks == 0 {
+        return;
+    }
+
+    while out.last().is_some_and(|line| line.width() == 0) {
+        out.pop();
+    }
+
+    // push 1 or 2 blank lines as requested
+    push_blank_line(out);
+    if blanks >= 2 {
+        out.push(Line::from(""));
+    }
 }
 
 fn push_tool_explain_line(
@@ -2387,7 +2588,7 @@ pub fn draw_settings_status(
     };
     let max_w = area.width.max(1) as usize;
     // 与聊天页的“输入状态栏”统一：左侧圆点 + 文本（偏灰），避免蓝色跑马/强对比打扰。
-    let dot = "";
+    let dot = "☯";
     let left_pad = 1usize;
     let dot_w = UnicodeWidthStr::width(dot);
     // 右侧动作提示：仅用于人类观测。
@@ -2483,16 +2684,16 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
         user_active: _user_active,
         pulse_dir: _pulse_dir,
         tick,
-        run_secs,
+        run_secs: _run_secs,
+        right: right_text,
     } = args;
-    // 顶栏一行：左（品牌静态）/中（提示）/右（运行时间）
-    // 约束：顶栏不要展示 Working/Connecting/Ready 等动态状态（避免噪声与误导）。
+    // 顶栏一行：反色（浅白底黑字）+ 渐变边缘（░▓ ... ▓░）。
+    let pal = topbar_palette(theme);
     let block = Block::default()
         .borders(Borders::NONE)
         .style(Style::default().bg(theme.bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let max_w = inner.width.max(1) as usize;
     if inner.height == 0 {
         return;
     }
@@ -2504,8 +2705,6 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
         height: 1,
     };
 
-    // 左侧：状态栏（动态）。
-    // 只展示哪些窗口在工作，避免 Connecting/Ready 等噪声。
     let is_busy = |m: Mode| {
         matches!(
             m,
@@ -2522,88 +2721,119 @@ pub fn draw_header(f: &mut ratatui::Frame, args: DrawHeaderArgs<'_>) {
     if is_busy(memory_mode) {
         working.push("Memory");
     }
-    let raw_left = if working.is_empty() {
-        "●NOW Working · Ready".to_string()
+
+    let raw_right = right_text.trim();
+    let raw_right = if raw_right.is_empty() {
+        String::new()
     } else {
-        format!("●NOW Working · {}", working.join(" · "))
+        format!("{raw_right} ")
     };
+    let raw_left_fallback = "NOW · Powered by AItermux".to_string();
 
-    // 右侧：运行时间（days>0 时显示 Days；其它 0 值段不显示）。不加图标，减少视觉噪声。
-    let uptime = {
-        let days = (run_secs / 86_400).min(999);
-        let rem = run_secs % 86_400;
-        let h = rem / 3600;
-        let m = (rem % 3600) / 60;
-        let s = rem % 60;
-        if days > 0 {
-            format!("{days}Days-{h:02}:{m:02}:{s:02}")
-        } else if h > 0 {
-            format!("{h:02}:{m:02}:{s:02}")
-        } else if m > 0 {
-            format!("{m:02}:{s:02}")
-        } else {
-            format!("{s}s")
-        }
-    };
-    let uptime_w = UnicodeWidthStr::width(uptime.as_str()).min(max_w).max(1) as u16;
-    let right_line = Line::from(Span::styled(
-        uptime,
-        Style::default()
-            .fg(theme.dim)
-            .bg(theme.bg)
-            .add_modifier(Modifier::BOLD),
-    ));
-
-    let line_w = line_area.width.max(1);
-    if uptime_w >= line_w {
-        // 极窄屏：只显示右侧运行时间（其它信息无空间）。
-        let right_p = Paragraph::new(Text::from(right_line))
-            .block(Block::default().borders(Borders::NONE))
-            .style(Style::default().bg(theme.bg))
-            .alignment(ratatui::layout::Alignment::Right);
-        f.render_widget(right_p, line_area);
-        return;
-    }
-    let right_area = Rect {
-        x: line_area.x.saturating_add(line_w.saturating_sub(uptime_w)),
-        y: line_area.y,
-        width: uptime_w,
-        height: 1,
-    };
-
-    let max_left = line_w.saturating_sub(uptime_w).saturating_sub(1);
-    let left_area = Rect {
-        x: line_area.x,
-        y: line_area.y,
-        width: max_left,
-        height: 1,
-    };
-
-    if left_area.width > 0 {
-        let max_cells = left_area.width.max(1) as usize;
-        let shown = if UnicodeWidthStr::width(raw_left.as_str()) <= max_cells {
-            truncate_to_width(raw_left.as_str(), max_cells)
-        } else {
-            marquee_one_line(raw_left.as_str(), max_cells, tick)
-        };
-        let left_line = Line::from(vec![Span::styled(
+    let line_w = line_area.width.max(1) as usize;
+    let edge_w = topbar_edge_width();
+    if line_w <= edge_w {
+        let shown = truncate_to_width_middle_ellipsis(raw_left_fallback.as_str(), line_w);
+        let p = Paragraph::new(Text::from(Line::from(Span::styled(
             shown,
             Style::default()
-                .fg(theme.dim)
-                .bg(theme.bg)
+                .fg(pal.fg)
+                .bg(pal.bg)
                 .add_modifier(Modifier::BOLD),
-        )]);
-        let left_p = Paragraph::new(Text::from(left_line))
-            .block(Block::default().borders(Borders::NONE))
-            .style(Style::default().bg(theme.bg));
-        f.render_widget(left_p, left_area);
+        ))))
+        .style(Style::default().bg(pal.bg));
+        f.render_widget(p, line_area);
+        return;
+    }
+    let inner_w = line_w.saturating_sub(edge_w);
+    let right_w = UnicodeWidthStr::width(raw_right.as_str()).min(inner_w);
+    let gap = if right_w > 0 { 2 } else { 0 };
+    let left_max = inner_w.saturating_sub(right_w).saturating_sub(gap).max(1);
+
+    // - NOW 不斜体；仅“标签名称”斜体（Matrix/WatchDog/Memory）
+    let plain = Style::default()
+        .fg(pal.fg)
+        .bg(pal.bg)
+        .add_modifier(Modifier::BOLD);
+    let italic = Style::default()
+        .fg(pal.fg)
+        .bg(pal.bg)
+        .add_modifier(Modifier::BOLD | Modifier::ITALIC);
+
+    let mut prefix_spans: Vec<Span<'static>> = Vec::new();
+    prefix_spans.push(Span::styled(" ", plain));
+    prefix_spans.push(Span::styled("NOW", plain));
+    prefix_spans.push(Span::styled(" · ", plain));
+
+    let mut suffix_spans: Vec<Span<'static>> = Vec::new();
+    if working.is_empty() {
+        suffix_spans.push(Span::styled("Powered by AItermux", italic));
+    } else if working.len() > 3 {
+        suffix_spans.push(Span::styled("More than 3 tabs working", italic));
+    } else {
+        for (i, name) in working.iter().enumerate() {
+            if i > 0 {
+                suffix_spans.push(Span::styled(" · ", plain));
+            }
+            suffix_spans.push(Span::styled((*name).to_string(), italic));
+        }
+        suffix_spans.push(Span::styled(" · ", plain));
+        suffix_spans.push(Span::styled("Working", italic));
+        let dots_n = (tick / 2) % 3 + 1;
+        suffix_spans.push(Span::styled(".".repeat(dots_n), italic));
     }
 
-    let right_p = Paragraph::new(Text::from(right_line))
+    let build_left = |suffix: &[Span<'static>]| {
+        let mut v: Vec<Span<'static>> = Vec::new();
+        v.extend(prefix_spans.iter().cloned());
+        v.extend(suffix.iter().cloned());
+        v
+    };
+    let mut left_content: Vec<Span<'static>> = build_left(&suffix_spans);
+
+
+    // 若左侧会挤压到右侧 provider：直接退化为固定短语，避免“半截标签 + …”。
+    if !working.is_empty()
+        && working.len() > 1
+        && spans_width(&left_content) > left_max
+    {
+        let short = vec![Span::styled("More than 3 tabs working", italic)];
+        left_content = build_left(&short);
+    }
+
+    // 裁切到 left_max（保留样式，不让 ●/▍变斜体）
+    let left_shown = take_spans_prefix_ellipsis(&left_content, left_max);
+    let left_w = spans_width(&left_shown);
+    let pad = inner_w.saturating_sub(left_w).saturating_sub(right_w);
+
+    let edge_inner_style = Style::default()
+        .fg(pal.edge_inner_fg)
+        .bg(pal.bg)
+        .add_modifier(Modifier::BOLD);
+    let right_style = Style::default()
+        .fg(pal.fg)
+        .bg(pal.bg)
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled("░▓", edge_inner_style));
+    spans.extend(left_shown);
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(pal.bg)));
+    }
+    if right_w > 0 {
+        spans.push(Span::styled(
+            truncate_to_width_middle_ellipsis(raw_right.as_str(), right_w),
+            right_style,
+        ));
+    }
+    spans.push(Span::styled("▓░", edge_inner_style));
+
+    let p = Paragraph::new(Text::from(Line::from(spans)))
         .block(Block::default().borders(Borders::NONE))
-        .style(Style::default().bg(theme.bg))
-        .alignment(ratatui::layout::Alignment::Right);
-    f.render_widget(right_p, right_area);
+        .style(Style::default().bg(pal.bg))
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, line_area);
 }
 
 pub struct DrawHeaderArgs<'a> {
@@ -2618,6 +2848,7 @@ pub struct DrawHeaderArgs<'a> {
     pub pulse_dir: Option<PulseDir>,
     pub tick: usize,
     pub run_secs: u64,
+    pub right: &'a str,
 }
 
 pub struct DrawChatTabsArgs<'a> {
@@ -2628,6 +2859,7 @@ pub struct DrawChatTabsArgs<'a> {
     pub dog_busy: bool,
     pub memory_busy: bool,
     pub tick: usize,
+    pub sse_enabled: bool,
 }
 
 pub fn draw_chat_tabs(f: &mut ratatui::Frame, args: DrawChatTabsArgs<'_>) {
@@ -2639,61 +2871,115 @@ pub fn draw_chat_tabs(f: &mut ratatui::Frame, args: DrawChatTabsArgs<'_>) {
         dog_busy,
         memory_busy,
         tick,
+        sse_enabled,
     } = args;
     if area.height == 0 || area.width == 0 {
         return;
     }
 
+    // 标签页：黑底白字（与背景一致）。
+    // - 选中：反色块
+    // - busy：柔和呼吸（不做乱码/扫描，不左右抖动）
     let labels = ["Matrix", "WatchDog", "Memory"];
     let kinds = [MindKind::Main, MindKind::Sub, MindKind::Memory];
     let busy = [main_busy, dog_busy, memory_busy];
-    let accents = [theme.cyan, theme.magenta, theme.magenta];
 
-    let w = area.width.max(1);
-    let seg = (w / 3).max(1);
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let line_w = area.width.max(1) as usize;
+    let edge_w = topbar_edge_width();
+    let inner_w = line_w.saturating_sub(edge_w).max(1);
+
+    let bar_bg = theme.bg;
+    let bar_fg = theme.fg;
+    let sep_fg = theme.dim;
+
+    let tab_base = Style::default().fg(bar_fg).bg(bar_bg);
+    let right = if sse_enabled { "/ SSE" } else { "" };
+    let right_w = UnicodeWidthStr::width(right).min(inner_w);
+
+    let edge_glyph = "▍";
+
+    let mut left_spans: Vec<Span<'static>> = Vec::new();
+    left_spans.push(Span::styled(" " , Style::default().bg(bar_bg)));
 
     for i in 0..3 {
-        let width = if i == 2 {
-            w.saturating_sub(seg.saturating_mul(2))
-        } else {
-            seg
-        };
-        let max_cells = width.max(1) as usize;
-        let label = labels[i];
-        let selected = active_tab == kinds[i];
-        let mut fg = theme.dim;
-        if busy[i] || selected {
-            fg = pulse_color(theme, accents[i], tick);
+        if i > 0 {
+            left_spans.push(Span::styled("  " , Style::default().bg(bar_bg)));
         }
-        let style = Style::default()
-            .fg(fg)
-            .bg(theme.bg)
-            .add_modifier(Modifier::BOLD);
 
-        let text = truncate_to_width(label, max_cells);
-        let pad_total = max_cells.saturating_sub(UnicodeWidthStr::width(text.as_str()));
-        let pad_left = pad_total / 2;
-        let pad_right = pad_total.saturating_sub(pad_left);
+        let selected = active_tab == kinds[i];
+        let is_busy = busy[i];
 
-        spans.push(Span::styled(
-            " ".repeat(pad_left),
-            Style::default().bg(theme.bg),
-        ));
-        spans.push(Span::styled(text, style));
-        spans.push(Span::styled(
-            " ".repeat(pad_right),
-            Style::default().bg(theme.bg),
-        ));
+        let breathe_phase = tick % 8;
+        let breathe_on = matches!(breathe_phase, 2 | 3 | 4 | 5);
+
+        let mut label_style = tab_base;
+        if selected {
+            label_style = label_style.add_modifier(Modifier::REVERSED);
+        }
+        if is_busy {
+            label_style = label_style.add_modifier(Modifier::ITALIC);
+            if selected {
+                // 选中+busy：不改颜色，避免反色态太闪；仅轻微粗细变化。
+                if breathe_on {
+                    label_style = label_style.add_modifier(Modifier::BOLD);
+                }
+            } else {
+                // 未选中 busy：前景色从 dim -> fg 轻微呼吸。
+                label_style = label_style.fg(pulse_color(theme, bar_fg, tick));
+            }
+        } else if selected {
+            label_style = label_style.add_modifier(Modifier::BOLD);
+        }
+
+        let edge_style = if selected {
+            tab_base.add_modifier(Modifier::REVERSED).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(sep_fg).bg(bar_bg).add_modifier(Modifier::BOLD)
+        };
+        let space_style = Style::default().bg(bar_bg);
+
+        left_spans.push(Span::styled(edge_glyph, edge_style));
+        left_spans.push(Span::styled(" " , space_style));
+        left_spans.push(Span::styled(labels[i], label_style));
+        left_spans.push(Span::styled(" " , space_style));
+        left_spans.push(Span::styled(edge_glyph, edge_style));
     }
 
-    let line = Line::from(spans);
-    let p = Paragraph::new(Text::from(line))
+    let left_w_used: usize = left_spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+
+    let gap = if right_w > 0 { 1 } else { 0 };
+    let pad = inner_w
+        .saturating_sub(left_w_used.min(inner_w))
+        .saturating_sub(right_w)
+        .saturating_sub(gap);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let edge_style = Style::default().fg(sep_fg).bg(bar_bg).add_modifier(Modifier::BOLD);
+
+    spans.push(Span::styled("░▓", edge_style));
+    spans.extend(left_spans);
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bar_bg)));
+    }
+    if right_w > 0 {
+        spans.push(Span::styled(" " , Style::default().bg(bar_bg)));
+        spans.push(Span::styled(
+            truncate_to_width(right, right_w),
+            Style::default().fg(bar_fg).bg(bar_bg).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled("▓░", edge_style));
+
+    let p = Paragraph::new(Text::from(Line::from(spans)))
         .block(Block::default().borders(Borders::NONE))
-        .style(Style::default().bg(theme.bg))
+        .style(Style::default().bg(bar_bg))
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
+
 pub fn draw_chat(
     f: &mut ratatui::Frame,
     theme: &Theme,
@@ -2709,6 +2995,7 @@ pub fn draw_chat(
 }
 
 pub struct DrawHintLineArgs<'a> {
+    #[allow(dead_code)]
     pub theme: &'a Theme,
     pub area: Rect,
     pub hint: &'a str,
@@ -2723,7 +3010,7 @@ pub struct DrawHintLineArgs<'a> {
 
 pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
     let DrawHintLineArgs {
-        theme,
+        theme: _,
         area,
         hint,
         right_hint,
@@ -2738,16 +3025,43 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         return;
     }
 
-    let dot = "";
+    // 输入框状态栏：反色白底黑字（提升可读性与“输入区边界”辨识度）。
+    let bar_bg = Color::Rgb(228, 228, 228);
+    let bar_fg = Color::Rgb(0, 0, 0);
+    let bar_dim = Color::Rgb(60, 60, 60);
+
+    // 铺底色，避免右侧残留旧背景色。
+    let bg = Block::default()
+        .borders(Borders::NONE)
+        .style(Style::default().bg(bar_bg));
+    f.render_widget(bg, area);
+
+    let dot = "●";
     let dot_w = UnicodeWidthStr::width(dot);
-    let max_w = area.width.max(1) as usize;
+
+    let full_w = area.width.max(1) as usize;
+    // 左右边框：与顶栏风格对齐。窄屏下自动关闭，避免挤压正文。
+    let (edge_left, edge_right) = if full_w >= 18 {
+        ("░▓", "▓░")
+    } else {
+        ("", "")
+    };
+    let edge_left_w = UnicodeWidthStr::width(edge_left);
+    let edge_right_w = UnicodeWidthStr::width(edge_right);
+    let edge_total = edge_left_w.saturating_add(edge_right_w);
+    let max_w = full_w.saturating_sub(edge_total).max(1);
+
+    let edge_style = Style::default()
+        .fg(bar_fg)
+        .bg(bar_bg)
+        .add_modifier(Modifier::BOLD);
 
     // 右侧动作提示（仅用于人类观测，不影响上下文/协议层）。
     // 例如：Tab/Shift+Tab/焦点切换/置底/回溯等。
     let mut rhs = compact_ws(right_hint).trim().to_string();
     let rhs_style = Style::default()
-        .fg(theme.cyan)
-        .bg(theme.bg)
+        .fg(bar_fg)
+        .bg(bar_bg)
         .add_modifier(Modifier::BOLD);
 
     let mut body = compact_ws(hint);
@@ -2827,8 +3141,8 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         // 速度偏快：手机小屏上更像“活跃指示”，但不至于闪烁刺眼。
         let phase = (tick / 6) % 3;
         let dots = match phase {
-            0 => ".",
-            1 => "..",
+            0 => ".  ",
+            1 => ".. ",
             _ => "...",
         };
         body = format!("{base}{dots}");
@@ -2843,21 +3157,21 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
     // - 动效主要由圆点承担（更像“状态灯”）
     let left_pad = 1usize;
     let dot_color = if body.trim().eq_ignore_ascii_case("ready") {
-        theme.dim
+        bar_dim
     } else if mode == Mode::ApprovingTool {
-        theme.border_warn
+        bar_fg
     } else if active || user_active {
-        pulse_color(theme, theme.fg, tick)
+        bar_fg
     } else {
-        theme.dim
+        bar_dim
     };
     let dot_style = Style::default()
         .fg(dot_color)
-        .bg(theme.bg)
+        .bg(bar_bg)
         .add_modifier(Modifier::BOLD);
     let text_style = Style::default()
-        .fg(theme.dim)
-        .bg(theme.bg)
+        .fg(bar_fg)
+        .bg(bar_bg)
         .add_modifier(Modifier::BOLD);
 
     // 乱码展开动画：● 闪烁三次 → 乱码收敛到正文。
@@ -3015,24 +3329,21 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
 
     let dot_char = if dot_visible { dot } else { " " };
     let mut spans: Vec<Span<'static>> = Vec::new();
+    if !edge_left.is_empty() {
+        spans.push(Span::styled(edge_left, edge_style));
+    }
     if left_pad > 0 {
         spans.push(Span::styled(
             " ".repeat(left_pad),
-            Style::default().bg(theme.bg),
+            Style::default().bg(bar_bg),
         ));
     }
     spans.push(Span::styled(dot_char, dot_style));
-    spans.push(Span::styled(" ", Style::default().bg(theme.bg)));
+    spans.push(Span::styled(" ", Style::default().bg(bar_bg)));
     if !anim || phase >= reveal_end {
         // 动画结束后才展示 markdown 高亮，避免 `**` 影响动画宽度计算。
-        let normal = Style::default()
-            .fg(theme.dim)
-            .bg(theme.bg)
-            .add_modifier(Modifier::BOLD);
-        let bold = Style::default()
-            .fg(theme.fg)
-            .bg(theme.bg)
-            .add_modifier(Modifier::BOLD);
+        let normal = Style::default().fg(bar_dim).bg(bar_bg).add_modifier(Modifier::BOLD);
+        let bold = Style::default().fg(bar_fg).bg(bar_bg).add_modifier(Modifier::BOLD);
         for (t, is_bold) in segs.iter() {
             if t.is_empty() {
                 continue;
@@ -3053,19 +3364,22 @@ pub fn draw_hint_line(f: &mut ratatui::Frame, args: DrawHintLineArgs<'_>) {
         if used_w < max_w {
             spans.push(Span::styled(
                 " ".repeat(max_w.saturating_sub(used_w)),
-                Style::default().bg(theme.bg),
+                Style::default().bg(bar_bg),
             ));
         }
     } else {
         let pad = max_w.saturating_sub(rhs_w).saturating_sub(used_w);
         if pad > 0 {
-            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(theme.bg)));
+            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bar_bg)));
         }
         spans.push(Span::styled(rhs, rhs_style));
     }
+    if !edge_right.is_empty() {
+        spans.push(Span::styled(edge_right, edge_style));
+    }
     let p = Paragraph::new(Text::from(Line::from(spans)))
         .block(Block::default().borders(Borders::NONE))
-        .style(Style::default().bg(theme.bg));
+        .style(Style::default().bg(bar_bg));
     f.render_widget(p, area);
 }
 
@@ -3128,6 +3442,7 @@ pub fn draw_separator(f: &mut ratatui::Frame, args: DrawSeparatorArgs<'_>) {
         user_active,
         highlight,
         tick,
+        cursor_x,
         hint,
     } = args;
     if area.height == 0 {
@@ -3154,13 +3469,14 @@ pub fn draw_separator(f: &mut ratatui::Frame, args: DrawSeparatorArgs<'_>) {
             len: max_w,
             mode,
             active_kind,
+            cursor_x,
             user_active,
             highlight,
             tick,
             theme,
         }))
     } else {
-        let dot = "";
+        let dot = "●";
         let dot_w = UnicodeWidthStr::width(dot);
         let max_hint_w = max_w.saturating_sub(dot_w.saturating_add(3));
         let hint_text = if max_hint_w == 0 {
@@ -3233,6 +3549,7 @@ pub struct DrawSeparatorArgs<'a> {
     pub user_active: bool,
     pub highlight: bool,
     pub tick: usize,
+    pub cursor_x: Option<usize>,
     pub hint: &'a str,
 }
 
@@ -3517,6 +3834,7 @@ fn render_message_lines(
     let text = strip_timeline_footer_for_ui(&msg.text);
     let prefix = format!("{dot} ");
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let base_style = base_style;
     let prefix_style = if matches!(msg.role, Role::User | Role::System) {
         Style::default()
             .fg(color)
@@ -3526,7 +3844,24 @@ fn render_message_lines(
         Style::default().fg(color).bg(theme.bg)
     };
     if msg.role == Role::User {
-        let content_width = width.saturating_sub(prefix_width).max(1);
+        let full_w = width.max(1);
+        let box_w = (full_w / 2).max(24).min(full_w);
+        let left = "▪▪▪";
+        let edge_w = UnicodeWidthStr::width(left);
+        let target = box_w.saturating_sub(edge_w);
+        let pat = "───────────────── ── ── - - - · · ";
+        let mut mid = String::new();
+        while UnicodeWidthStr::width(mid.as_str()) < target {
+            mid.push_str(pat);
+        }
+        let mid = truncate_to_width(&mid, target);
+        let border = truncate_to_width(&format!("{left}{mid}"), box_w);
+        let border_style = Style::default()
+            .fg(theme.dim)
+            .bg(theme.bg)
+            .add_modifier(Modifier::BOLD);
+
+        let content_width = box_w.saturating_sub(2).max(1);
         let (base_text, paste_blocks) = split_user_paste_blocks(text);
         let display_text = if user_expanded && !paste_blocks.is_empty() {
             let mut out = String::new();
@@ -3587,19 +3922,16 @@ fn render_message_lines(
         };
 
         let mut out: Vec<Line<'static>> = Vec::new();
-        let mut it = lines.into_iter();
-        if let Some(first) = it.next() {
+        out.push(Line::from(vec![Span::styled(border.clone(), border_style)]));
+        out.push(Line::from(""));
+        for line in lines {
             out.push(Line::from(vec![
-                Span::styled(prefix, prefix_style),
-                Span::styled(first, base_style),
+                Span::styled(" ", Style::default().bg(theme.bg)),
+                Span::styled(truncate_to_width(&line, content_width), base_style),
             ]));
         }
-        for line in it {
-            out.push(Line::from(vec![
-                Span::styled(" ".repeat(prefix_width), Style::default().bg(theme.bg)),
-                Span::styled(line, base_style),
-            ]));
-        }
+        out.push(Line::from(""));
+        out.push(Line::from(vec![Span::styled(border, border_style)]));
         return out;
     }
     let display = if let Some(reveal_len) = reveal_len {
@@ -3785,6 +4117,17 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
         }
         let selected = selected_msg_idx == Some(msg_idx);
 
+        let next_role = (msg_idx + 1..core.history.len()).find_map(|j| {
+            let m = &core.history[j];
+            if !is_visible_in_tab(m, active_tab) {
+                return None;
+            }
+            if m.role == Role::Assistant && m.text.trim().is_empty() {
+                return None;
+            }
+            Some(m.role)
+        });
+
         let pulse = if pulse_idx == Some(msg_idx) {
             pulse_style
         } else {
@@ -3839,10 +4182,28 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 if out.len() > start {
                     msg_line_ranges[msg_idx] = Some((start, out.len()));
                 }
-                if selected && let Some(first) = out.get_mut(start) {
-                    highlight_line(first, theme);
+                if selected {
+                    let end = out.len();
+                    let mut anchor_rel = 0usize;
+                    for (i, ln) in out[start..end].iter().enumerate() {
+                        let mut s = String::new();
+                        for sp in ln.spans.iter() {
+                            s.push_str(sp.content.as_ref());
+                        }
+                        let t = s.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        if t.chars().any(|c| c.is_ascii_alphanumeric() || matches!(c as u32, 0x4E00..=0x9FFF)) {
+                            anchor_rel = i;
+                            break;
+                        }
+                    }
+                    if let Some(l) = out.get_mut(start.saturating_add(anchor_rel)) {
+                        highlight_line(l, theme);
+                    }
                 }
-                push_blank_line(&mut out);
+                push_blank_line_after(&mut out, msg.role, next_role);
                 continue;
             }
 
@@ -3902,7 +4263,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     if selected && let Some(l) = out.get_mut(line_idx) {
                         highlight_line(l, theme);
                     }
-                    push_blank_line(&mut out);
+                    push_blank_line_after(&mut out, msg.role, next_role);
                     planning_placeholder_active = true;
                     continue;
                 }
@@ -3942,7 +4303,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     if selected && let Some(l) = out.get_mut(line_idx) {
                         highlight_line(l, theme);
                     }
-                    push_blank_line(&mut out);
+                    push_blank_line_after(&mut out, msg.role, next_role);
                 }
                 continue;
             }
@@ -3990,13 +4351,19 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                 let prefix = format!("{dot} ");
                 let prefix_w = UnicodeWidthStr::width(prefix.as_str());
                 let content_w = width.saturating_sub(prefix_w).max(1);
-                let (thinking_output_lines, _meta_lines) = extract_tool_sections(tool_text);
-                let thinking_body = thinking_output_lines.join("\n");
+                let output_slice = tool_output_slice(tool_text);
+                let thinking_has_text = tool_output_has_text(output_slice);
+                let need_full_lines = show_full_think || is_codex;
+                let (thinking_output_lines, _meta_lines) = if need_full_lines {
+                    extract_tool_sections(tool_text)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 // 空思考：不展示（Codex/DeepSeek 一致）。running 阶段由下方的闪烁占位处理（仅 DeepSeek）。
-                if thinking_body.trim().is_empty() && (!think_running || is_codex) {
+                if !thinking_has_text && (!think_running || is_codex) {
                     continue;
                 }
-                if thinking_body.trim().is_empty() && think_running {
+                if !thinking_has_text && think_running {
                     if planning_placeholder_active {
                         // Planning 占位已出现：避免同时显示 “Thinking” 空占位，减少视觉噪音。
                         continue;
@@ -4032,31 +4399,60 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     if selected && let Some(l) = out.get_mut(line_idx) {
                         highlight_line(l, theme);
                     }
-                    push_blank_line(&mut out);
+                    push_blank_line_after(&mut out, msg.role, next_role);
                     continue;
                 }
 
                 if !show_full_think && !is_codex {
-                    // 简约模式：单行跑马（仅 SSE+running）。
+                    // 简约模式（SSE+running）：纯跑马（不显示 “Thinking” 文案）。
                     let dot_prefix = format!("{dot} ");
-                    let head = "Thinking · ";
-                    let fixed = format!("{dot_prefix}{head}");
-                    let fixed_w = UnicodeWidthStr::width(fixed.as_str());
+                    let fixed_w = UnicodeWidthStr::width(dot_prefix.as_str());
                     let avail = width.saturating_sub(fixed_w).max(1);
-                    let preview = marquee_one_line(&thinking_body, avail, tick);
-                    let cursor = stream_cursor_glyph(tick);
+                    // 只取尾部若干行拼成一行：避免把很长的思考全文 join 成一个大字符串导致卡顿。
+                    let mut tail: Vec<&str> = output_slice
+                        .lines()
+                        .rev()
+                        .filter(|l| {
+                            let t = l.trim();
+                            if t.is_empty() {
+                                return false;
+                            }
+                            if t.eq_ignore_ascii_case("```text") || t == "```" {
+                                return false;
+                            }
+                            true
+                        })
+                        .take(6)
+                        .collect();
+                    tail.reverse();
+                    let mut preview_src = tail.join(" ");
+                    preview_src = compact_ws_inline(&preview_src);
+                    // 兜底：限制预览字符串长度，避免跑马处理大文本导致掉帧。
+                    if preview_src.chars().count() > 800 {
+                        preview_src = tail_by_chars(&preview_src, 800);
+                    }
+                    let progress: usize = output_slice.len();
+                    let mut preview = marquee_one_line_progress(&preview_src, avail, progress);
+                    if avail >= 2 {
+                        preview = format!(
+                            "{}{}",
+                            slice_by_cells(&preview, 0, avail.saturating_sub(1)),
+                            stream_cursor_glyph(tick)
+                        );
+                    }
                     let line_idx = out.len();
                     out.push(Line::from(vec![
                         Span::styled(dot_prefix, Style::default().fg(dot_color).bg(theme.bg)),
-                        Span::styled(format!("{head}{preview}{cursor}"), base_style),
+                        Span::styled(preview, base_style),
                     ]));
                     msg_line_ranges[msg_idx] = Some((line_idx, out.len()));
                     if selected && let Some(l) = out.get_mut(line_idx) {
                         highlight_line(l, theme);
                     }
-                    push_blank_line(&mut out);
+                    push_blank_line_after(&mut out, msg.role, next_role);
                     continue;
                 }
+                let thinking_body = thinking_output_lines.join("\n");
                 let thinking_body = if think_running && streaming_enabled && !is_codex {
                     format!("{thinking_body}{}", stream_cursor_glyph(tick))
                 } else {
@@ -4122,7 +4518,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     if selected && let Some(l) = out.get_mut(line_idx) {
                         highlight_line(l, theme);
                     }
-                    push_blank_line(&mut out);
+                    push_blank_line_after(&mut out, msg.role, next_role);
                 }
                 continue;
             }
@@ -4231,11 +4627,18 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     let cycle = base_w.saturating_add(UnicodeWidthStr::width(sep)).max(1);
                     let start = ((tick / 2) % cycle).min(cycle.saturating_sub(1));
                     let looped = format!("{raw}{sep}{raw}");
-                    let marquee = if UnicodeWidthStr::width(looped.as_str()) <= cmd_avail {
+                    let mut marquee = if UnicodeWidthStr::width(looped.as_str()) <= cmd_avail {
                         truncate_to_width(&raw, cmd_avail)
                     } else {
                         slice_by_cells(&looped, start, cmd_avail)
                     };
+                    if cmd_avail >= 2 {
+                        marquee = format!(
+                            "{}{}",
+                            slice_by_cells(&marquee, 0, cmd_avail.saturating_sub(1)),
+                            stream_cursor_glyph(tick)
+                        );
+                    }
                     lines.push(Line::from(vec![
                         Span::styled(indent.clone(), Style::default().fg(theme.dim).bg(theme.bg)),
                         Span::styled("↳ ", arrow_style),
@@ -4252,27 +4655,15 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         .bg(theme.bg)
                         .add_modifier(Modifier::ITALIC);
                     let cmd_avail = avail.saturating_sub(2).max(1);
-                    let chunks = wrap_plain_line(target_for_line2.trim(), cmd_avail);
-                    let cmd_max = if tool_raw.eq_ignore_ascii_case("list")
-                        || tool_raw.eq_ignore_ascii_case("LIST")
-                        || tool_raw.trim().to_ascii_uppercase().starts_with("M")
-                    {
-                        3
-                    } else {
-                        2
-                    };
-                    for (i, chunk) in chunks.iter().take(cmd_max).enumerate() {
-                        if chunk.trim().is_empty() {
-                            continue;
-                        }
-                        let prefix = if i == 0 { "↳ " } else { "  " };
+                    let cmd = truncate_to_width_ellipsis(target_for_line2.trim(), cmd_avail);
+                    if !cmd.trim().is_empty() {
                         lines.push(Line::from(vec![
                             Span::styled(
                                 indent.clone(),
                                 Style::default().fg(theme.dim).bg(theme.bg),
                             ),
-                            Span::styled(prefix, arrow_style),
-                            Span::styled(chunk.clone(), cmd_style),
+                            Span::styled("↳ ", arrow_style),
+                            Span::styled(cmd, cmd_style),
                         ]));
                     }
                 }
@@ -4319,7 +4710,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         }
                     }
                 }
-                push_blank_line(&mut out);
+                push_blank_line_after(&mut out, msg.role, next_role);
                 continue;
             }
 
@@ -4329,9 +4720,18 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             let (prefix, tool_name, suffix) = tool_compact_title_parts(&tool_raw);
             let head = format!("{dot} {prefix}");
             let sep = " · ";
-            let target_raw = input_raw.as_deref().unwrap_or("");
-            let (_disp, target_disp) = normalize_tool_display(&tool_raw, target_raw);
-            let target_disp = compact_ws_inline(&target_disp);
+            let is_patch_tool = tool_raw.eq_ignore_ascii_case("patch");
+            let brief_disp = extract_tool_explain(tool_text).unwrap_or_else(|| tool_raw.clone());
+            let brief_disp = compact_ws_inline(&brief_disp);
+            let input_disp = extract_tool_input_value(tool_text).unwrap_or_default();
+            let input_disp = compact_ws_inline(&input_disp);
+            let target_disp = if is_patch_tool {
+                let target_raw = input_raw.as_deref().unwrap_or("");
+                let (_disp, target_disp) = normalize_tool_display(&tool_raw, target_raw);
+                compact_ws_inline(&target_disp)
+            } else {
+                brief_disp
+            };
             let fixed = format!("{head}{tool_name}{suffix}{sep}");
             let fixed_w = UnicodeWidthStr::width(fixed.as_str());
             let w = width.max(1);
@@ -4405,10 +4805,94 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     ]));
                 }
             }
-            if let Some(explain) = extract_tool_explain(tool_text) {
-                push_tool_explain_line(
-                    &mut lines, theme, width, &explain, reveal_idx, msg_idx, reveal_len,
-                );
+            if is_patch_tool {
+                if let Some(explain) = extract_tool_explain(tool_text) {
+                    push_tool_explain_line(
+                        &mut lines,
+                        theme,
+                        width,
+                        &explain,
+                        reveal_idx,
+                        msg_idx,
+                        reveal_len,
+                    );
+                }
+            } else if !input_disp.trim().is_empty() {
+                let arrow_style = Style::default()
+                    .fg(theme.dim)
+                    .bg(theme.bg)
+                    .add_modifier(Modifier::ITALIC);
+                let cmd_style = Style::default()
+                    .fg(theme.fg)
+                    .bg(theme.bg)
+                    .add_modifier(Modifier::ITALIC);
+                let cmd_prefix = "  ↳ ";
+                let cont_prefix = "    ";
+                let prefix_w = UnicodeWidthStr::width(cmd_prefix);
+                let avail = w.saturating_sub(prefix_w).max(1);
+
+                let is_streaming_tool = streaming_enabled
+                    && extract_tool_status_token(&msg.text)
+                        .as_deref()
+                        .is_some_and(|s| {
+                            s.eq_ignore_ascii_case("parsing") || s.eq_ignore_ascii_case("running")
+                        });
+
+                if is_streaming_tool {
+                    let raw = compact_ws_inline(input_disp.trim());
+                    let progress = input_disp.len().saturating_add(tick.saturating_mul(8));
+                    let mut marquee = marquee_one_line_progress(&raw, avail, progress);
+                    if avail >= 2 {
+                        marquee = format!(
+                            "{}{}",
+                            slice_by_cells(&marquee, 0, avail.saturating_sub(1)),
+                            stream_cursor_glyph(tick)
+                        );
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled(cmd_prefix.to_string(), arrow_style),
+                        Span::styled(marquee, cmd_style),
+                    ]));
+                } else {
+                    let mut chunks: Vec<String> = Vec::new();
+                    for raw_line in input_disp.lines() {
+                        for c in wrap_plain_line(raw_line, avail) {
+                            if !c.trim().is_empty() {
+                                chunks.push(c);
+                            }
+                        }
+                    }
+                    if chunks.is_empty() {
+                        chunks.push(input_disp.trim().to_string());
+                    }
+                    const MAX_LINES: usize = 7;
+                    const HEAD_LINES: usize = 3;
+                    const TAIL_LINES: usize = 3;
+                    if chunks.len() > MAX_LINES && HEAD_LINES + TAIL_LINES < chunks.len() {
+                        let omitted = chunks.len().saturating_sub(HEAD_LINES + TAIL_LINES);
+                        let mut clipped: Vec<String> = Vec::new();
+                        clipped.extend(chunks.iter().take(HEAD_LINES).cloned());
+                        clipped.push(format!("... [truncated {omitted} lines]"));
+                        clipped.extend(
+                            chunks
+                                .iter()
+                                .skip(chunks.len().saturating_sub(TAIL_LINES))
+                                .cloned(),
+                        );
+                        chunks = clipped;
+                    }
+                    for (i, c) in chunks.iter().take(MAX_LINES).enumerate() {
+                        let prefix = if i == 0 { cmd_prefix } else { cont_prefix };
+                        let is_note = c.trim_start().starts_with("... [truncated");
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), arrow_style),
+                            Span::styled(
+                                truncate_to_width(c, avail),
+                                if is_note { arrow_style } else { cmd_style },
+                            ),
+                        ]));
+                    }
+                }
             }
             let is_shell_tool = tool_raw.eq_ignore_ascii_case("bash")
                 || tool_raw.eq_ignore_ascii_case("adb")
@@ -4435,13 +4919,30 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     *slot = Some(cache_key);
                 }
             }
-            if selected && let Some(first) = lines.get_mut(0) {
-                highlight_line(first, theme);
+            if selected {
+                let mut anchor = 0usize;
+                for (i, ln) in lines.iter().enumerate() {
+                    let mut s = String::new();
+                    for sp in ln.spans.iter() {
+                        s.push_str(sp.content.as_ref());
+                    }
+                    let t = s.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if t.chars().any(|c| c.is_ascii_alphanumeric() || matches!(c as u32, 0x4E00..=0x9FFF)) {
+                        anchor = i;
+                        break;
+                    }
+                }
+                if let Some(l) = lines.get_mut(anchor) {
+                    highlight_line(l, theme);
+                }
             }
             let start = out.len();
             out.extend(lines);
             msg_line_ranges[msg_idx] = Some((start, out.len()));
-            push_blank_line(&mut out);
+            push_blank_line_after(&mut out, msg.role, next_role);
             continue;
         }
 
@@ -4500,7 +5001,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                     )]));
                 }
                 msg_line_ranges[msg_idx] = Some((start, out.len()));
-                push_blank_line(&mut out);
+                push_blank_line_after(&mut out, msg.role, next_role);
                 continue;
             }
             if let Some(pass_kind) = parse_pass_token(&msg.text) {
@@ -4516,7 +5017,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
                         .add_modifier(Modifier::BOLD),
                 )]));
                 msg_line_ranges[msg_idx] = Some((start, out.len()));
-                push_blank_line(&mut out);
+                push_blank_line_after(&mut out, msg.role, next_role);
                 continue;
             }
         }
@@ -4590,7 +5091,7 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
             if selected && let Some(l) = out.get_mut(line_idx) {
                 highlight_line(l, theme);
             }
-            push_blank_line(&mut out);
+            push_blank_line_after(&mut out, msg.role, next_role);
             continue;
         }
         let mut animated_assistant = false;
@@ -4672,13 +5173,30 @@ pub fn build_chat_layout(args: BuildChatLinesArgs<'_>) -> ChatLayout {
         if rendered.is_empty() {
             continue;
         }
-        if selected && let Some(first) = rendered.get_mut(0) {
-            highlight_line(first, theme);
+        if selected {
+            let mut anchor = 0usize;
+            for (i, ln) in rendered.iter().enumerate() {
+                let mut s = String::new();
+                for sp in ln.spans.iter() {
+                    s.push_str(sp.content.as_ref());
+                }
+                let t = s.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if t.chars().any(|c| c.is_ascii_alphanumeric() || matches!(c as u32, 0x4E00..=0x9FFF)) {
+                    anchor = i;
+                    break;
+                }
+            }
+            if let Some(l) = rendered.get_mut(anchor) {
+                highlight_line(l, theme);
+            }
         }
         let start = out.len();
         out.extend(rendered);
         msg_line_ranges[msg_idx] = Some((start, out.len()));
-        push_blank_line(&mut out);
+        push_blank_line_after(&mut out, msg.role, next_role);
     }
 
     ChatLayout {
@@ -6087,4 +6605,135 @@ fn is_empty_visual_line(line: &StyledLogicalLine) -> bool {
         return false;
     }
     line.head[0].text.trim().is_empty()
+}
+
+pub struct ConfirmDialogRects {
+    pub yes: Rect,
+    pub no: Rect,
+}
+
+pub fn draw_confirm_dialog(
+    f: &mut ratatui::Frame,
+    theme: &Theme,
+    area: Rect,
+    msg: &str,
+    selected_yes: bool,
+    tick: usize,
+) -> Option<ConfirmDialogRects> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    let w = (area.width.saturating_sub(6)).min(54).max(24);
+    let h: u16 = 7;
+    let x = area.x.saturating_add(area.width.saturating_sub(w) / 2);
+    let y = area.y.saturating_add(area.height.saturating_sub(h) / 2);
+    let darea = Rect {
+        x,
+        y,
+        width: w,
+        height: h.min(area.height.max(1)),
+    };
+
+    f.render_widget(Clear, darea);
+
+    let border = pulse_color(theme, theme.yellow, tick);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(border).bg(theme.bg))
+        .title(Span::styled(
+            " 未保存 ",
+            Style::default()
+                .fg(theme.fg)
+                .bg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg));
+    let inner = block.inner(darea);
+    f.render_widget(block, darea);
+
+    let msg = truncate_to_width(msg.trim(), inner.width.max(1) as usize);
+    let msg_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 2.min(inner.height),
+    };
+    let msg_p = Paragraph::new(Text::from(Line::from(Span::styled(
+        msg,
+        Style::default().fg(theme.fg).bg(theme.bg),
+    ))))
+    .block(Block::default().borders(Borders::NONE))
+    .wrap(Wrap { trim: true });
+    f.render_widget(msg_p, msg_area);
+
+    if inner.height < 3 {
+        return None;
+    }
+
+    let by = inner.y.saturating_add(inner.height.saturating_sub(2));
+    let btn_area = Rect {
+        x: inner.x,
+        y: by,
+        width: inner.width,
+        height: 1,
+    };
+
+    let yes = " YES ";
+    let no = " NO ";
+    let yes_w = UnicodeWidthStr::width(yes);
+    let no_w = UnicodeWidthStr::width(no);
+    let gap = 4usize;
+    let total = yes_w.saturating_add(gap).saturating_add(no_w);
+    let start = (inner.width.max(1) as usize)
+        .saturating_sub(total)
+        .saturating_div(2);
+
+    let yes_x = inner.x.saturating_add(start as u16);
+    let no_x = yes_x.saturating_add((yes_w + gap) as u16);
+
+    let yes_style = if selected_yes {
+        Style::default()
+            .fg(theme.sel_fg)
+            .bg(theme.sel_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.dim).bg(theme.bg)
+    };
+    let no_style = if !selected_yes {
+        Style::default()
+            .fg(theme.sel_fg)
+            .bg(theme.sel_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.dim).bg(theme.bg)
+    };
+
+    let line = Line::from(vec![
+        Span::styled(" ".repeat(start), Style::default().bg(theme.bg)),
+        Span::styled(yes.to_string(), yes_style),
+        Span::styled(" ".repeat(gap), Style::default().bg(theme.bg)),
+        Span::styled(no.to_string(), no_style),
+    ]);
+    let p = Paragraph::new(Text::from(line))
+        .block(Block::default().borders(Borders::NONE))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().bg(theme.bg));
+    f.render_widget(p, btn_area);
+
+    Some(ConfirmDialogRects {
+        yes: Rect {
+            x: yes_x,
+            y: btn_area.y,
+            width: (yes_w as u16).min(btn_area.width),
+            height: 1,
+        },
+        no: Rect {
+            x: no_x,
+            y: btn_area.y,
+            width: (no_w as u16).min(btn_area.width),
+            height: 1,
+        },
+    })
 }

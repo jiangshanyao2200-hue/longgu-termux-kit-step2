@@ -3,3 +3,7 @@
 /memory/
 /config/*.json
 !/config/*.example.json
+
+# python
+__pycache__/
+*.pyc

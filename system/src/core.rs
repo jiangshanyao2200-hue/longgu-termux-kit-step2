@@ -8483,7 +8483,7 @@ fn run_loop(
                         format!("Editing: {selected_label}")
                     }
                 }
-                SettingsFocus::Prompt => "Prompt editor (Ctrl+S save, Esc)".to_string(),
+                SettingsFocus::Prompt => "Prompt editor (End save, Esc)".to_string(),
             }
         };
         let mut input_line = if screen == Screen::Chat {
@@ -9493,25 +9493,25 @@ ui::draw_header(
                                     && row >= r.y
                                     && row < r.y.saturating_add(r.height)
                             };
-                            if let Some(area) = settings_rect_cache.filter(|r| contains(*r)) {
-                                //（1）未保存确认弹窗：优先处理触控点击（YES/NO）。
-                                if settings.confirm.is_some() {
-                                    if settings_confirm_yes_rect_cache.is_some_and(contains) {
-                                        settings.focus = SettingsFocus::Fields;
-                                        reset_settings_edit(&mut settings);
-                                        needs_redraw = true;
-                                        continue;
-                                    }
-                                    if settings_confirm_no_rect_cache.is_some_and(contains) {
-                                        settings.confirm = None;
-                                        settings.focus = SettingsFocus::Prompt;
-                                        needs_redraw = true;
-                                        continue;
-                                    }
-                                    //（1）弹窗打开时屏蔽其它区域点击。
+                            // Confirm dialog: handle click without relying on panel hit.
+                            if settings.confirm.is_some() {
+                                if settings_confirm_yes_rect_cache.is_some_and(contains) {
+                                    settings.focus = SettingsFocus::Fields;
+                                    reset_settings_edit(&mut settings);
+                                    needs_redraw = true;
                                     continue;
                                 }
+                                if settings_confirm_no_rect_cache.is_some_and(contains) {
+                                    settings.confirm = None;
+                                    settings.focus = SettingsFocus::Prompt;
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                                // Dialog open: swallow other clicks.
+                                continue;
+                            }
 
+                            if let Some(area) = settings_rect_cache.filter(|r| contains(*r)) {
                                 //（1）提示词编辑：锁定焦点。
                                 //（2）除非 Esc 退出，否则不允许通过触控切换标签页/字段。
                                 if matches!(settings.focus, SettingsFocus::Prompt) {
@@ -9801,6 +9801,30 @@ ui::draw_header(
                         let dx = prev_col as i32 - me.column as i32;
                         touch_drag_last_row = Some(me.row);
                         touch_drag_last_col = Some(me.column);
+                        if matches!(screen, Screen::Settings) && settings.confirm.is_some() {
+                            let col = me.column;
+                            let row = me.row;
+                            let contains = |r: ratatui::layout::Rect| {
+                                col >= r.x
+                                    && col < r.x.saturating_add(r.width)
+                                    && row >= r.y
+                                    && row < r.y.saturating_add(r.height)
+                            };
+                            if settings_confirm_yes_rect_cache.is_some_and(contains) {
+                                settings.focus = SettingsFocus::Fields;
+                                reset_settings_edit(&mut settings);
+                                needs_redraw = true;
+                                continue;
+                            }
+                            if settings_confirm_no_rect_cache.is_some_and(contains) {
+                                settings.confirm = None;
+                                settings.focus = SettingsFocus::Prompt;
+                                needs_redraw = true;
+                                continue;
+                            }
+                            // Dialog open: swallow drag events.
+                            continue;
+                        }
                         if matches!(screen, Screen::Chat) && (matches!(chat_focus, ChatFocus::Input) || input.starts_with('/'))
                         {
                             //（1）输入焦点：手势滑动用于移动输入光标（↑↓←→）。

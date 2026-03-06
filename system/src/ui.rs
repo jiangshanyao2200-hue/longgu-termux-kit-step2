@@ -2591,7 +2591,7 @@ pub fn draw_settings_status(
     };
     let max_w = area.width.max(1) as usize;
     // 与聊天页的“输入状态栏”统一：左侧圆点 + 文本（偏灰），避免蓝色跑马/强对比打扰。
-    let dot = "☯";
+    let dot = "●";
     let left_pad = 1usize;
     let dot_w = UnicodeWidthStr::width(dot);
     // 右侧动作提示：仅用于人类观测。
@@ -6728,15 +6728,15 @@ pub fn draw_confirm_dialog(
 
     Some(ConfirmDialogRects {
         yes: Rect {
-            x: yes_x.saturating_sub(1),
+            x: yes_x.saturating_sub(2),
             y: btn_area.y,
-            width: (yes_w as u16).saturating_add(2).min(btn_area.width),
+            width: (yes_w as u16).saturating_add(4).min(btn_area.width),
             height: 1,
         },
         no: Rect {
-            x: no_x.saturating_sub(1),
+            x: no_x.saturating_sub(2),
             y: btn_area.y,
-            width: (no_w as u16).saturating_add(2).min(btn_area.width),
+            width: (no_w as u16).saturating_add(4).min(btn_area.width),
             height: 1,
         },
     })

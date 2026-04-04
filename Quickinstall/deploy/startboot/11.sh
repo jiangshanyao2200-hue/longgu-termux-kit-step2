@@ -1,10 +1,94 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 
+aitermux_anim_term_size() {
+  local rows_raw='' cols_raw='' stty_out='' cols_safe=''
+  if stty_out="$(stty size </dev/tty 2>/dev/null)"; then
+    rows_raw="${stty_out%% *}"
+    cols_raw="${stty_out##* }"
+  fi
+  [[ "$rows_raw" =~ ^[0-9]+$ ]] || rows_raw="$(tput lines 2>/dev/null || echo 24)"
+  [[ "$cols_raw" =~ ^[0-9]+$ ]] || cols_raw="$(tput cols 2>/dev/null || echo 80)"
+  [[ "$rows_raw" =~ ^[0-9]+$ ]] || rows_raw=24
+  [[ "$cols_raw" =~ ^[0-9]+$ ]] || cols_raw=80
+  if (( cols_raw > 2 )); then
+    cols_safe=$((cols_raw - 1))
+  else
+    cols_safe=$cols_raw
+  fi
+  if (( rows_raw < 1 )); then rows_raw=1; fi
+  if (( cols_safe < 1 )); then cols_safe=1; fi
+  printf '%sx%s\n' "$cols_safe" "$rows_raw"
+}
+
 aitermux_anim_print_frame() {
   local frame="${1-}"
-  printf '%s' "$frame"
+  local fallback_height="${2:-24}"
+  local term_size='' current_height="$fallback_height"
+  local line='' printed=0
+
+  term_size="$(aitermux_anim_term_size 2>/dev/null || true)"
+  if [[ "$term_size" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    current_height="${BASH_REMATCH[2]}"
+  fi
+  if ! [[ "$current_height" =~ ^[0-9]+$ ]] || (( current_height < 1 )); then
+    current_height=1
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s' "$line"
+    printed=$((printed + 1))
+    if (( printed >= current_height )); then
+      break
+    fi
+    printf '\n'
+  done <<< "$frame"
+
   printf '\033[0m\033[J'
+}
+
+aitermux_anim_now_us() {
+  local now="${EPOCHREALTIME-}"
+  local sec='' frac=''
+  if [[ -n "$now" && "$now" == *.* ]]; then
+    sec="${now%%.*}"
+    frac="${now#*.}"
+    frac="${frac}000000"
+    printf '%s%s\n' "$sec" "${frac:0:6}"
+    return 0
+  fi
+  date +%s%6N 2>/dev/null || printf '%s000000\n' "$(date +%s 2>/dev/null || echo 0)"
+}
+
+aitermux_anim_wait_until_us() {
+  local target_us="${1:-0}"
+  local now_us='' sleep_us=0 sleep_s=''
+
+  if ! [[ "$target_us" =~ ^[0-9]+$ ]] || (( target_us <= 0 )); then
+    return 0
+  fi
+
+  now_us="$(aitermux_anim_now_us)"
+  if ! [[ "$now_us" =~ ^[0-9]+$ ]]; then
+    if (( have_tty )); then
+      IFS= read -rsn1 -t "$dt" <&4 || true
+    else
+      sleep "$dt"
+    fi
+    return 0
+  fi
+
+  sleep_us=$(( target_us - now_us ))
+  if (( sleep_us <= 0 )); then
+    return 0
+  fi
+
+  printf -v sleep_s '%d.%06d' $((sleep_us / 1000000)) $((sleep_us % 1000000))
+  if (( have_tty )); then
+    IFS= read -rsn1 -t "$sleep_s" <&4 || true
+  else
+    sleep "$sleep_s"
+  fi
 }
 
 # AITermux boot animation #11（致敬 TRON）：
@@ -89,7 +173,9 @@ printf "\033[?7l"
 printf "\033[H\033[2J"
 
 DELIM=$'\x1e'
-dt="$(awk -v fps="${FPS}" 'BEGIN{fps=int(fps+0); if(fps<8) fps=8; if(fps>30) fps=30; printf "%.6f", 1.0/fps }')"
+fps_effective="$(awk -v fps="${FPS}" 'BEGIN{fps=int(fps+0); if(fps<8) fps=8; if(fps>30) fps=30; printf "%d", fps }')"
+dt="$(awk -v fps="${fps_effective}" 'BEGIN{ printf "%.6f", 1.0/fps }')"
+frame_interval_us=$(( (1000000 + fps_effective / 2) / fps_effective ))
 have_tty=0
 if { exec 4</dev/tty; } 2>/dev/null; then
   have_tty=1
@@ -572,9 +658,17 @@ BEGIN{
 '
 )
 
+next_frame_us="$(aitermux_anim_now_us 2>/dev/null || echo 0)"
+if ! [[ "$next_frame_us" =~ ^[0-9]+$ ]]; then
+  next_frame_us=0
+fi
+
 while IFS= read -r -u 3 -d "${DELIM}" frame; do
   aitermux_anim_print_frame "${frame}" "${HEIGHT}"
-  if (( have_tty )); then
+  if (( next_frame_us > 0 )); then
+    next_frame_us=$(( next_frame_us + frame_interval_us ))
+    aitermux_anim_wait_until_us "$next_frame_us"
+  elif (( have_tty )); then
     IFS= read -rsn1 -t "${dt}" <&4 || true
   else
     sleep "${dt}"

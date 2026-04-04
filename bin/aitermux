@@ -2,12 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="${AITERMUX_HOME:-$HOME/AItermux}"
-SYS_DIR="$ROOT_DIR/system"
-BIN="$SYS_DIR/target/release/ying"
-
-STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-STATE_DIR="$STATE_HOME/aitermux"
-MARKER="$STATE_DIR/first_run_ying_v1.done"
+PROJECT_DIR="$ROOT_DIR/projectying"
+RUN_SCRIPT="$PROJECT_DIR/run.sh"
+BOOTSTRAP_BIN="$ROOT_DIR/bin/aitermux-bootstrap"
 
 cleanup() {
   stty sane >/dev/null 2>&1 || true
@@ -17,42 +14,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$STATE_DIR" >/dev/null 2>&1 || true
-
-force_selfcheck=0
-skip_selfcheck=0
-rebuild=0
-rest=()
-
-for arg in "$@"; do
-  case "$arg" in
-    --force-selfcheck) force_selfcheck=1 ;;
-    --skip-selfcheck) skip_selfcheck=1 ;;
-    --rebuild) rebuild=1 ;;
-    --help|-h)
-      cat <<'EOF'
+usage() {
+  cat <<'EOF'
 AITermux 启动器
 
 用法：
-  aitermux [--force-selfcheck] [--skip-selfcheck] [--rebuild] [-- <ying args>]
+  aitermux [--help] [-- <projectying args>]
+  aitermux [projectying args]
 EOF
-      exit 0
-      ;;
-    --)
-      shift
-      rest+=("$@")
-      break
-      ;;
-    *) rest+=("$arg") ;;
-  esac
-done
+}
 
-if [[ ! -d "$SYS_DIR" ]]; then
-  echo "[aitermux] 缺少系统目录：$SYS_DIR" >&2
-  exit 1
-fi
-
-cleanup_orphan_ying() {
+cleanup_orphan_projectying() {
   local pid ppid
   local -a pids=()
   while read -r pid ppid _; do
@@ -61,8 +33,8 @@ cleanup_orphan_ying() {
     fi
   done < <(
     ps -o pid=,ppid=,args= -A 2>/dev/null \
-      | grep -F "$SYS_DIR/target/" \
-      | grep -F "/ying" \
+      | grep -F "$PROJECT_DIR/target/" \
+      | grep -F "/projectying" \
       | grep -v grep \
       || true
   )
@@ -73,38 +45,30 @@ cleanup_orphan_ying() {
   fi
 }
 
-cleanup_orphan_ying || true
-
-need_build=0
-if (( rebuild )) || [[ ! -x "$BIN" ]]; then
-  need_build=1
-fi
-
-if (( !need_build )) && [[ -f "$SYS_DIR/Cargo.toml" && "$SYS_DIR/Cargo.toml" -nt "$BIN" ]]; then
-  need_build=1
-fi
-
-if (( !need_build )) && command -v find >/dev/null 2>&1; then
-  if find "$SYS_DIR/src" -type f -name '*.rs' -newer "$BIN" -print -quit 2>/dev/null | grep -q .; then
-    need_build=1
+ensure_projectying_ready() {
+  if [[ -f "$RUN_SCRIPT" ]]; then
+    chmod u+x "$RUN_SCRIPT" >/dev/null 2>&1 || true
   fi
+
+  if [[ ! -x "$RUN_SCRIPT" && -x "$BOOTSTRAP_BIN" ]]; then
+    "$BOOTSTRAP_BIN" --quiet --force --component projectying || true
+    [[ -f "$RUN_SCRIPT" ]] && chmod u+x "$RUN_SCRIPT" >/dev/null 2>&1 || true
+  fi
+
+  if [[ ! -x "$RUN_SCRIPT" ]]; then
+    echo "[aitermux] 缺少 Project 萤启动脚本：$RUN_SCRIPT" >&2
+    exit 1
+  fi
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
 fi
 
-if (( !skip_selfcheck )) && { (( force_selfcheck )) || [[ ! -f "$MARKER" ]]; }; then
-  echo "[aitermux] 首次启动：bootstrap + release build + selfcheck"
-  (cd "$SYS_DIR" && bash scripts/bootstrap.sh)
-  (cd "$SYS_DIR" && cargo build --release -q)
-  (cd "$SYS_DIR" && "$BIN" --selfcheck)
-  date '+%Y-%m-%d %H:%M:%S' > "$MARKER" 2>/dev/null || true
-  need_build=0
-fi
-
-if (( need_build )); then
-  echo "[aitermux] 检测到源码更新：执行 release 构建"
-  (cd "$SYS_DIR" && bash scripts/bootstrap.sh)
-  (cd "$SYS_DIR" && cargo build --release -q)
-fi
+ensure_projectying_ready
+cleanup_orphan_projectying || true
 
 export AITERMUX_STARTED=1
-cd "$SYS_DIR"
-"$BIN" --no-bootstrap "${rest[@]}"
+cd "$PROJECT_DIR"
+exec "$RUN_SCRIPT" "$@"

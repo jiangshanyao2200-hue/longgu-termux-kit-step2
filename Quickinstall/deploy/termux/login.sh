@@ -2,8 +2,8 @@
 
 unset TERMUX_HUSHLOGIN
 
-if [ -G ~/.termux/shell ]; then
-  export SHELL="`realpath ~/.termux/shell`"
+if [ -e "$HOME/.termux/shell" ]; then
+  export SHELL="$(realpath "$HOME/.termux/shell")"
 else
   for file in /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/usr/bin/sh /system/bin/sh; do
     if [ -x "$file" ]; then
@@ -12,6 +12,13 @@ else
     fi
   done
 fi
+
+# PATH sanity:
+# Prefer Termux toolchain binaries first.
+# This avoids accidentally shadowing common tools (e.g. `rg`) with glibc-linked
+# binaries that cannot run on Android.
+PREFIX="/data/data/com.termux/files/usr"
+export PATH="$PREFIX/bin:/system/bin:/system/xbin:${PATH:-}"
 
 if [ -f "/data/data/com.termux/files/usr/lib/libtermux-exec-ld-preload.so" ]; then
   export LD_PRELOAD="/data/data/com.termux/files/usr/lib/libtermux-exec-ld-preload.so"

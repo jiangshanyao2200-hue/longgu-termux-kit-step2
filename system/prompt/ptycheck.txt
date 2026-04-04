@@ -1,5 +1,0 @@
-[sys:PTY审计]后台 PTY 仍在运行（已到审计间隔）。
-owner:{OWNER} | running_total:{RUNNING_TOTAL} | running_owner:{RUNNING_OWNER}
-
-请先调用 1 次 `pty.list`。
-然后用 2-4 行回答：是否仍在运行、如已完成执行 `pty.kill(job_id)`；并汇报任务。
